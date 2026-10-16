@@ -1,0 +1,70 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Crypto Strategy DSL",
+  "description": "Declarative strategy definition for BTC/ETH/XRP and other crypto pairs",
+  "type": "object",
+  "required": ["name", "type", "version", "entry", "exit", "risk"],
+  "properties": {
+    "name": { "type": "string", "description": "Unique strategy identifier (e.g., 'bb_mean_revert_v1')" },
+    "version": { "type": "string", "enum": ["v1", "v2", "v3"] },
+    "type": { "type": "string", "enum": ["mean_reversion", "trend_following", "breakout", "volatility", "arbitrage", "custom"], "description": "Strategy family for categorization" },
+    "tags": { "type": "array", "items": { "type": "string" }, "description": "Free-form strategy tags." },
+    "description": { "type": "string" },
+    "indicators": {
+      "type": "object",
+      "properties": {
+        "sma": { "type": "object", "required": ["period"], "properties": { "period": { "type": "integer" } } },
+        "ema": { "type": "object", "required": ["period"], "properties": { "period": { "type": "integer" } } },
+        "bb": { "type": "object", "required": ["period", "std_dev"], "properties": { "period": { "type": "integer" }, "std_dev": { "type": "number" } } },
+        "rsi": { "type": "object", "required": ["period"], "properties": { "period": { "type": "integer" }, "oversold": { "type": "integer", "default": 30 }, "overbought": { "type": "integer", "default": 70 } } },
+        "macd": { "type": "object", "required": ["fast", "slow", "signal"], "properties": { "fast": { "type": "integer" }, "slow": { "type": "integer" }, "signal": { "type": "integer" } } },
+        "atr": { "type": "object", "required": ["period"], "properties": { "period": { "type": "integer" } } },
+        "elliott_wave": { "type": "object", "required": ["degree"], "properties": { "degree": { "type": "string", "enum": ["subminuette", "minuette", "minute", "minor", "intermediate", "primary", "cycle", "supercycle", "grand_supercycle"] }, "min_wave_deviation": { "type": "number", "default": 0.005 } } }
+      }
+    },
+    "entry": {
+      "type": "object",
+      "required": ["condition", "side"],
+      "properties": {
+        "side": { "type": "string", "enum": ["long", "short", "both"] },
+        "condition": { "type": "string", "description": "Expression combining indicator conditions (e.g., 'close < bb_lower AND rsi < 30')" },
+        "qty_type": { "type": "string", "enum": ["fixed_qty", "pct_equity", "usd_value"], "default": "pct_equity" },
+        "qty": { "type": "number", "description": "Quantity or % equity depending on qty_type" }
+      }
+    },
+    "exit": {
+      "type": "object",
+      "required": ["condition"],
+      "properties": {
+        "condition": { "type": "string", "description": "Exit trigger expression" },
+        "stop_loss_pct": { "type": "number", "description": "Hard stop loss % below entry" },
+        "take_profit_pct": { "type": "number", "description": "Target % above entry" },
+        "trailing_stop_pct": { "type": "number", "description": "Dynamic trailing stop %" },
+        "max_hold_hours": { "type": "integer", "description": "Force exit after N hours (24/7 crypto)" }
+      }
+    },
+    "risk": {
+      "type": "object",
+      "required": ["max_position_pct"],
+      "properties": {
+        "max_position_pct": { "type": "number", "description": "Max % of account equity per trade", "default": 5.0 },
+        "max_daily_loss_pct": { "type": "number", "default": 3.0 },
+        "max_drawdown_pct": { "type": "number", "default": 10.0 },
+        "max_open_trades": { "type": "integer", "default": 3 },
+        "allowed_symbols": { "type": "array", "items": { "type": "string" }, "description": "Symbols permitted by this strategy." },
+        "max_spread_pct": { "type": "number", "description": "Max bid/ask spread % to allow entry", "default": 0.1 }
+      }
+    },
+    "backtest_config": {
+      "type": "object",
+      "properties": {
+        "start_date": { "type": "string", "format": "date" },
+        "end_date": { "type": "string", "format": "date" },
+        "timeframe": { "type": "string", "default": "1h" },
+        "slippage_model": { "type": "string", "enum": ["fixed_pct", "bid_ask", "volume_weighted"], "default": "bid_ask" },
+        "commission_pct": { "type": "number", "default": 0.001 }
+      }
+    }
+  },
+  "additionalProperties": false
+}

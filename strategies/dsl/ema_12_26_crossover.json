@@ -1,0 +1,27 @@
+{
+  "name": "ema_12_26_crossover",
+  "version": "v1",
+  "type": "trend_following",
+  "tags": ["paper", "implemented"],
+  "description": "Enter long when EMA 12 crosses above EMA 26; exit when it crosses below.",
+  "indicators": {
+    "ema": { "period": 12 },
+    "ema_slow": { "period": 26 }
+  },
+  "entry": {
+    "side": "long",
+    "condition": "ema_fast crosses_above ema_slow",
+    "qty_type": "usd_value",
+    "qty": 100
+  },
+  "exit": {
+    "condition": "ema_fast crosses_below ema_slow",
+    "max_hold_hours": 168
+  },
+  "risk": {
+    "max_position_pct": 5,
+    "max_daily_loss_pct": 3,
+    "max_open_trades": 3,
+    "allowed_symbols": ["BTC-USD"]
+  }
+}

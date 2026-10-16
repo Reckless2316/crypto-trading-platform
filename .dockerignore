@@ -1,0 +1,13 @@
+.env
+.env.*
+!.env.example
+.git
+__pycache__/
+*.py[cod]
+*.db
+*.sqlite*
+*.log
+tests/
+research/
+monitoring/
+security/

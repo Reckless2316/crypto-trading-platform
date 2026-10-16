@@ -1,0 +1,42 @@
+name: surge
+
+services:
+  surge:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: surge-paper:local
+    container_name: surge-paper
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8000:8000"
+    environment:
+      SURGE_DB_PATH: /var/lib/surge/surge.sqlite3
+      SURGE_COLLECTION_SECONDS: "300"
+      PORT: "8000"
+      SURGE_LIVE_TRADING_ENABLED: ${SURGE_LIVE_TRADING_ENABLED:-false}
+      SURGE_LIVE_TRADING_ARMED: ${SURGE_LIVE_TRADING_ARMED:-}
+      SURGE_LIVE_EXCHANGE: ${SURGE_LIVE_EXCHANGE:-}
+      SURGE_LIVE_MAX_ORDER_QUOTE: ${SURGE_LIVE_MAX_ORDER_QUOTE:-0}
+      SURGE_BINANCE_API_KEY: ${SURGE_BINANCE_API_KEY:-}
+      SURGE_BINANCE_API_SECRET: ${SURGE_BINANCE_API_SECRET:-}
+      SURGE_COINBASE_API_KEY: ${SURGE_COINBASE_API_KEY:-}
+      SURGE_COINBASE_API_SECRET: ${SURGE_COINBASE_API_SECRET:-}
+    volumes:
+      - surge-data:/var/lib/surge
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+volumes:
+  surge-data:
