@@ -20,6 +20,8 @@ Open <http://127.0.0.1:8000>. The service loads Coinbase BTC-USD hourly candles 
 ./deploy/deploy.sh stop
 ```
 
+On Windows, install and start Docker Desktop, then double-click `launch-windows.bat`. The launcher builds/starts the Compose service, waits for its health endpoint, and opens the dashboard. It also accepts `stop`, `restart`, `status`, or `logs` arguments.
+
 SQLite data persists in the Docker volume `surge-data`. Public market data needs network access but no exchange credentials. Live trading is disabled unless explicitly configured; see `.env.example` and the deployment notes.
 
 ## Paper controls
