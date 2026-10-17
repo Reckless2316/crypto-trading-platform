@@ -111,13 +111,18 @@ class LedgerTests(unittest.TestCase):
         self.assertEqual(0, self.ledger.connection.execute("SELECT count(*) FROM order_intents").fetchone()[0])
 
     def seed(self, *, valid=False):
-        """Persist inert fixtures; production authority owns import and arming."""
-        c = self.ledger.connection
+        """Persist inert fixtures through the supported atomic import seam."""
         now = time.time_ns() // 1000
-        c.execute("INSERT INTO release_bundles(release_hash,manifest_json,expires_at_us,recorded_at_us) VALUES (?, '{}', ?, ?)", (RELEASE_HASH, now + 100_000_000, now))
-        c.execute("INSERT INTO snapshots(snapshot_id,account_id,release_hash,candle_close_us,knowledge_cutoff_us,field_hash,state_json,lineage_hash,account_revision,valid,tokenizer_hash,token_count,recorded_at_us) VALUES (?,'paper-test',?,1000000,1000000,?,'{}',?,'{}',?,?,?,?)", (HASH_B, RELEASE_HASH, HASH_A, HASH_B, int(valid), HASH_A if valid else None, 10 if valid else None, now))
-        c.execute("INSERT INTO decisions(decision_id,snapshot_id,request_id,deadline_us,model_id,status,recorded_at_us) VALUES ('decision-test',?,'request-test',?,'test','completed',?)", (HASH_B, now + 100_000_000, now))
-        c.execute("INSERT INTO reconciliations(reconcile_id,account_id,started_at_us,finished_at_us,status,balances_json,open_orders_json,differences_json,recorded_at_us) VALUES ('reconcile','paper-test',?,?,'completed','[]','[]','[]',?)", (now, now, now))
+        original_clock=self.ledger._clock_us
+        self.ledger._clock_us=lambda:now
+        try:
+            with self.ledger.transaction() as c:
+                c.execute("INSERT INTO release_bundles(release_hash,manifest_json,expires_at_us,recorded_at_us) VALUES (?, '{}', ?, ?)", (RELEASE_HASH, now + 100_000_000, now))
+                c.execute("INSERT INTO snapshots(snapshot_id,account_id,release_hash,candle_close_us,knowledge_cutoff_us,field_hash,state_json,lineage_hash,account_revision,valid,tokenizer_hash,token_count,recorded_at_us) VALUES (?,'paper-test',?,1000000,1000000,?,'{}',?,'{}',?,?,?,?)", (HASH_B, RELEASE_HASH, HASH_A, HASH_B, int(valid), HASH_A if valid else None, 10 if valid else None, now))
+                c.execute("INSERT INTO decisions(decision_id,snapshot_id,request_id,deadline_us,model_id,status,recorded_at_us) VALUES ('decision-test',?,'request-test',?,'test','completed',?)", (HASH_B, now + 100_000_000, now))
+                c.execute("INSERT INTO reconciliations(reconcile_id,account_id,started_at_us,finished_at_us,status,balances_json,open_orders_json,differences_json,recorded_at_us) VALUES ('reconcile','paper-test',?,?,'completed','[]','[]','[]',?)", (now, now, now))
+        finally:
+            self.ledger._clock_us=original_clock
         return now
 
     def ready(self):
@@ -461,18 +466,20 @@ class LedgerTests(unittest.TestCase):
     def test_review_r4_manifest_ids_use_real_primary_keys(self):
         now=self.seed()
         c=self.ledger.connection
-        c.execute("INSERT INTO snapshots SELECT 'snapshot-2',account_id,release_hash,candle_close_us,knowledge_cutoff_us,field_hash,state_json,tokenizer_hash,token_count,lineage_hash,account_revision,valid,invalid_reason,recorded_at_us FROM snapshots")
-        for run in ('run-1','run-2'):
-            c.execute("INSERT INTO evaluation_runs VALUES (?,?,?,?,?,'{}','completed',?)",(run,RELEASE_HASH,HASH_A,HASH_B,'holdout',now))
-        c.execute("INSERT INTO forecasts VALUES ('forecast','decision-test',1,'buy',4,'[]',NULL,NULL,0,?,?)",(HASH_A,now))
-        c.execute("INSERT INTO outcome_labels VALUES ('label','forecast',0,?,NULL,'pending',NULL,NULL,NULL,NULL,0)",(now+100,))
-        for revision,event_id,previous in ((0,'label-pending',None),(1,'label-corrected','label-pending')):
-            c.execute("INSERT INTO label_events VALUES (?,'label',?,?,'pending','{}',?,?)",(event_id,revision,previous,content_hash({}),now))
-        c.execute("INSERT INTO source_events(event_id,source,stream,logical_key,revision,event_at_us,received_at_us,known_at_us,payload_json,payload_hash,recorded_at_us) VALUES ('source','test','metric','source',0,?,?,?,'{}',?,?)",(now,now,now,content_hash({}),now))
-        for invalidation in ('invalidation-1','invalidation-2'):
-            c.execute("INSERT INTO source_invalidations VALUES (?,'source',?,'test',?)",(invalidation,now,now))
-        for line in (0,1):
-            c.execute("INSERT INTO snapshot_inputs VALUES (?,?,'source',NULL,NULL,NULL,?)",(HASH_B,line,now))
+        self.ledger._clock_us=lambda:now
+        with self.ledger.transaction():
+            c.execute("INSERT INTO snapshots SELECT 'snapshot-2',account_id,release_hash,candle_close_us,knowledge_cutoff_us,field_hash,state_json,tokenizer_hash,token_count,lineage_hash,account_revision,valid,invalid_reason,recorded_at_us FROM snapshots")
+            for run in ('run-1','run-2'):
+                c.execute("INSERT INTO evaluation_runs VALUES (?,?,?,?,?,'{}','completed',?)",(run,RELEASE_HASH,HASH_A,HASH_B,'holdout',now))
+            c.execute("INSERT INTO forecasts VALUES ('forecast','decision-test',1,'buy',4,'[]',NULL,NULL,0,?,?)",(HASH_A,now))
+            c.execute("INSERT INTO outcome_labels VALUES ('label','forecast',0,?,NULL,'pending',NULL,NULL,NULL,NULL,0)",(now+100,))
+            for revision,event_id,previous in ((0,'label-pending',None),(1,'label-corrected','label-pending')):
+                c.execute("INSERT INTO label_events VALUES (?,'label',?,?,'pending','{}',?,?)",(event_id,revision,previous,content_hash({}),now))
+            c.execute("INSERT INTO source_events(event_id,source,stream,logical_key,revision,event_at_us,received_at_us,known_at_us,payload_json,payload_hash,recorded_at_us) VALUES ('source','test','metric','source',0,?,?,?,'{}',?,?)",(now,now,now,content_hash({}),now))
+            for invalidation in ('invalidation-1','invalidation-2'):
+                c.execute("INSERT INTO source_invalidations VALUES (?,'source',?,'test',?)",(invalidation,now,now))
+            for line in (0,1):
+                c.execute("INSERT INTO snapshot_inputs VALUES (?,?,'source',NULL,NULL,NULL,?)",(HASH_B,line,now))
         archive,_=self.export_payload(SessionCutoff('paper-test',now+10,'reconcile'))
         identities=[entry.record_id for entry in archive.event_manifest+archive.outcome_manifest+archive.artifact_manifest]
         self.assertEqual(len(identities),len(set(identities)))
@@ -513,3 +520,71 @@ class LedgerTests(unittest.TestCase):
         with localcontext() as context:
             context.prec=6
             self.assertTrue(self.ledger.append_order_event(event).appended)
+
+    def test_review_r2_event_before_commit_capture_uses_previous_committed_prefix(self):
+        p=self.ready()
+        base=time.time_ns()//1000+1000
+        self.ledger._clock_us=lambda:base
+        intent=self.reserve(p)
+        historical=self.ledger.account_view('paper-test').revision
+        # Dispatch evidence is written at T; the commit proof is captured at T+1.
+        calls=iter((base+10,base+10,base+11))
+        self.ledger._clock_us=lambda:next(calls)
+        self.ledger.mark_dispatching(intent.intent_id,intent.generation)
+        self.ledger._clock_us=lambda:base+20
+        archive,payload=self.export_payload(SessionCutoff('paper-test',base+10,'reconcile'))
+        self.assertEqual(historical,archive.account_revision)
+        self.assertEqual('reserved',payload['order_intents'][0]['state'])
+        self.assertEqual(['reserved'],[row['kind'] for row in payload['order_events']])
+
+    def test_review_r2_clock_regression_cutoff_preserves_committed_event_prefix(self):
+        p=self.ready()
+        base=time.time_ns()//1000+1000
+        clock=[base+80]
+        self.ledger._clock_us=lambda:clock[0]
+        intent=self.reserve(p)
+        self.ledger.mark_dispatching(intent.intent_id,intent.generation)
+        historical=self.ledger.account_view('paper-test').revision
+        clock[0]=base+100
+        self.ledger.append_order_event(self.status_event(intent,'open-at-100',IntentState.OPEN,base+100))
+        clock[0]=base+90
+        self.ledger.append_order_event(self.status_event(intent,'partial-at-90',IntentState.PARTIAL,base+90,filled='.5',remaining='.5'))
+        archive,payload=self.export_payload(SessionCutoff('paper-test',base+95,'reconcile'))
+        self.assertEqual(historical,archive.account_revision)
+        self.assertEqual('dispatching',payload['order_intents'][0]['state'])
+        self.assertEqual(['reserved','dispatching'],[row['kind'] for row in sorted(payload['order_events'],key=lambda row:row['append_sequence'])])
+
+    def test_review_r2_nested_result_receipt_participates_in_revision_visibility(self):
+        p=self.ready()
+        base=time.time_ns()//1000+1000
+        self.ledger._clock_us=lambda:base
+        intent=self.reserve(p)
+        self.ledger.mark_dispatching(intent.intent_id,intent.generation)
+        historical=self.ledger.account_view('paper-test').revision
+        event=self.status_event(intent,'nested-future-receipt',IntentState.OPEN,base)
+        event=dataclasses.replace(event,result=dataclasses.replace(event.result,received_at_us=base+100))
+        self.ledger.append_order_event(event)
+        current=self.ledger.account_view('paper-test').revision
+        archive,payload=self.export_payload(SessionCutoff('paper-test',base+10,'reconcile'))
+        self.assertEqual(historical,archive.account_revision)
+        self.assertEqual('dispatching',payload['order_intents'][0]['state'])
+        later,later_payload=self.export_payload(SessionCutoff('paper-test',base+100,'reconcile'))
+        self.assertEqual(current,later.account_revision)
+        self.assertEqual('open',later_payload['order_intents'][0]['state'])
+
+    def test_review_r2_non_economic_import_commits_new_prefix_without_revision_change(self):
+        now=self.seed()
+        base=time.time_ns()//1000+1000
+        self.ledger._clock_us=lambda:base
+        before=self.ledger.account_view('paper-test').revision
+        count=self.ledger.connection.execute('SELECT count(*) FROM account_revision_history').fetchone()[0]
+        with self.ledger.transaction() as c:
+            c.execute("INSERT INTO source_events(event_id,source,stream,logical_key,revision,event_at_us,received_at_us,known_at_us,payload_json,payload_hash,recorded_at_us) VALUES ('new-observation','test','metric','new',0,?,?,?,'{}',?,?)",(base,base,base,content_hash({}),base))
+        self.assertEqual(before,self.ledger.account_view('paper-test').revision)
+        self.assertEqual(count+1,self.ledger.connection.execute('SELECT count(*) FROM account_revision_history').fetchone()[0])
+        archive,payload=self.export_payload(SessionCutoff('paper-test',base,'reconcile'))
+        self.assertEqual(['new-observation'],[row['event_id'] for row in payload['source_events']])
+        self.assertEqual(before,archive.account_revision)
+        with self.ledger.transaction():
+            pass
+        self.assertEqual(count+1,self.ledger.connection.execute('SELECT count(*) FROM account_revision_history').fetchone()[0])

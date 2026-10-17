@@ -97,7 +97,7 @@ CREATE TRIGGER intent_identity_immutable BEFORE UPDATE OF intent_id,account_id,d
 CREATE TRIGGER intent_no_delete BEFORE DELETE ON order_intents BEGIN SELECT RAISE(ABORT,'retained intent'); END;
 
 -- Cutoff-proven revision/generation snapshots recorded within each outer commit.
-CREATE TABLE account_revision_history(append_sequence INTEGER PRIMARY KEY AUTOINCREMENT,account_id TEXT NOT NULL REFERENCES accounts(account_id),journal_sequence INTEGER NOT NULL CHECK(journal_sequence>=0),version INTEGER NOT NULL CHECK(version>=0),generation INTEGER NOT NULL CHECK(generation>=0),known_at_us INTEGER NOT NULL CHECK(known_at_us>=recorded_at_us),recorded_at_us INTEGER NOT NULL) STRICT;
+CREATE TABLE account_revision_history(append_sequence INTEGER PRIMARY KEY AUTOINCREMENT,account_id TEXT NOT NULL REFERENCES accounts(account_id),journal_sequence INTEGER NOT NULL CHECK(journal_sequence>=0),version INTEGER NOT NULL CHECK(version>=0),generation INTEGER NOT NULL CHECK(generation>=0),evidence_watermarks_json TEXT NOT NULL CHECK(json_valid(evidence_watermarks_json)),known_at_us INTEGER NOT NULL CHECK(known_at_us>=recorded_at_us),recorded_at_us INTEGER NOT NULL) STRICT;
 CREATE INDEX account_revision_cutoff ON account_revision_history(account_id,known_at_us,append_sequence);
 CREATE TRIGGER account_revision_history_no_update BEFORE UPDATE ON account_revision_history BEGIN SELECT RAISE(ABORT,'append-only account_revision_history'); END;
 CREATE TRIGGER account_revision_history_no_delete BEFORE DELETE ON account_revision_history BEGIN SELECT RAISE(ABORT,'append-only account_revision_history'); END;

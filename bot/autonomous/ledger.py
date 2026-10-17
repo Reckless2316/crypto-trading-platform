@@ -606,32 +606,42 @@ class Ledger:
             (event_id,intent_id,kind,venue_event_key,payload_json,event_at_us,received_at_us,recorded_at_us))
 
     def _record_revisions(self) -> None:
-        """Capture mutable revision/generation before, and atomically with, commit.
+        """Commit a revision and an exact durable prefix for every evidence table.
 
-        A future observation cannot make this snapshot knowable before its own
-        event/receipt time. Prior knowledge timestamps never regress within an
-        account, even when the process UTC clock moves backward.
+        AccountRevision alone does not change for source/artifact imports. Their
+        prefix changes still create a new history row. The history table itself
+        is excluded explicitly to avoid an endlessly self-advancing watermark.
+        Immutable tables retain rowids; mutable order/label/account rows export
+        only stable identity fields or projections rebuilt from this evidence.
         """
+        tables=tuple(table for table in _EXPORT_TIMES if table!='account_revision_history')
+        watermarks={table:self.connection.execute('SELECT coalesce(max(rowid),0) FROM '+table).fetchone()[0] for table in tables}
+        watermarks_json=canonical_bytes(watermarks).decode()
+        # Use exactly the export visibility policies when establishing when the
+        # whole committed prefix is knowable, including nested venue receipts.
+        prefix_known=0
+        for table in tables:
+            for timestamp in _EXPORT_TIMES[table]:
+                value=self.connection.execute('SELECT max('+timestamp+') FROM '+table+' WHERE rowid<=?',(watermarks[table],)).fetchone()[0]
+                prefix_known=max(prefix_known,value or 0)
+        nested_receipt=self.connection.execute("SELECT max(json_extract(payload_json,'$.result.received_at_us')) FROM order_events WHERE rowid<=?",(watermarks['order_events'],)).fetchone()[0]
+        prefix_known=max(prefix_known,nested_receipt or 0)
         for account in self.connection.execute('SELECT account_id,generation FROM accounts').fetchall():
             account_id=account['account_id']
             revision=self._revision(account_id)
             previous=self.connection.execute('SELECT * FROM account_revision_history WHERE account_id=? ORDER BY append_sequence DESC LIMIT 1',(account_id,)).fetchone()
-            if previous and (previous['journal_sequence'],previous['version'],previous['generation'])==(revision.journal_sequence,revision.version,account['generation']):
+            if previous and (previous['journal_sequence'],previous['version'],previous['generation'],previous['evidence_watermarks_json'])==(revision.journal_sequence,revision.version,account['generation'],watermarks_json):
                 continue
             recorded=self._clock_us()
-            known=max(recorded,previous['known_at_us'] if previous else 0)
-            for sql in (
-                'SELECT max(max(coalesce(e.event_at_us,0),e.received_at_us,e.recorded_at_us)) FROM order_events e JOIN order_intents i USING(intent_id) WHERE i.account_id=?',
-                'SELECT max(max(event_at_us,recorded_at_us)) FROM journal_transactions WHERE account_id=?',
-                'SELECT max(max(event_at_us,received_at_us,recorded_at_us)) FROM fills WHERE account_id=?',
-                'SELECT max(max(marked_at_us,recorded_at_us)) FROM equity_marks WHERE account_id=?',
-                'SELECT max(max(started_at_us,coalesce(finished_at_us,0),recorded_at_us)) FROM reconciliations WHERE account_id=?',
-                'SELECT updated_at_us FROM account_control WHERE account_id=?',
-                'SELECT private_heartbeat_us FROM account_readiness WHERE account_id=?'):
+            known=max(recorded,prefix_known,previous['known_at_us'] if previous else 0)
+            # These mutable inputs are deliberately omitted from replay payload;
+            # their revision still cannot precede current control/private proof.
+            for sql in ('SELECT updated_at_us FROM account_control WHERE account_id=?',
+                        'SELECT private_heartbeat_us FROM account_readiness WHERE account_id=?'):
                 value=self.connection.execute(sql,(account_id,)).fetchone()[0]
                 known=max(known,value or 0)
-            self.connection.execute('INSERT INTO account_revision_history(account_id,journal_sequence,version,generation,known_at_us,recorded_at_us) VALUES (?,?,?,?,?,?)',
-                (account_id,revision.journal_sequence,revision.version,account['generation'],known,recorded))
+            self.connection.execute('INSERT INTO account_revision_history(account_id,journal_sequence,version,generation,evidence_watermarks_json,known_at_us,recorded_at_us) VALUES (?,?,?,?,?,?,?)',
+                (account_id,revision.journal_sequence,revision.version,account['generation'],watermarks_json,known,recorded))
 
     @staticmethod
     def _manifest_entries(export: dict, tables: tuple[str,...]) -> tuple[ManifestEntry,...]:
@@ -694,6 +704,15 @@ class Ledger:
             reconcile = c.execute('SELECT * FROM reconciliations WHERE reconcile_id=? AND account_id=?',(cutoff.reconcile_id,cutoff.account_id)).fetchone()
             if reconcile is None or reconcile['status']!='completed' or reconcile['finished_at_us'] is None or reconcile['finished_at_us']>cutoff.cutoff_us or reconcile['recorded_at_us']>cutoff.cutoff_us:
                 raise ContractViolation('session lacks cutoff-consistent reconciliation')
+            historical=c.execute('SELECT * FROM account_revision_history WHERE account_id=? AND recorded_at_us<=? AND known_at_us<=? ORDER BY append_sequence DESC LIMIT 1',
+                (cutoff.account_id,cutoff.cutoff_us,cutoff.cutoff_us)).fetchone()
+            if historical is None:
+                raise ContractViolation('cutoff has no proven committed account prefix')
+            watermarks=strict_json(historical['evidence_watermarks_json'])
+            expected_tables=set(_EXPORT_TIMES)-{'account_revision_history'}
+            if type(watermarks) is not dict or set(watermarks)!=expected_tables or any(type(value) is not int or value<0 for value in watermarks.values()):
+                raise ContractViolation('invalid committed evidence watermark map')
+            revision=AccountRevision(historical['journal_sequence'],historical['version'])
             # Serialize an actual consistent replay payload, not a hash of the
             # current revision. Account-bound tables are selected by account FKs;
             # shared causal source/artifact evidence may be included conservatively.
@@ -706,7 +725,10 @@ class Ledger:
                 if table not in _EXPORT_TIMES:
                     raise ContractViolation('missing explicit export visibility policy for '+table)
                 columns = {r['name'] for r in c.execute('PRAGMA table_info('+table+')')}
-                clauses,parameters = [],[]
+                if table=='account_revision_history':
+                    clauses,parameters=['append_sequence<=?'],[historical['append_sequence']]
+                else:
+                    clauses,parameters=['rowid<=?'],[watermarks[table]]
                 if 'account_id' in columns:
                     clauses.append('account_id=?'); parameters.append(account_id)
                 elif 'intent_id' in columns:
@@ -725,13 +747,8 @@ class Ledger:
                     parameters.append(cutoff.cutoff_us)
                 rows = [dict(r) for r in c.execute('SELECT * FROM '+table+(' WHERE '+' AND '.join(clauses) if clauses else ''),parameters)]
                 export[table] = sorted(rows,key=canonical_bytes)
-            history=sorted(export.get('account_revision_history',[]),key=lambda row:row['append_sequence'])
-            if not history:
-                raise ContractViolation('cutoff has no proven account revision')
-            historical=history[-1]
-            revision=AccountRevision(historical['journal_sequence'],historical['version'])
             if revision.journal_sequence!=max((row['sequence'] for row in export['journal_transactions']),default=0):
-                raise ContractViolation('cutoff journal and revision evidence disagree')
+                raise ContractViolation('cutoff journal and committed prefix disagree')
             for row in export['accounts']:
                 row['generation']=historical['generation']
             # Mutable order status is replayed from evidence at the cutoff;
