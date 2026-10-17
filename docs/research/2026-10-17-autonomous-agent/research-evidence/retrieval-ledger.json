@@ -1,0 +1,68 @@
+[
+  {
+    "name": "coinbase_btc_daily",
+    "url": "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=86400",
+    "status": 200,
+    "sha256": "ec09c9c8858e6aeb548f6480e543349f12f93a8e06312de5fc7477a075484086",
+    "bytes": 21456,
+    "request_started_at": "2026-10-17T07:07:01.241009+00:00",
+    "received_at": null,
+    "receipt_note": "Initial capture recorded request start, not receipt; file mtime is an upper bound on receipt.",
+    "received_at_upper_bound": "2026-10-17T07:07:01.315130+00:00"
+  },
+  {
+    "name": "coinbase_eth_daily",
+    "url": "https://api.exchange.coinbase.com/products/ETH-USD/candles?granularity=86400",
+    "status": 200,
+    "sha256": "f5531f3f4364a70d5780730d23740ff3053fdae8fdcada3a3207aa44dcbc09c7",
+    "bytes": 20725,
+    "request_started_at": "2026-10-17T07:07:01.241694+00:00",
+    "received_at": null,
+    "receipt_note": "Initial capture recorded request start, not receipt; file mtime is an upper bound on receipt.",
+    "received_at_upper_bound": "2026-10-17T07:07:01.311271+00:00"
+  },
+  {
+    "name": "deribit_btc",
+    "url": "https://www.deribit.com/api/v2/public/get_book_summary_by_currency?currency=BTC&kind=future",
+    "status": 200,
+    "sha256": "2639322b9639c1a31536ee95f098616d5352fa1d0401dfce95a9573bc40b9f66",
+    "bytes": 5290,
+    "request_started_at": "2026-10-17T07:07:01.242092+00:00",
+    "received_at": null,
+    "receipt_note": "Initial capture recorded request start, not receipt; file mtime is an upper bound on receipt.",
+    "received_at_upper_bound": "2026-10-17T07:07:01.435570+00:00"
+  },
+  {
+    "name": "deribit_eth",
+    "url": "https://www.deribit.com/api/v2/public/get_book_summary_by_currency?currency=ETH&kind=future",
+    "status": 200,
+    "sha256": "b63ab9c95e65c817140814fd8e1436d42df70ee45ac9962f0c2c8ab78d07f5ff",
+    "bytes": 5194,
+    "request_started_at": "2026-10-17T07:07:01.242473+00:00",
+    "received_at": null,
+    "receipt_note": "Initial capture recorded request start, not receipt; file mtime is an upper bound on receipt.",
+    "received_at_upper_bound": "2026-10-17T07:07:01.433298+00:00"
+  },
+  {
+    "name": "coingecko_global_secondary",
+    "url": "https://api.coingecko.com/api/v3/global",
+    "status": 200,
+    "sha256": "01bb95ba95644a938229d2dac1f1f6c7574a4fab3bc6193ce430dbceec17fa75",
+    "bytes": 3775,
+    "request_started_at": "2026-10-17T07:07:01.242866+00:00",
+    "received_at": null,
+    "receipt_note": "Initial capture recorded request start, not receipt; file mtime is an upper bound on receipt.",
+    "received_at_upper_bound": "2026-10-17T07:07:01.350406+00:00"
+  },
+  {
+    "name": "stablecoins_secondary",
+    "url": "https://stablecoins.llama.fi/stablecoincharts/all",
+    "status": 200,
+    "sha256": "cfc57b1741a9ede9594c35a1233479701ab9643256131652df6ef02946a0f056",
+    "bytes": 1320716,
+    "request_started_at": "2026-10-17T07:07:01.243340+00:00",
+    "received_at": null,
+    "receipt_note": "Initial capture recorded request start, not receipt; file mtime is an upper bound on receipt.",
+    "received_at_upper_bound": "2026-10-17T07:07:01.412698+00:00"
+  }
+]

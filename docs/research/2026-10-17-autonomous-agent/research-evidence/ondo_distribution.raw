@@ -1,0 +1,298 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Unlocking ONDO: A Proposal from the Ondo Foundation</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Lora:ital,wght@0,400;0,500;0,600;0,700;1,400;1,700&family=Inter:wght@400;500;600;700;800&display=swap">
+    <link rel="stylesheet" href="https://blog.ondo.foundation/assets/built/screen.css?v=KH7Rko7jICgVMy4U">
+
+    <link rel="icon" href="https://storage.ghost.io/c/22/ef/22ef69f2-9657-4bb7-b747-0ec972b9ea72/content/images/size/w256h256/2023/12/Ondo-Icon-Black-L.png" type="image/png">
+    <link rel="canonical" href="https://blog.ondo.foundation/unlocking-ondo-a-proposal-from-the-ondo-foundation/">
+    <meta name="referrer" content="no-referrer-when-downgrade">
+    
+    <meta property="og:site_name" content="Ondo Foundation Blog">
+    <meta property="og:type" content="article">
+    <meta property="og:title" content="Unlocking ONDO: A Proposal from the Ondo Foundation">
+    <meta property="og:description" content="The Ondo Foundation is excited to announce a significant milestone in our journey: the proposed release of the ONDO token lock-up. This marks a pivotal moment, aligning our community toward a future of open, transparent, and efficient global finance. This document provides a concise overview of ONDO&#x27;s origin,">
+    <meta property="og:url" content="https://blog.ondo.foundation/unlocking-ondo-a-proposal-from-the-ondo-foundation/">
+    <meta property="og:image" content="https://storage.ghost.io/c/22/ef/22ef69f2-9657-4bb7-b747-0ec972b9ea72/content/images/size/w1200/2023/12/Ondo-Foundation.png">
+    <meta property="article:published_time" content="2023-12-27T14:36:00.000Z">
+    <meta property="article:modified_time" content="2026-02-24T10:47:33.000Z">
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="Unlocking ONDO: A Proposal from the Ondo Foundation">
+    <meta name="twitter:description" content="The Ondo Foundation is excited to announce a significant milestone in our journey: the proposed release of the ONDO token lock-up. This marks a pivotal moment, aligning our community toward a future of open, transparent, and efficient global finance. This document provides a concise overview of ONDO&#x27;s origin,">
+    <meta name="twitter:url" content="https://blog.ondo.foundation/unlocking-ondo-a-proposal-from-the-ondo-foundation/">
+    <meta name="twitter:image" content="https://storage.ghost.io/c/22/ef/22ef69f2-9657-4bb7-b747-0ec972b9ea72/content/images/size/w1200/2023/12/Ondo-Foundation.png">
+    <meta name="twitter:label1" content="Written by">
+    <meta name="twitter:data1" content="Ondo Foundation">
+    <meta name="twitter:site" content="@ondofoundation">
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="675">
+    
+    <script type="application/ld+json">
+{
+    "@context": "https://schema.org",
+    "@type": "Article",
+    "publisher": {
+        "@type": "Organization",
+        "name": "Ondo Foundation Blog",
+        "url": "https://blog.ondo.foundation/",
+        "logo": {
+            "@type": "ImageObject",
+            "url": "https://storage.ghost.io/c/22/ef/22ef69f2-9657-4bb7-b747-0ec972b9ea72/content/images/2023/12/Ondo-Foundation-Logo-2.svg"
+        }
+    },
+    "author": {
+        "@type": "Person",
+        "name": "Ondo Foundation",
+        "image": {
+            "@type": "ImageObject",
+            "url": "https://storage.ghost.io/c/22/ef/22ef69f2-9657-4bb7-b747-0ec972b9ea72/content/images/2023/12/Ondo-Coinbase-b-tp-f.png",
+            "width": 1000,
+            "height": 1000
+        },
+        "url": "https://blog.ondo.foundation/author/ondofoundation/",
+        "sameAs": []
+    },
+    "headline": "Unlocking ONDO: A Proposal from the Ondo Foundation",
+    "url": "https://blog.ondo.foundation/unlocking-ondo-a-proposal-from-the-ondo-foundation/",
+    "datePublished": "2023-12-27T14:36:00.000Z",
+    "dateModified": "2026-02-24T10:47:33.000Z",
+    "image": {
+        "@type": "ImageObject",
+        "url": "https://storage.ghost.io/c/22/ef/22ef69f2-9657-4bb7-b747-0ec972b9ea72/content/images/size/w1200/2023/12/Ondo-Foundation.png",
+        "width": 1200,
+        "height": 675
+    },
+    "description": "The Ondo Foundation is excited to announce a significant milestone in our journey: the proposed release of the ONDO token lock-up. This marks a pivotal moment, aligning our community toward a future of open, transparent, and efficient global finance. This document provides a concise overview of ONDO's origin, its strategic role, and the planned token distribution that shapes our collective path forward.\n\n\nONDO Genesis and Real World Entities\n\nOndo Finance, founded in 2021, is a US-based technolo",
+    "mainEntityOfPage": "https://blog.ondo.foundation/unlocking-ondo-a-proposal-from-the-ondo-foundation/"
+}
+    </script>
+
+    <meta name="generator" content="Ghost 6.71">
+    <link rel="alternate" type="application/rss+xml" title="Ondo Foundation Blog" href="https://blog.ondo.foundation/rss/">
+    <script defer src="https://cdn.jsdelivr.net/ghost/portal@~2.72/umd/portal.min.js" data-i18n="true" data-ghost="https://blog.ondo.foundation/" data-key="c1bea7ae2dba1d57045a0b07cd" data-api="https://ondo-foundation.ghost.io/ghost/api/content/" data-locale="en" crossorigin="anonymous"></script><style id="gh-members-styles">.gh-post-upgrade-cta-content,
+.gh-post-upgrade-cta {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, 'Open Sans', 'Helvetica Neue', sans-serif;
+    text-align: center;
+    width: 100%;
+    color: #ffffff;
+    font-size: 16px;
+}
+
+.gh-post-upgrade-cta-content {
+    border-radius: 8px;
+    padding: 40px 4vw;
+}
+
+.gh-post-upgrade-cta h2 {
+    color: #ffffff;
+    font-size: 28px;
+    letter-spacing: -0.2px;
+    margin: 0;
+    padding: 0;
+}
+
+.gh-post-upgrade-cta p {
+    margin: 20px 0 0;
+    padding: 0;
+}
+
+.gh-post-upgrade-cta small {
+    font-size: 16px;
+    letter-spacing: -0.2px;
+}
+
+.gh-post-upgrade-cta a {
+    color: #ffffff;
+    cursor: pointer;
+    font-weight: 500;
+    box-shadow: none;
+    text-decoration: underline;
+}
+
+.gh-post-upgrade-cta a:hover {
+    color: #ffffff;
+    opacity: 0.8;
+    box-shadow: none;
+    text-decoration: underline;
+}
+
+.gh-post-upgrade-cta a.gh-btn {
+    display: block;
+    background: #ffffff;
+    text-decoration: none;
+    margin: 28px 0 0;
+    padding: 8px 18px;
+    border-radius: 4px;
+    font-size: 16px;
+    font-weight: 600;
+}
+
+.gh-post-upgrade-cta a.gh-btn:hover {
+    opacity: 0.92;
+}</style>
+    <script defer src="https://cdn.jsdelivr.net/ghost/sodo-search@~1.9/umd/sodo-search.min.js" data-key="c1bea7ae2dba1d57045a0b07cd" data-styles="https://cdn.jsdelivr.net/ghost/sodo-search@~1.9/umd/main.css" data-sodo-search="https://ondo-foundation.ghost.io/" data-locale="en" crossorigin="anonymous"></script>
+    
+    <link href="https://blog.ondo.foundation/webmentions/receive/" rel="webmention">
+    <script defer src="/public/cards.min.js?v=ShRHxgy4po8zN-Wf"></script>
+    <link rel="stylesheet" type="text/css" href="/public/cards.min.css?v=WwnU9jw5ancNC8Gc">
+    <script defer src="/public/member-attribution.min.js?v=AKG4hWena9j3yX3I"></script>
+    <script defer src="/public/ghost-stats.min.js?v=vFcCUf6ZQ0Hyhc8h" data-stringify-payload="false" data-datasource="analytics_events" data-storage="localStorage" data-host="https://blog.ondo.foundation/.ghost/analytics/api/v1/page_hit"  tb_site_uuid="22ef69f2-9657-4bb7-b747-0ec972b9ea72" tb_post_uuid="93483237-a97c-407c-ad3b-de6c2cf78b99" tb_post_type="post" tb_member_uuid="undefined" tb_member_status="undefined" tb_gift_link=""></script><style>:root {--ghost-accent-color: #000000;}</style>
+    <style>
+.gh-head-logo img {max-height: 70px;}
+</style>
+</head>
+
+<body class="post-template is-head-b--a_n has-serif-body">
+    <div class="gh-site">
+        <header id="gh-head" class="gh-head gh-outer">
+            <div class="gh-head-inner gh-inner">
+              <div>
+                <button class="gh-search gh-icon-btn" aria-label="Search this site" data-ghost-search><svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" width="20" height="20"><path stroke-linecap="round" stroke-linejoin="round" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"></path></svg></button>
+              </div>
+                <div class="gh-head-brand">
+                    <a class="gh-head-logo" href="https://blog.ondo.foundation">
+                            <img src="https://storage.ghost.io/c/22/ef/22ef69f2-9657-4bb7-b747-0ec972b9ea72/content/images/2023/12/Ondo-Foundation-Logo-2.svg" alt="Ondo Foundation Blog">
+
+                    </a>
+                    <button class="gh-burger"></button>
+                </div>
+
+                <nav class="gh-head-menu">
+                    <ul class="nav">
+    <li class="nav-ondo-foundation"><a href="https://ondo.foundation/">Ondo Foundation</a></li>
+    <li class="nav-ondo-finance"><a href="https://ondo.finance/">Ondo Finance</a></li>
+    <li class="nav-flux-finance"><a href="https://fluxfinance.com/">Flux Finance</a></li>
+</ul>
+
+                </nav>
+
+                <div class="gh-head-actions">
+                        <a class="gh-head-btn gh-btn gh-primary-btn" href="#/portal/signup" data-portal="signup">Subscribe</a>
+                </div>
+            </div>
+        </header>
+
+
+        
+<main class="gh-main">
+        <article class="gh-article post">
+            <header class="gh-article-header gh-canvas">
+
+                <h1 class="gh-article-title">Unlocking ONDO: A Proposal from the Ondo Foundation</h1>
+
+                    <aside class="gh-article-sidebar">
+            <figure class="gh-author-image">
+                    <img src="https://storage.ghost.io/c/22/ef/22ef69f2-9657-4bb7-b747-0ec972b9ea72/content/images/2023/12/Ondo-Coinbase-b-tp-f.png" alt="Ondo Foundation">
+            </figure>
+
+            <h4 class="gh-author-name">
+                <a href="/author/ondofoundation/">Ondo Foundation</a>
+            </h4>
+
+        <div class="gh-article-meta">
+            <time class="gh-article-date" datetime="2023-12-27">Dec 27, 2023</time>
+
+                <span class="gh-article-meta-sep"></span>
+                <span class="gh-article-length">6 min</span>
+        </div>
+    </aside>
+
+
+                    <figure class="gh-article-image">
+                        <img
+                            srcset="https://storage.ghost.io/c/22/ef/22ef69f2-9657-4bb7-b747-0ec972b9ea72/content/images/size/w300/2023/12/Ondo-Foundation.png 300w,
+                                    https://storage.ghost.io/c/22/ef/22ef69f2-9657-4bb7-b747-0ec972b9ea72/content/images/size/w720/2023/12/Ondo-Foundation.png 720w,
+                                    https://storage.ghost.io/c/22/ef/22ef69f2-9657-4bb7-b747-0ec972b9ea72/content/images/size/w960/2023/12/Ondo-Foundation.png 960w,
+                                    https://storage.ghost.io/c/22/ef/22ef69f2-9657-4bb7-b747-0ec972b9ea72/content/images/size/w1200/2023/12/Ondo-Foundation.png 1200w,
+                                    https://storage.ghost.io/c/22/ef/22ef69f2-9657-4bb7-b747-0ec972b9ea72/content/images/size/w2000/2023/12/Ondo-Foundation.png 2000w"
+                            sizes="(max-width: 1200px) 100vw, 1200px"
+                            src="https://storage.ghost.io/c/22/ef/22ef69f2-9657-4bb7-b747-0ec972b9ea72/content/images/size/w1200/2023/12/Ondo-Foundation.png"
+                            alt="Unlocking ONDO: A Proposal from the Ondo Foundation"
+                        >
+                    </figure>
+            </header>
+
+            <section class="gh-content gh-canvas">
+                <p>The Ondo Foundation is excited to announce a significant milestone in our journey: the proposed release of the ONDO token lock-up. This marks a pivotal moment, aligning our community toward a future of open, transparent, and efficient global finance. This document provides a concise overview of ONDO's origin, its strategic role, and the planned token distribution that shapes our collective path forward.</p><h2 id="ondo-genesis-and-real-world-entities">ONDO Genesis and Real World Entities</h2><p>Ondo Finance, founded in 2021, is a US-based technology company focused on making institutional-grade financial products and services available to everyone. Ondo Finance manages over $200 million in tokenized assets and has developed decentralized financial protocols, including Flux Finance, the world’s first lending protocol supporting tokenized securities as collateral. Ondo Finance has raised $24 million in equity financing from Peter Thiel’s Founders Fund, Pantera, and Coinbase, works with institutional-grade service providers like Blackrock and Morgan Stanley, and is led by the former leadership of the Goldman Sachs Digital Assets team.</p><p>In 2022, Ondo Finance helped to establish the Ondo Foundation (formerly known as the Neptune Foundation), an independently-governed and nonprofit Cayman Islands Foundation Company with no beneficial owners and a mission similar to that of Ondo Finance: democratizing access to institutional-grade finance.&nbsp;</p><p>As its first act, the Ondo Foundation acquired ONDO token issuance rights from Ondo Finance. In mid 2022, Ondo Foundation, through its subsidiaries, sold ONDO tokens to over 18,000 individuals through CoinList.&nbsp;</p><p>Ondo Foundation subsequently assisted in the launch of the Ondo DAO, which deployed and currently governs Flux Finance, the first lending protocol supporting tokenized securities as collateral, with approximately $50 million in assets today.&nbsp;</p><h2 id="governance-and-the-ondo-dao">Governance and the Ondo DAO</h2><p>ONDO token holders are entrusted with shaping the future of the Ondo DAO so that it continues to pursue its mission to democratize access to institutional-grade finance.&nbsp;</p><p>The Ondo DAO gives ONDO holders the following specific rights pertaining to Flux Finance, which is currently governed by the Ondo DAO:</p><ul><li>List a new fToken market (i.e. support new assets as collateral and/or to be lendable within the Flux protocol)</li><li>Pause fToken markets</li><li>Update the interest rate model per market</li><li>Update the oracle address</li><li>Withdraw the reserve of a fToken market</li></ul><p>More information on these specific mechanics can be found at <a href="https://docs.fluxfinance.com/?ref=blog.ondo.foundation"><u>https://docs.fluxfinance.com/</u></a>&nbsp;</p><p>The Ondo DAO has the following additional rights:</p><ul><li>Choose a new admin</li><li>Manage a treasury of assets</li><li>Control ONDO emissions to efficiently grow use of Ondo DAO products</li><li>Call any arbitrary function</li></ul><p>The capability to execute these initiatives is already fully established at the Ondo DAO and any future features would need to be established by a decentralized group of ONDO holders. There have already been <a href="https://www.tally.xyz/gov/ondo-dao/proposals?ref=blog.ondo.foundation"><u>seven fully executed DAO proposals</u></a> and the Ondo DAO has over 11k unique registered token holders and almost 2k active voters on <a href="https://www.tally.xyz/?ref=blog.ondo.foundation"><u>Tally</u></a>.</p><h2 id="ondo-foundation">Ondo Foundation</h2><p>The Ondo DAO is supported by the Ondo Foundation. As part of its mission to democratize access to institutional-grade finance, the Ondo Foundation is focused on supporting decentralized protocols like Flux, acting as a real world touch point for the Ondo DAO and, more recently, supporting tokenized real world assets (RWAs) like USDY. Notably, the Ondo Foundation, through its subsidiaries, owns 99% of the common equity in Ondo USDY LLC, the issuer of USDY. The Ondo Foundation therefore benefits from the growth of USDY and uses proceeds from this growth in furtherance of its mission.</p><p>Ondo Foundation’s mandate is focused on several additional key areas:</p><ul><li><strong>Supporting Innovation:</strong> Financing and endorsing projects that responsibly advance the adoption of tokenized RWAs and their use in onchain financial protocols</li><li><strong>Educating and Promoting Awareness: </strong>Increasing public understanding of our ecosystem and the benefits of asset tokenization</li><li><strong>Treasury Management: </strong>Overseeing a treasury to facilitate strategic ecosystem growth</li><li><strong>Contract Deployment:</strong> Issuing governance tokens and deploying protocol smart contracts</li><li><strong>Web Application Management: </strong>Hosting web applications for certain platforms in the ecosystem</li><li><strong>Strategic Partnerships and Engagement: </strong>Collaborating with businesses, regulators, and other stakeholders</li><li><strong>Intellectual Property Management:</strong> Acquiring and handling IP rights</li><li><strong>Community Events and Engagement: </strong>Organizing events to strengthen community ties</li></ul><p>The Ondo Foundation also works with Ondo Finance as a commercial partner that is focused on the provision of certain technology and business development services and the management of certain tokenized RWAs like USDY. </p><h2 id="ondo-distribution">ONDO Distribution</h2><p>ONDO tokens all remain subject to a lock-up (the “Global Lock-Up”) where the release of that lock-up must be agreed upon by a majority of ONDO holders. The Ondo Foundation intends to make a proposal directly to ONDO holders for a release of the Global Lock-Up as described below. This proposal is focused on long-term alignment for core contributors, strategic investors, and ecosystem participants. After a period of community discussion, we intend to post the proposal for an onchain vote.&nbsp;</p><h3 id="overview">Overview:</h3><ul><li><strong>Token Symbol: </strong>ONDO</li><li><strong>Max Supply:</strong> 10,000,000,000</li><li><strong>Initial Circulating Supply: </strong>1,426,647,567 (~14.3%)</li><li><strong>Vesting: </strong>More than 85% of the ONDO tokens would be initially locked and locked tokens would unlock 12, 24, 36, 48, and 60 months after the initial token unlock.</li><li><strong>Investors and Team: </strong>Private sale investors (excludes CoinList purchasers) and core contributors would all remain locked up for at least 12 months with a subsequent release over the following four years (five years total).</li><li><strong>Immediate Unlock for CoinList Purchasers: </strong>Participants in the Community Access Sale (facilitated by CoinList in May 2022) would be released entirely from the Global Lock-Up, with their tokens therefore representing a substantial portion of the initial circulating supply.</li></ul><p>The ONDO tokens are allocated across the following main categories:</p><ul><li><strong>Community Access Sale: </strong>198,884,411 (~2.0%)</li><li><strong>Ecosystem Growth: </strong>5,210,869,545 (~52.1%)</li><li><strong>Protocol Development:</strong> 3,300,000,000 (33.0%)</li><li><strong>Private Sales: </strong>1,290,246,044 (~12.9%)</li></ul><h3 id="ondo-unlock-schedule">ONDO Unlock Schedule</h3><figure class="kg-card kg-image-card"><img src="https://storage.ghost.io/c/22/ef/22ef69f2-9657-4bb7-b747-0ec972b9ea72/content/images/2024/12/Combined-Unlock.png" class="kg-image" alt="" loading="lazy" width="2000" height="946" srcset="https://storage.ghost.io/c/22/ef/22ef69f2-9657-4bb7-b747-0ec972b9ea72/content/images/size/w600/2024/12/Combined-Unlock.png 600w, https://storage.ghost.io/c/22/ef/22ef69f2-9657-4bb7-b747-0ec972b9ea72/content/images/size/w1000/2024/12/Combined-Unlock.png 1000w, https://storage.ghost.io/c/22/ef/22ef69f2-9657-4bb7-b747-0ec972b9ea72/content/images/size/w1600/2024/12/Combined-Unlock.png 1600w, https://storage.ghost.io/c/22/ef/22ef69f2-9657-4bb7-b747-0ec972b9ea72/content/images/2024/12/Combined-Unlock.png 2038w" sizes="(min-width: 720px) 720px"></figure><p>This proposal describes an unlock schedule relative to a to-be-determined date when the tokens first become transferable (the “Public Launch”). For example, “M2” refers to two months from the Public Launch. In this proposal, the Ondo Foundation would be responsible for choosing the exact Public Launch date, and it is expected that the Ondo Foundation will choose a Public Launch date to occur before March 31, 2024, or otherwise it will require additional approval from the ONDO holders.</p><h2 id="community-access-sale">Community Access Sale</h2><p>ONDO tokens were sold in a “Community Access Sale” to over 18,000 early community members, facilitated on the CoinList platform. Many of the sale participants were early users and advocates of the Ondo DAO. In our proposal, Community Access Sale participants would have their ONDO tokens released entirely from the Global Lock-Up on the Public Launch.</p><p>A small number of ONDO tokens would still be subject to lock-ups that would be released over the subsequent ~12 months, in accordance with the CoinList sale terms and conditions. If the Public Launch was to occur in January of 2024, then approximately 90% (179M) of the 199M ONDO tokens would be freely transferable at the Public Launch (including all tokens sold at $0.055 per token). The remaining tokens (20M) would be released over the following 12 months. The exact number of ONDO tokens circulating during the Public Launch depends on the exact date of the Public Launch.</p><h3 id="ondo-community-access-sale-unlock-schedule">ONDO Community Access Sale Unlock Schedule</h3><figure class="kg-card kg-image-card"><img src="https://lh7-us.googleusercontent.com/Q610oUjQc2WVCHJ_mHvqej81Oq1JKWPxjg_hIktqDdyhlK_ROKSfjSKQM3eybSK7iEwgxldstLxMH7XXg-e2bzrZ-4AXcJgDJNsfpNTXGi90UBlGfslaqKfCyg7q14_GJ4aJfVBnOdIbceOElC1u5xA" class="kg-image" alt="" loading="lazy" width="643" height="315"></figure><h2 id="ecosystem-growth">Ecosystem Growth</h2><p>52.1% — 5,210,869,545 ONDO</p><p>The “Ecosystem Growth” allocation is a strategic portion of tokens set aside for growth incentives such as airdrops and for contributors to the Ondo ecosystem, including developers, educators, researchers, and strategic contributors.&nbsp;</p><p>24% (1.25B) of the 5.2B ONDO tokens would be unlocked at the Public Launch. The remaining tokens (3.96B) would be subject to the unlock schedule shown below.</p><h3 id="ondo-ecosystem-growth-unlock-schedule">ONDO Ecosystem Growth Unlock Schedule</h3><figure class="kg-card kg-image-card"><img src="https://lh7-us.googleusercontent.com/4rF8zY43NxZZoEV5jDY6AMAOoS-3u746-7fOzDtIXFbrq1Lw7IVYx1rtbci1lTdTZEJypHIYvzHnC7SCXmw8KjpHZL3QBWAg_7MSNC0RvSuyPfATbP_xDCoAylFUTSGaCVLXMpYMxDsvk1Wp8h6ymKE" class="kg-image" alt="" loading="lazy" width="647" height="317"></figure><h2 id="protocol-development">Protocol Development</h2><p>33.0% — 3,300,000,000 ONDO</p><p>This portion of the token supply has been allocated to core contributors focused on building infrastructure, products, and protocols to expand the Ondo ecosystem, such as Ondo Finance.</p><p>All of the 3.3B ONDO tokens would be locked for at least 12 months following the Public Launch and subject to the unlock schedule shown below.</p><h3 id="ondo-protocol-development-unlock-schedule">ONDO Protocol Development Unlock Schedule</h3><figure class="kg-card kg-image-card"><img src="https://storage.ghost.io/c/22/ef/22ef69f2-9657-4bb7-b747-0ec972b9ea72/content/images/2024/12/Protocol-Development-Unlock.png" class="kg-image" alt="" loading="lazy" width="2000" height="925" srcset="https://storage.ghost.io/c/22/ef/22ef69f2-9657-4bb7-b747-0ec972b9ea72/content/images/size/w600/2024/12/Protocol-Development-Unlock.png 600w, https://storage.ghost.io/c/22/ef/22ef69f2-9657-4bb7-b747-0ec972b9ea72/content/images/size/w1000/2024/12/Protocol-Development-Unlock.png 1000w, https://storage.ghost.io/c/22/ef/22ef69f2-9657-4bb7-b747-0ec972b9ea72/content/images/size/w1600/2024/12/Protocol-Development-Unlock.png 1600w, https://storage.ghost.io/c/22/ef/22ef69f2-9657-4bb7-b747-0ec972b9ea72/content/images/2024/12/Protocol-Development-Unlock.png 2020w" sizes="(min-width: 720px) 720px"></figure><h2 id="private-sales">Private Sales</h2><p>12.9% — 1,290,246,044 ONDO</p><p>This category represents two historical funding rounds to strategic contributors who invested in Ondo Finance equity rounds. Please note that these funding rounds closed and the allocation has been finalized.</p><p>All of the 1.29B ONDO tokens would be locked for at least 12 months following the Public Launch and subject to the unlock schedule shown below.</p><h3 id="ondo-private-sales-unlock-schedule">ONDO Private Sales Unlock Schedule</h3><figure class="kg-card kg-image-card"><img src="https://storage.ghost.io/c/22/ef/22ef69f2-9657-4bb7-b747-0ec972b9ea72/content/images/2024/12/Private-Sales-Unlock.png" class="kg-image" alt="" loading="lazy" width="2000" height="935" srcset="https://storage.ghost.io/c/22/ef/22ef69f2-9657-4bb7-b747-0ec972b9ea72/content/images/size/w600/2024/12/Private-Sales-Unlock.png 600w, https://storage.ghost.io/c/22/ef/22ef69f2-9657-4bb7-b747-0ec972b9ea72/content/images/size/w1000/2024/12/Private-Sales-Unlock.png 1000w, https://storage.ghost.io/c/22/ef/22ef69f2-9657-4bb7-b747-0ec972b9ea72/content/images/size/w1600/2024/12/Private-Sales-Unlock.png 1600w, https://storage.ghost.io/c/22/ef/22ef69f2-9657-4bb7-b747-0ec972b9ea72/content/images/2024/12/Private-Sales-Unlock.png 2044w" sizes="(min-width: 720px) 720px"></figure><p><em>For questions, contact admin@ondo.foundation</em></p><p><em>Rev Dec 6, 2024</em></p>
+            </section>
+        </article>
+
+    </main>
+
+        <footer class="gh-foot gh-outer">
+            <div class="gh-foot-inner gh-inner">
+                    <section class="gh-subscribe">
+                        <h4 class="gh-subscribe-title">Subscribe to Ondo Foundation Blog</h3>
+
+                            <div class="gh-subscribe-description">Don&#x27;t miss out on the latest news. Sign up now to get access to the library of members-only articles.</div>
+
+                        <button class="gh-subscribe-btn gh-btn" data-portal="signup"><svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" xmlns="http://www.w3.org/2000/svg">
+    <path d="M3.33332 3.33334H16.6667C17.5833 3.33334 18.3333 4.08334 18.3333 5.00001V15C18.3333 15.9167 17.5833 16.6667 16.6667 16.6667H3.33332C2.41666 16.6667 1.66666 15.9167 1.66666 15V5.00001C1.66666 4.08334 2.41666 3.33334 3.33332 3.33334Z" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M18.3333 5L9.99999 10.8333L1.66666 5" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+</svg> Subscribe now</button>
+                    </section>
+
+
+                <div class="gh-copyright">
+                        Ondo Foundation Blog © 2026</a>
+                </div>
+            </div>
+        </footer>
+    </div>
+
+        <div class="pswp" tabindex="-1" role="dialog" aria-hidden="true">
+    <div class="pswp__bg"></div>
+
+    <div class="pswp__scroll-wrap">
+        <div class="pswp__container">
+            <div class="pswp__item"></div>
+            <div class="pswp__item"></div>
+            <div class="pswp__item"></div>
+        </div>
+
+        <div class="pswp__ui pswp__ui--hidden">
+            <div class="pswp__top-bar">
+                <div class="pswp__counter"></div>
+
+                <button class="pswp__button pswp__button--close" title="Close (Esc)"></button>
+                <button class="pswp__button pswp__button--share" title="Share"></button>
+                <button class="pswp__button pswp__button--fs" title="Toggle fullscreen"></button>
+                <button class="pswp__button pswp__button--zoom" title="Zoom in/out"></button>
+
+                <div class="pswp__preloader">
+                    <div class="pswp__preloader__icn">
+                        <div class="pswp__preloader__cut">
+                            <div class="pswp__preloader__donut"></div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="pswp__share-modal pswp__share-modal--hidden pswp__single-tap">
+                <div class="pswp__share-tooltip"></div>
+            </div>
+
+            <button class="pswp__button pswp__button--arrow--left" title="Previous (arrow left)"></button>
+            <button class="pswp__button pswp__button--arrow--right" title="Next (arrow right)"></button>
+
+            <div class="pswp__caption">
+                <div class="pswp__caption__center"></div>
+            </div>
+        </div>
+    </div>
+</div>
+    <script src="https://blog.ondo.foundation/assets/built/main.min.js?v=ZSWMI5dbtxioLboV"></script>
+
+    
+</body>
+
+</html>

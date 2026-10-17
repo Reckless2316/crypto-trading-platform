@@ -1,0 +1,35 @@
+[
+  {
+    "name": "aero_official_bundle",
+    "url": "https://aerodrome.finance/assets/index-lzCJa0hw.js",
+    "request_started_at": "2026-10-17T07:08:08.623170+00:00",
+    "error": "HTTP Error 403: Forbidden"
+  },
+  {
+    "name": "aero_contract_spec",
+    "url": "https://raw.githubusercontent.com/aerodrome-finance/contracts/main/SPECIFICATION.md",
+    "request_started_at": "2026-10-17T07:08:08.623558+00:00",
+    "status": 200,
+    "retrieved_at": "2026-10-17T07:08:08.782838+00:00",
+    "sha256": "5bf4d28db92356f8fe156690b172920b72c6b1476d28f4da8dd09c6a626c1833",
+    "bytes": 16238
+  },
+  {
+    "name": "pendle_spendle",
+    "url": "https://docs.pendle.finance/pendle-v2/ProtocolMechanics/Mechanisms/sPENDLE",
+    "request_started_at": "2026-10-17T07:08:08.624226+00:00",
+    "status": 200,
+    "retrieved_at": "2026-10-17T07:08:09.006964+00:00",
+    "sha256": "c9111708ba06fa21f3576854bd02f71a771ce5a27fac7c1e1406aca3bfc07fa3",
+    "bytes": 24409
+  },
+  {
+    "name": "deribit_docs",
+    "url": "https://docs.deribit.com/api-reference/market-data/public-get_book_summary_by_currency",
+    "request_started_at": "2026-10-17T07:08:08.624692+00:00",
+    "status": 200,
+    "retrieved_at": "2026-10-17T07:08:08.877314+00:00",
+    "sha256": "401fb3e788c14f740f9e0181b16c3c76fcbcc90ed49276bc72fa7267d0272d54",
+    "bytes": 552374
+  }
+]

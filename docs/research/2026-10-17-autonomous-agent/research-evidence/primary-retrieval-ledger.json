@@ -1,0 +1,224 @@
+[
+  {
+    "name": "aave_docs",
+    "url": "https://aave.com/docs/ecosystem/aave",
+    "request_started_at": "2026-10-17T07:07:35.923431+00:00",
+    "status": 200,
+    "retrieved_at": "2026-10-17T07:07:36.150127+00:00",
+    "sha256": "93f2739651437e3af4c1ce71e0ababeee26c8629be9411c328fae146a453c566",
+    "bytes": 84615
+  },
+  {
+    "name": "aave_budget_forum",
+    "url": "https://governance.aave.com/t/aave-dao-funding-insights/24192.json",
+    "request_started_at": "2026-10-17T07:07:35.923961+00:00",
+    "status": 200,
+    "retrieved_at": "2026-10-17T07:07:36.930713+00:00",
+    "sha256": "013b6c127b10810dca47c71fc141e10904cbc1207257761b2bfc072daf6d4962",
+    "bytes": 133761
+  },
+  {
+    "name": "hype_fees_docs",
+    "url": "https://hyperliquid.gitbook.io/hyperliquid-docs/trading/fees.md",
+    "request_started_at": "2026-10-17T07:07:35.924329+00:00",
+    "status": 200,
+    "retrieved_at": "2026-10-17T07:07:36.065117+00:00",
+    "sha256": "75e55504b1b887a89e1668a9544d09b013242747bcc29f8648a5410142a71258",
+    "bytes": 12174
+  },
+  {
+    "name": "pendle_tokenomics",
+    "url": "https://docs.pendle.finance/pendle-v2/ProtocolMechanics/Mechanisms/Tokenomics",
+    "request_started_at": "2026-10-17T07:07:35.924659+00:00",
+    "status": 200,
+    "retrieved_at": "2026-10-17T07:07:36.146619+00:00",
+    "sha256": "fc2e0393693afd575d144e08cc700e2a4dfc32b9b0a4c03712042e6a76ecb5d3",
+    "bytes": 19526
+  },
+  {
+    "name": "pendle_fees",
+    "url": "https://docs.pendle.finance/pendle-v2/ProtocolMechanics/Mechanisms/Fees",
+    "request_started_at": "2026-10-17T07:07:35.924971+00:00",
+    "status": 200,
+    "retrieved_at": "2026-10-17T07:07:36.146092+00:00",
+    "sha256": "fccf575f078323a4a3b7d4f273796778e5b9e7a3b9cfc7d3a4f2c17771a6af96",
+    "bytes": 21177
+  },
+  {
+    "name": "aero_docs",
+    "url": "https://aerodrome.finance/docs",
+    "request_started_at": "2026-10-17T07:07:35.925884+00:00",
+    "status": 200,
+    "retrieved_at": "2026-10-17T07:07:36.111437+00:00",
+    "sha256": "1525c0e6fb2a45e0f25c867c910b21670847df5d0129402cafd28816e3ec50ad",
+    "bytes": 4370
+  },
+  {
+    "name": "lido_h1_2026",
+    "url": "https://lido.fi/ldo-hub/reports/h1-2026",
+    "request_started_at": "2026-10-17T07:07:35.926209+00:00",
+    "status": 200,
+    "retrieved_at": "2026-10-17T07:07:36.133116+00:00",
+    "sha256": "35b3af9868e7aae490d7c6f0f5b6129a2b137c93fd427de2cd1381b9d90cf0cf",
+    "bytes": 503361
+  },
+  {
+    "name": "ondo_docs",
+    "url": "https://docs.ondo.foundation/ondo-token",
+    "request_started_at": "2026-10-17T07:07:35.926553+00:00",
+    "status": 200,
+    "retrieved_at": "2026-10-17T07:07:36.109524+00:00",
+    "sha256": "b3ebc301e5f6c8c5cab7b03b47d2897096ba976e1a6ee5cf3b16d66537a11592",
+    "bytes": 26469
+  },
+  {
+    "name": "ondo_distribution",
+    "url": "https://blog.ondo.foundation/unlocking-ondo-a-proposal-from-the-ondo-foundation/",
+    "request_started_at": "2026-10-17T07:07:36.065273+00:00",
+    "status": 200,
+    "retrieved_at": "2026-10-17T07:07:36.277600+00:00",
+    "sha256": "fc5d5ad3158e97a57c45f7232f8bdf40403c4f9a669f6d74c48020718af8c086",
+    "bytes": 29045
+  },
+  {
+    "name": "circle_transparency",
+    "url": "https://www.circle.com/transparency",
+    "request_started_at": "2026-10-17T07:07:36.109642+00:00",
+    "status": 200,
+    "retrieved_at": "2026-10-17T07:07:36.311635+00:00",
+    "sha256": "03fdf2ff9a34ef87d66afdf1ecd201b3e1db75aa2b44f497345057055ca304bb",
+    "bytes": 466467
+  },
+  {
+    "name": "fed_statement",
+    "url": "https://www.federalreserve.gov/newsevents/pressreleases/monetary20260916a.htm",
+    "request_started_at": "2026-10-17T07:07:36.111516+00:00",
+    "status": 200,
+    "retrieved_at": "2026-10-17T07:07:36.260048+00:00",
+    "sha256": "b06b24027a58a0abd96fefb6c95f5ea507e5bec3b6a483295d4a68417e49f870",
+    "bytes": 82636
+  },
+  {
+    "name": "fed_calendar",
+    "url": "https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm",
+    "request_started_at": "2026-10-17T07:07:36.133663+00:00",
+    "status": 200,
+    "retrieved_at": "2026-10-17T07:07:36.308588+00:00",
+    "sha256": "b8efdd80a622bb856cad25a6027b3561d2254ed3dd6f8a7f08d88c0083fe16f0",
+    "bytes": 165751
+  },
+  {
+    "name": "aave_ticker",
+    "url": "https://api.exchange.coinbase.com/products/AAVE-USD/ticker",
+    "request_started_at": "2026-10-17T07:07:36.146265+00:00",
+    "status": 200,
+    "retrieved_at": "2026-10-17T07:07:36.215076+00:00",
+    "sha256": "f60f7e007e5cbf5a623da659799f3915f373519b6b7f2f1fe72546e86cd4a611",
+    "bytes": 169,
+    "ticker": {
+      "ask": "156.05",
+      "bid": "156.03",
+      "volume": "20841.151",
+      "trade_id": 68445669,
+      "price": "156.08",
+      "size": "0.819",
+      "time": "2026-10-17T07:06:20.113893659Z",
+      "rfq_volume": "18.051684"
+    }
+  },
+  {
+    "name": "hype_ticker",
+    "url": "https://api.exchange.coinbase.com/products/HYPE-USD/ticker",
+    "request_started_at": "2026-10-17T07:07:36.146759+00:00",
+    "status": 200,
+    "retrieved_at": "2026-10-17T07:07:36.216737+00:00",
+    "sha256": "9edd3db93dcb625a64b6e52730e98a30c9e0728387201aee5ef2e8ed875311c7",
+    "bytes": 169,
+    "ticker": {
+      "ask": "79.93",
+      "bid": "79.91",
+      "volume": "276381.545",
+      "trade_id": 10903439,
+      "price": "79.92",
+      "size": "1.072",
+      "time": "2026-10-17T07:07:03.517998729Z",
+      "rfq_volume": "2010.813542"
+    }
+  },
+  {
+    "name": "pendle_ticker",
+    "url": "https://api.exchange.coinbase.com/products/PENDLE-USD/ticker",
+    "request_started_at": "2026-10-17T07:07:36.150373+00:00",
+    "status": 200,
+    "retrieved_at": "2026-10-17T07:07:36.324039+00:00",
+    "sha256": "b79a8a72f048af267e569cefd3795a831f44880276222190d55811b77e0ae912",
+    "bytes": 171,
+    "ticker": {
+      "ask": "2.1245",
+      "bid": "2.1218",
+      "volume": "284847.37",
+      "trade_id": 4004156,
+      "price": "2.1232",
+      "size": "20.69",
+      "time": "2026-10-17T07:07:01.721802603Z",
+      "rfq_volume": "20209.747065"
+    }
+  },
+  {
+    "name": "aero_ticker",
+    "url": "https://api.exchange.coinbase.com/products/AERO-USD/ticker",
+    "request_started_at": "2026-10-17T07:07:36.215193+00:00",
+    "status": 200,
+    "retrieved_at": "2026-10-17T07:07:36.321355+00:00",
+    "sha256": "f1795792a340dec9c94601e6f615db2763c3926294439f7a808df14655b10198",
+    "bytes": 172,
+    "ticker": {
+      "ask": "0.89211",
+      "bid": "0.89145",
+      "volume": "6253303.1",
+      "trade_id": 31041044,
+      "price": "0.89211",
+      "size": "10",
+      "time": "2026-10-17T07:07:29.274464697Z",
+      "rfq_volume": "83888.361305"
+    }
+  },
+  {
+    "name": "ldo_ticker",
+    "url": "https://api.exchange.coinbase.com/products/LDO-USD/ticker",
+    "request_started_at": "2026-10-17T07:07:36.216814+00:00",
+    "status": 200,
+    "retrieved_at": "2026-10-17T07:07:36.335340+00:00",
+    "sha256": "d2cfc3be7cc9c9946bba4ed4ac4cbaca9532701bc35e9d4608000c1f54795965",
+    "bytes": 174,
+    "ticker": {
+      "ask": "0.39886",
+      "bid": "0.39854",
+      "volume": "792998.12",
+      "trade_id": 12900486,
+      "price": "0.3988",
+      "size": "487.5",
+      "time": "2026-10-17T07:03:22.360234891Z",
+      "rfq_volume": "18949.058489"
+    }
+  },
+  {
+    "name": "ondo_ticker",
+    "url": "https://api.exchange.coinbase.com/products/ONDO-USD/ticker",
+    "request_started_at": "2026-10-17T07:07:36.260205+00:00",
+    "status": 200,
+    "retrieved_at": "2026-10-17T07:07:36.365059+00:00",
+    "sha256": "80f87739c57e2e89fba3e6546bd0bf99a8272a378625f951a851b3d4d7419dd2",
+    "bytes": 177,
+    "ticker": {
+      "ask": "0.45569",
+      "bid": "0.45559",
+      "volume": "10283614.33",
+      "trade_id": 69386164,
+      "price": "0.45555",
+      "size": "12.85",
+      "time": "2026-10-17T07:06:58.871779935Z",
+      "rfq_volume": "17350.234022"
+    }
+  }
+]

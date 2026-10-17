@@ -34,7 +34,7 @@ The installed `.venv` uses Python 3.14.4; the deployment image specifies Python 
 | Task | State |
 |---|---|
 | 1 Domain contracts/defaults | complete; commits a77407a + 76e0527; 26 tests Python 3.12; independent spec/quality review passes |
-| 2 Durable journal/reservations | in progress |
+| 2 Durable journal/reservations | implemented 9977b03; 33 focused tests pass; independent review in progress |
 | 3 Equity/flows/latches | pending |
 | 4 Causal source/archive | pending |
 | 5 Numeric state/token proof | pending |
@@ -61,3 +61,9 @@ Each task requires observed RED/GREEN checks and task review. Baseline and task 
 ### Task 1 acceptance
 
 Strict frozen domain records, canonical serialization, monetary validation, safe configuration and numeric field dictionary implemented. RED/GREEN evidence: initial10 missing-contract failures, implementation20 passing tests, then independent review identified numeric-ID and discrete-mask issues; test-first fixes increased coverage to26 passing Python3.12 tests. Both independent review stages now pass with no open findings. Task15 must implement core-manifest identity excluding embedded approvals and a separate package hash; this is recorded in its task brief. Full reports/diffs: `.agenkit/sdd/task-01-*`.
+
+### Team research and safety artifacts
+
+The operator explicitly requested a set of agents. A sequential core implementer and independent code reviewer are supported by separate market-research and safety-audit agents. Fresh advisory research is saved at `docs/research/2026-10-17-autonomous-agent/RESEARCH.md` with31 public evidence artifacts, whose hashes were verified locally. All six candidates remain ineligible. The safety acceptance audit is saved at `docs/reviews/2026-10-17-autonomous-safety-contracts.md`; its requirements are handed to owning task briefs. It clarifies activation requires unarmed AND reconciled state and distinguishes retrospective model replay from genuinely prospective forecast evidence. These reports are not implementation certification.
+
+Task2 commit9977b03 implements schema/journal/reservation storage;33 focused Python3.12 tests pass. Task3 must add actual native fill/basis/fee/flow/liquidation marks; Task12 must add authority-issued reduction/replacement slots; Task13 final fill/fee reconciliation; Task11 full pure risk. Intermediate components remain failclosed and unarmed.
