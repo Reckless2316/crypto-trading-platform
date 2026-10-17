@@ -36,7 +36,7 @@ The installed `.venv` uses Python 3.14.4; the deployment image specifies Python 
 | 1 Domain contracts/defaults | complete; commits a77407a + 76e0527; 26 tests Python 3.12; independent spec/quality review passes |
 | 2 Durable journal/reservations | complete through 57509ea; 49 focused tests pass; independent spec/quality review passes |
 | 3 Equity/flows/latches | complete through a4fbd8d; 133 tests; independent spec/quality PASS; base 67ad62e |
-| 4 Causal source/archive | pending |
+| 4 Causal source/archive | complete 26dfa8d; 164 covering tests; independent spec/quality PASS |
 | 5 Numeric state/token proof | pending |
 | 6 Research/six schema definitions | pending |
 | 7 Jev client/validation | pending |
