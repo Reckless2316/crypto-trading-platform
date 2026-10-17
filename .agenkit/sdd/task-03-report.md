@@ -386,3 +386,435 @@ Ran 125 tests in 1.960s
 
 OK
 ```
+
+
+## October 17 resumed review fixes: R1–R3
+
+Source/test commit: **`07ecc179d816b30a480e51bef85c82b45090b224`** (`fix: preserve replay and native accounting invariants`). Changes remain limited to ledger.py and test_ledger.py. This appendix records resumed implementation verification; independent review remains pending.
+
+Root causes and corrections:
+
+- R1: full-history economic replay incorrectly treated unchanged terminal-order totals as newly admitted fills. Compare prior and new exact cumulative quantities before reservation updates or late-fill findings. Two regressions complete/reconcile an order, admit an unrelated deposit or another intent's fill, preserve the old reservation byte-for-byte, and restore readiness with a complete current mark. A separate genuine terminal-fill/cumulative-overfill guard proves one durable incident, one journal application, and inhibited readiness on retry.
+- R2: an authoritative native correction delta was serialized with the bounded floor display projection. Split exact differences into bounded integer/fractional native legs; verify each leg round-trips and compare the actual serialized per-account/per-asset posting aggregate with exact replay before commit. The 10-to-1e-38 correction succeeds, retains exactly 1e-38 inventory, conserves the whole native journal, and reopens with identical balances and its review incident intact.
+- R3: admission accepted bounded Decimal text but persisted noncanonical source forms that startup rejected. Normalize fill base/quote/price/fee and flow quantity columns using the same decimal_text(decimal_value(...)) rule startup enforces. Preserve original immutable payload/hash and retry identity. Regressions cover trailing zeros, same-evidence and same-payload/new-evidence retries, unchanged economics, successful reopening and fresh reconciliation.
+
+TDD evidence is reconstructed honestly: these source/test edits already existed when this resume began, so this appendix does not claim their original edit order was observed. Original committed ledger source from aa18c18 was copied to /tmp/task03-red-ledger.py and executed only in a separate Python process's ledger module namespace, keeping its real __file__ for migrations. Shared production source was never overwritten. Running the six new regressions against that source produced five expected assertion failures (both false late-fill scenarios, native-journal mismatch, and both noncanonical-storage cases); the genuine-late-fill guard already passed and protects retained behavior. Reproduced on Python **3.12.14**, with zero errors.
+
+Reproduction command used to capture the following RED output:
+
+```text
+PYTHONPATH=. .venv-autonomous/bin/python /tmp/task03-record-evidence.py
+```
+
+The temporary runner obtains `git show aa18c18:bot/autonomous/ledger.py`, compiles it in the imported ledger module, and loads the six AccountingTests named below. Its own exit 0 confirms the expected 6-test/5-failure/0-error shape, not a passing original implementation.
+
+```text
+test_terminal_fill_replay_does_not_change_reservation_on_unrelated_deposit (tests.autonomous.test_ledger.AccountingTests.test_terminal_fill_replay_does_not_change_reservation_on_unrelated_deposit) ... FAIL
+test_terminal_fill_replay_does_not_change_reservation_on_another_intent_fill (tests.autonomous.test_ledger.AccountingTests.test_terminal_fill_replay_does_not_change_reservation_on_another_intent_fill) ... FAIL
+test_new_terminal_fill_and_open_cumulative_overfill_journal_once (tests.autonomous.test_ledger.AccountingTests.test_new_terminal_fill_and_open_cumulative_overfill_journal_once) ... ok
+test_wide_native_correction_preserves_exact_posting_targets_and_reopens (tests.autonomous.test_ledger.AccountingTests.test_wide_native_correction_preserves_exact_posting_targets_and_reopens) ... FAIL
+test_trailing_zero_flow_is_canonical_idempotent_and_restartable (tests.autonomous.test_ledger.AccountingTests.test_trailing_zero_flow_is_canonical_idempotent_and_restartable) ... FAIL
+test_trailing_zero_fill_fields_are_canonical_idempotent_and_restartable (tests.autonomous.test_ledger.AccountingTests.test_trailing_zero_fill_fields_are_canonical_idempotent_and_restartable) ... FAIL
+
+======================================================================
+FAIL: test_terminal_fill_replay_does_not_change_reservation_on_unrelated_deposit (tests.autonomous.test_ledger.AccountingTests.test_terminal_fill_replay_does_not_change_reservation_on_unrelated_deposit)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/reckless/crypto-trading-platform/tests/autonomous/test_ledger.py", line 1143, in test_terminal_fill_replay_does_not_change_reservation_on_unrelated_deposit
+    self.assertEqual([],list(self.ledger.connection.execute(
+AssertionError: Lists differ: [] != [<sqlite3.Row object at 0x73857bfebf70>]
+
+Second list contains 1 additional elements.
+First extra element 0:
+<sqlite3.Row object at 0x73857bfebf70>
+
+- []
++ [<sqlite3.Row object at 0x73857bfebf70>]
+
+======================================================================
+FAIL: test_terminal_fill_replay_does_not_change_reservation_on_another_intent_fill (tests.autonomous.test_ledger.AccountingTests.test_terminal_fill_replay_does_not_change_reservation_on_another_intent_fill)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/reckless/crypto-trading-platform/tests/autonomous/test_ledger.py", line 1161, in test_terminal_fill_replay_does_not_change_reservation_on_another_intent_fill
+    self.assertEqual([],list(self.ledger.connection.execute(
+AssertionError: Lists differ: [] != [<sqlite3.Row object at 0x73857c5fc5b0>]
+
+Second list contains 1 additional elements.
+First extra element 0:
+<sqlite3.Row object at 0x73857c5fc5b0>
+
+- []
++ [<sqlite3.Row object at 0x73857c5fc5b0>]
+
+======================================================================
+FAIL: test_wide_native_correction_preserves_exact_posting_targets_and_reopens (tests.autonomous.test_ledger.AccountingTests.test_wide_native_correction_preserves_exact_posting_targets_and_reopens)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/reckless/crypto-trading-platform/tests/autonomous/test_ledger.py", line 1206, in test_wide_native_correction_preserves_exact_posting_targets_and_reopens
+    self.assertEqual({k:v for k,v in target.items() if v},{k:v for k,v in actual.items() if v})
+AssertionError: {('cash', 'USD'): Fraction(9999999999, 1000000[244 chars]000)} != {('capital', 'USD'): Fraction(-10000, 1), ('ca[161 chars]000)}
+  {('capital', 'USD'): Fraction(-10000, 1),
+   ('cash', 'USD'): Fraction(9999999999, 1000000),
+-  ('inventory:AAVE', 'AAVE'): Fraction(1, 100000000000000000000000000000000000000),
+-  ('settlement', 'AAVE'): Fraction(-1, 100000000000000000000000000000000000000),
+?                                        -
+
++  ('settlement', 'AAVE'): Fraction(-1, 10000000000000000000000000000000000000),
+   ('settlement', 'USD'): Fraction(1, 1000000)}
+
+======================================================================
+FAIL: test_trailing_zero_flow_is_canonical_idempotent_and_restartable (tests.autonomous.test_ledger.AccountingTests.test_trailing_zero_flow_is_canonical_idempotent_and_restartable)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/reckless/crypto-trading-platform/tests/autonomous/test_ledger.py", line 1222, in test_trailing_zero_flow_is_canonical_idempotent_and_restartable
+    self.assertEqual('1',self.ledger.connection.execute('SELECT native_qty FROM external_flows').fetchone()[0])
+AssertionError: '1' != '1.0'
+- 1
++ 1.0
+
+
+======================================================================
+FAIL: test_trailing_zero_fill_fields_are_canonical_idempotent_and_restartable (tests.autonomous.test_ledger.AccountingTests.test_trailing_zero_fill_fields_are_canonical_idempotent_and_restartable)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/reckless/crypto-trading-platform/tests/autonomous/test_ledger.py", line 1246, in test_trailing_zero_fill_fields_are_canonical_idempotent_and_restartable
+    self.assertEqual(('1','100','100','0.01'),tuple(row)[:4])
+AssertionError: Tuples differ: ('1', '100', '100', '0.01') != ('1.0', '100.00', '100.000', '0.0100')
+
+First differing element 0:
+'1'
+'1.0'
+
+- ('1', '100', '100', '0.01')
++ ('1.0', '100.00', '100.000', '0.0100')
+?    ++       +++       ++++        ++
+
+
+----------------------------------------------------------------------
+Ran 6 tests in 0.100s
+
+FAILED (failures=5)
+
+```
+
+The first resumed covering run found 2 failures among 131 tests: both new formatting tests incorrectly expected immediate readiness after reopen. Startup intentionally clears readiness and heartbeat. Only those tests were adjusted to assert unready after reopen, then require a fresh complete mark before ready=True. Production behavior was preserved.
+
+Final covering command, run after the final source/test edit (captured through subprocess with stdout/stderr combined; exit **0**):
+
+```text
+.venv-autonomous/bin/python -m unittest tests.autonomous.test_contracts tests.autonomous.test_ledger tests.autonomous.test_risk_limits -v
+```
+
+Exact final output:
+
+```text
+test_book_delta_deletions_and_signed_metrics (tests.autonomous.test_contracts.ContractTests.test_book_delta_deletions_and_signed_metrics) ... ok
+test_canonical_and_finite (tests.autonomous.test_contracts.ContractTests.test_canonical_and_finite) ... ok
+test_canonical_rejects_lossy_keys_and_unsupported_values (tests.autonomous.test_contracts.ContractTests.test_canonical_rejects_lossy_keys_and_unsupported_values) ... ok
+test_continuous_wire_slots_obey_dictionary_ranges (tests.autonomous.test_contracts.ContractTests.test_continuous_wire_slots_obey_dictionary_ranges) ... ok
+test_decimal_instrument_scale_supports_full_precision (tests.autonomous.test_contracts.ContractTests.test_decimal_instrument_scale_supports_full_precision) ... ok
+test_decimal_precision_scale_and_explicit_rounding (tests.autonomous.test_contracts.ContractTests.test_decimal_precision_scale_and_explicit_rounding) ... ok
+test_defaults_disable_exposure_and_fix_approved_limits (tests.autonomous.test_contracts.ContractTests.test_defaults_disable_exposure_and_fix_approved_limits) ... ok
+test_dictionary_covers_all_compact_slots (tests.autonomous.test_contracts.ContractTests.test_dictionary_covers_all_compact_slots) ... ok
+test_dictionary_documents_wire_metadata_and_thesis_bit_width (tests.autonomous.test_contracts.ContractTests.test_dictionary_documents_wire_metadata_and_thesis_bit_width) ... ok
+test_direction_distribution_and_toxic_threshold (tests.autonomous.test_contracts.ContractTests.test_direction_distribution_and_toxic_threshold) ... ok
+test_discrete_wire_slots_have_exact_integer_domains (tests.autonomous.test_contracts.ContractTests.test_discrete_wire_slots_have_exact_integer_domains) ... ok
+test_eligibility_needs_evidence_and_ondo_cannot_activate (tests.autonomous.test_contracts.ContractTests.test_eligibility_needs_evidence_and_ondo_cannot_activate) ... ok
+test_encoded_state_checks_complete_numeric_shape (tests.autonomous.test_contracts.ContractTests.test_encoded_state_checks_complete_numeric_shape) ... ok
+test_every_architecture_record_is_frozen_and_typed (tests.autonomous.test_contracts.ContractTests.test_every_architecture_record_is_frozen_and_typed) ... ok
+test_frozen_strict_roundtrip (tests.autonomous.test_contracts.ContractTests.test_frozen_strict_roundtrip) ... ok
+test_hash_type_id_and_unknown_enum_are_rejected_at_wire_boundary (tests.autonomous.test_contracts.ContractTests.test_hash_type_id_and_unknown_enum_are_rejected_at_wire_boundary) ... ok
+test_immutable_nested_values_and_declared_probability_bounds (tests.autonomous.test_contracts.ContractTests.test_immutable_nested_values_and_declared_probability_bounds) ... ok
+test_invalid_measurements_are_zero_and_snapshot_masks_match (tests.autonomous.test_contracts.ContractTests.test_invalid_measurements_are_zero_and_snapshot_masks_match) ... ok
+test_late_batch_requires_rejection_without_decisions (tests.autonomous.test_contracts.ContractTests.test_late_batch_requires_rejection_without_decisions) ... ok
+test_late_model_batch_and_unverified_token_accounting_refuse (tests.autonomous.test_contracts.ContractTests.test_late_model_batch_and_unverified_token_accounting_refuse) ... ok
+test_nonnegative_account_magnitudes_and_revisions (tests.autonomous.test_contracts.ContractTests.test_nonnegative_account_magnitudes_and_revisions) ... ok
+test_numeric_candidate_mapping_is_fixed_and_exact (tests.autonomous.test_contracts.ContractTests.test_numeric_candidate_mapping_is_fixed_and_exact) ... ok
+test_order_reference_and_authorization_are_not_implicit (tests.autonomous.test_contracts.ContractTests.test_order_reference_and_authorization_are_not_implicit) ... ok
+test_source_payload_is_typed_hashed_and_immutable (tests.autonomous.test_contracts.ContractTests.test_source_payload_is_typed_hashed_and_immutable) ... ok
+test_timestamps_enums_and_nested_records (tests.autonomous.test_contracts.ContractTests.test_timestamps_enums_and_nested_records) ... ok
+test_wire_masks_have_bounded_integer_bit_widths (tests.autonomous.test_contracts.ContractTests.test_wire_masks_have_bounded_integer_bit_widths) ... ok
+test_canonical_reduced_rational_and_resource_bound (tests.autonomous.test_contracts.ExactNavTests.test_canonical_reduced_rational_and_resource_bound) ... ok
+test_decimal_projections_cannot_disagree_with_exact_authority (tests.autonomous.test_contracts.ExactNavTests.test_decimal_projections_cannot_disagree_with_exact_authority) ... ok
+test_ready_fixture_carries_exact_revision_mark_and_equity (tests.autonomous.test_contracts.ExactNavTests.test_ready_fixture_carries_exact_revision_mark_and_equity) ... ok
+test_ready_view_requires_bound_exact_evidence (tests.autonomous.test_contracts.ExactNavTests.test_ready_view_requires_bound_exact_evidence) ... ok
+test_accounting_write_boundary_failures_roll_back_every_projection (tests.autonomous.test_ledger.AccountingTests.test_accounting_write_boundary_failures_roll_back_every_projection) ... ok
+test_additive_accounting_migration_preserves_legacy_committed_export (tests.autonomous.test_ledger.AccountingTests.test_additive_accounting_migration_preserves_legacy_committed_export) ... ok
+test_buy_net_base_fee_and_sell_extra_base_fee_apply_once (tests.autonomous.test_ledger.AccountingTests.test_buy_net_base_fee_and_sell_extra_base_fee_apply_once) ... ok
+test_buy_sell_native_fees_basis_and_reservation_conservation (tests.autonomous.test_ledger.AccountingTests.test_buy_sell_native_fees_basis_and_reservation_conservation) ... ok
+test_closed_redeposit_requires_fresh_transfer_not_fresh_preclosure_mark (tests.autonomous.test_ledger.AccountingTests.test_closed_redeposit_requires_fresh_transfer_not_fresh_preclosure_mark) ... ok
+test_closure_redeposit_and_reopen_keep_halts_and_exact_history (tests.autonomous.test_ledger.AccountingTests.test_closure_redeposit_and_reopen_keep_halts_and_exact_history) ... ok
+test_committed_reservation_rechecks_held_book_and_fx_at_dispatch (tests.autonomous.test_ledger.AccountingTests.test_committed_reservation_rechecks_held_book_and_fx_at_dispatch) ... ok
+test_correction_replays_old_buy_basis_after_partial_sell (tests.autonomous.test_ledger.AccountingTests.test_correction_replays_old_buy_basis_after_partial_sell) ... ok
+test_current_accounting_mark_rebinds_only_non_economic_revisions (tests.autonomous.test_ledger.AccountingTests.test_current_accounting_mark_rebinds_only_non_economic_revisions) ... ok
+test_delayed_closed_redeposit_preserves_exact_loss_history_and_requires_new_mark (tests.autonomous.test_ledger.AccountingTests.test_delayed_closed_redeposit_preserves_exact_loss_history_and_requires_new_mark) ... ok
+test_delayed_mark_application_cannot_refresh_held_book_or_fx (tests.autonomous.test_ledger.AccountingTests.test_delayed_mark_application_cannot_refresh_held_book_or_fx) ... ok
+test_deposit_loss_closure_restart_and_redeposit_preserve_latch (tests.autonomous.test_ledger.AccountingTests.test_deposit_loss_closure_restart_and_redeposit_preserve_latch) ... ok
+test_economic_failure_rolls_back_and_prefix_excludes_future_mark (tests.autonomous.test_ledger.AccountingTests.test_economic_failure_rolls_back_and_prefix_excludes_future_mark) ... ok
+test_exact_accounting_events_are_cutoff_prefix_bound (tests.autonomous.test_ledger.AccountingTests.test_exact_accounting_events_are_cutoff_prefix_bound) ... ok
+test_exact_flow_after_units_are_checked_on_restart (tests.autonomous.test_ledger.AccountingTests.test_exact_flow_after_units_are_checked_on_restart) ... ok
+test_fill_after_flow_still_latches_loss_in_economic_transaction (tests.autonomous.test_ledger.AccountingTests.test_fill_after_flow_still_latches_loss_in_economic_transaction) ... ok
+test_fill_known_cash_fee_can_latch_before_another_reconciliation (tests.autonomous.test_ledger.AccountingTests.test_fill_known_cash_fee_can_latch_before_another_reconciliation) ... ok
+test_flow_with_missing_fx_keeps_evidence_and_inhibits_entries (tests.autonomous.test_ledger.AccountingTests.test_flow_with_missing_fx_keeps_evidence_and_inhibits_entries) ... ok
+test_genuine_boundary_restored_after_outage_requires_current_reconciliation (tests.autonomous.test_ledger.AccountingTests.test_genuine_boundary_restored_after_outage_requires_current_reconciliation) ... ok
+test_held_book_and_fx_expire_independently_of_mark_for_readiness (tests.autonomous.test_ledger.AccountingTests.test_held_book_and_fx_expire_independently_of_mark_for_readiness) ... ok
+test_held_book_and_fx_expiry_refuses_new_reservation (tests.autonomous.test_ledger.AccountingTests.test_held_book_and_fx_expiry_refuses_new_reservation) ... ok
+test_late_fill_changed_retry_and_stale_correction_preserve_history (tests.autonomous.test_ledger.AccountingTests.test_late_fill_changed_retry_and_stale_correction_preserve_history) ... ok
+test_later_depth_cannot_be_relabeled_as_midnight (tests.autonomous.test_ledger.AccountingTests.test_later_depth_cannot_be_relabeled_as_midnight) ... ok
+test_local_evidence_cannot_claim_live_provenance_or_changed_identity (tests.autonomous.test_ledger.AccountingTests.test_local_evidence_cannot_claim_live_provenance_or_changed_identity) ... ok
+test_missing_fx_liquidation_invalidates_previous_ready_mark (tests.autonomous.test_ledger.AccountingTests.test_missing_fx_liquidation_invalidates_previous_ready_mark) ... ok
+test_missing_or_stale_depth_unknown_holding_and_boundary_are_unready (tests.autonomous.test_ledger.AccountingTests.test_missing_or_stale_depth_unknown_holding_and_boundary_are_unready) ... ok
+test_new_terminal_fill_and_open_cumulative_overfill_journal_once (tests.autonomous.test_ledger.AccountingTests.test_new_terminal_fill_and_open_cumulative_overfill_journal_once) ... ok
+test_non_usd_external_capital_requires_fx_and_preserves_nav (tests.autonomous.test_ledger.AccountingTests.test_non_usd_external_capital_requires_fx_and_preserves_nav) ... ok
+test_open_flow_cannot_refresh_expired_held_valuation_sources (tests.autonomous.test_ledger.AccountingTests.test_open_flow_cannot_refresh_expired_held_valuation_sources) ... ok
+test_projection_failure_retains_factual_transfer_and_inhibits_ready_view (tests.autonomous.test_ledger.AccountingTests.test_projection_failure_retains_factual_transfer_and_inhibits_ready_view) ... ok
+test_repeated_capital_flow_keeps_depth_for_following_loss_event (tests.autonomous.test_ledger.AccountingTests.test_repeated_capital_flow_keeps_depth_for_following_loss_event) ... ok
+test_repeating_units_repeated_flows_and_exact_view (tests.autonomous.test_ledger.AccountingTests.test_repeating_units_repeated_flows_and_exact_view) ... ok
+test_rounding_and_compensation_export_cutoff_keeps_original_economics (tests.autonomous.test_ledger.AccountingTests.test_rounding_and_compensation_export_cutoff_keeps_original_economics) ... ok
+test_stale_depth_heartbeat_and_unexplained_holdings_do_not_refresh_readiness (tests.autonomous.test_ledger.AccountingTests.test_stale_depth_heartbeat_and_unexplained_holdings_do_not_refresh_readiness) ... ok
+test_startup_rejects_day_boundary_projection_tampering (tests.autonomous.test_ledger.AccountingTests.test_startup_rejects_day_boundary_projection_tampering) ... ok
+test_startup_rejects_highwater_and_native_projection_tampering (tests.autonomous.test_ledger.AccountingTests.test_startup_rejects_highwater_and_native_projection_tampering) ... ok
+test_startup_rejects_mutable_unit_projection_tampering (tests.autonomous.test_ledger.AccountingTests.test_startup_rejects_mutable_unit_projection_tampering) ... ok
+test_submicro_basis_residual_and_duplicate_fill_evidence (tests.autonomous.test_ledger.AccountingTests.test_submicro_basis_residual_and_duplicate_fill_evidence) ... ok
+test_submicro_usd_transfer_cannot_silently_round_native_cash (tests.autonomous.test_ledger.AccountingTests.test_submicro_usd_transfer_cannot_silently_round_native_cash) ... ok
+test_terminal_fill_replay_does_not_change_reservation_on_another_intent_fill (tests.autonomous.test_ledger.AccountingTests.test_terminal_fill_replay_does_not_change_reservation_on_another_intent_fill) ... ok
+test_terminal_fill_replay_does_not_change_reservation_on_unrelated_deposit (tests.autonomous.test_ledger.AccountingTests.test_terminal_fill_replay_does_not_change_reservation_on_unrelated_deposit) ... ok
+test_third_asset_fee_fx_and_pending_unknown_conversion (tests.autonomous.test_ledger.AccountingTests.test_third_asset_fee_fx_and_pending_unknown_conversion) ... ok
+test_trailing_zero_fill_fields_are_canonical_idempotent_and_restartable (tests.autonomous.test_ledger.AccountingTests.test_trailing_zero_fill_fields_are_canonical_idempotent_and_restartable) ... ok
+test_trailing_zero_flow_is_canonical_idempotent_and_restartable (tests.autonomous.test_ledger.AccountingTests.test_trailing_zero_flow_is_canonical_idempotent_and_restartable) ... ok
+test_transfer_cost_triggers_daily_halt_atomically_and_utc_rollover (tests.autonomous.test_ledger.AccountingTests.test_transfer_cost_triggers_daily_halt_atomically_and_utc_rollover) ... ok
+test_unknown_fill_semantics_records_incident_and_invalidates_ready_view (tests.autonomous.test_ledger.AccountingTests.test_unknown_fill_semantics_records_incident_and_invalidates_ready_view) ... ok
+test_wide_native_correction_preserves_exact_posting_targets_and_reopens (tests.autonomous.test_ledger.AccountingTests.test_wide_native_correction_preserves_exact_posting_targets_and_reopens) ... ok
+test_zero_equity_still_persists_breach_while_unarmed (tests.autonomous.test_ledger.AccountingTests.test_zero_equity_still_persists_breach_while_unarmed) ... ok
+test_busy_failure_disables_dispatch_without_partial_write (tests.autonomous.test_ledger.LedgerTests.test_busy_failure_disables_dispatch_without_partial_write) ... ok
+test_cash_competition_rechecks_pending_reservations (tests.autonomous.test_ledger.LedgerTests.test_cash_competition_rechecks_pending_reservations) ... ok
+test_changed_release_content_fails_startup_integrity (tests.autonomous.test_ledger.LedgerTests.test_changed_release_content_fails_startup_integrity) ... ok
+test_changed_venue_event_key_payload_is_rejected (tests.autonomous.test_ledger.LedgerTests.test_changed_venue_event_key_payload_is_rejected) ... ok
+test_correction_and_label_keys_are_unique (tests.autonomous.test_ledger.LedgerTests.test_correction_and_label_keys_are_unique) ... ok
+test_crash_after_dispatch_keeps_reservation_and_becomes_unknown (tests.autonomous.test_ledger.LedgerTests.test_crash_after_dispatch_keeps_reservation_and_becomes_unknown) ... ok
+test_dispatch_assessor_does_not_count_own_reservation_twice (tests.autonomous.test_ledger.LedgerTests.test_dispatch_assessor_does_not_count_own_reservation_twice) ... ok
+test_dispatch_marker_commits_and_rechecks_control (tests.autonomous.test_ledger.LedgerTests.test_dispatch_marker_commits_and_rechecks_control) ... ok
+test_duplicate_correction_retains_original_and_rejects_changed_key (tests.autonomous.test_ledger.LedgerTests.test_duplicate_correction_retains_original_and_rejects_changed_key) ... ok
+test_failed_posting_rolls_back_entire_journal (tests.autonomous.test_ledger.LedgerTests.test_failed_posting_rolls_back_entire_journal) ... ok
+test_failed_reservation_rolls_back_intent (tests.autonomous.test_ledger.LedgerTests.test_failed_reservation_rolls_back_intent) ... ok
+test_filled_status_requires_complete_cumulative_quantity (tests.autonomous.test_ledger.LedgerTests.test_filled_status_requires_complete_cumulative_quantity) ... ok
+test_foreign_keys_and_snapshot_exactly_one_reference (tests.autonomous.test_ledger.LedgerTests.test_foreign_keys_and_snapshot_exactly_one_reference) ... ok
+test_forged_assessor_verdict_never_authorizes (tests.autonomous.test_ledger.LedgerTests.test_forged_assessor_verdict_never_authorizes) ... ok
+test_invalid_money_and_missing_account_rejected (tests.autonomous.test_ledger.LedgerTests.test_invalid_money_and_missing_account_rejected) ... ok
+test_migration_checksum_tampering_refuses_open (tests.autonomous.test_ledger.LedgerTests.test_migration_checksum_tampering_refuses_open) ... ok
+test_nested_transaction_failure_cannot_commit_partial_post (tests.autonomous.test_ledger.LedgerTests.test_nested_transaction_failure_cannot_commit_partial_post) ... ok
+test_open_never_adopts_or_arms_account (tests.autonomous.test_ledger.LedgerTests.test_open_never_adopts_or_arms_account) ... ok
+test_order_events_are_typed_idempotent_and_keep_capacity (tests.autonomous.test_ledger.LedgerTests.test_order_events_are_typed_idempotent_and_keep_capacity) ... ok
+test_reopen_preserves_journal_and_disarms (tests.autonomous.test_ledger.LedgerTests.test_reopen_preserves_journal_and_disarms) ... ok
+test_reopen_rejects_removed_evidence_protection (tests.autonomous.test_ledger.LedgerTests.test_reopen_rejects_removed_evidence_protection) ... ok
+test_reservation_commits_and_cross_release_action_is_unique (tests.autonomous.test_ledger.LedgerTests.test_reservation_commits_and_cross_release_action_is_unique) ... ok
+test_reservation_duplicate_is_content_bound (tests.autonomous.test_ledger.LedgerTests.test_reservation_duplicate_is_content_bound) ... ok
+test_reservation_rechecks_revision_and_capacity (tests.autonomous.test_ledger.LedgerTests.test_reservation_rechecks_revision_and_capacity) ... ok
+test_reservation_unready_fails_closed (tests.autonomous.test_ledger.LedgerTests.test_reservation_unready_fails_closed) ... ok
+test_review_job_dedupe_and_missing_reference (tests.autonomous.test_ledger.LedgerTests.test_review_job_dedupe_and_missing_reference) ... ok
+test_review_r1_nested_dispatch_rejects_before_mutation (tests.autonomous.test_ledger.LedgerTests.test_review_r1_nested_dispatch_rejects_before_mutation) ... ok
+test_review_r1_uncommitted_reservation_cannot_dispatch (tests.autonomous.test_ledger.LedgerTests.test_review_r1_uncommitted_reservation_cannot_dispatch) ... ok
+test_review_r2_all_event_receipt_knowledge_and_segment_endpoints_are_causal (tests.autonomous.test_ledger.LedgerTests.test_review_r2_all_event_receipt_knowledge_and_segment_endpoints_are_causal) ... ok
+test_review_r2_clock_regression_cutoff_preserves_committed_event_prefix (tests.autonomous.test_ledger.LedgerTests.test_review_r2_clock_regression_cutoff_preserves_committed_event_prefix) ... ok
+test_review_r2_delayed_first_export_uses_historical_revision_and_generation (tests.autonomous.test_ledger.LedgerTests.test_review_r2_delayed_first_export_uses_historical_revision_and_generation) ... ok
+test_review_r2_event_before_commit_capture_uses_previous_committed_prefix (tests.autonomous.test_ledger.LedgerTests.test_review_r2_event_before_commit_capture_uses_previous_committed_prefix) ... ok
+test_review_r2_nested_result_receipt_participates_in_revision_visibility (tests.autonomous.test_ledger.LedgerTests.test_review_r2_nested_result_receipt_participates_in_revision_visibility) ... ok
+test_review_r2_non_economic_import_commits_new_prefix_without_revision_change (tests.autonomous.test_ledger.LedgerTests.test_review_r2_non_economic_import_commits_new_prefix_without_revision_change) ... ok
+test_review_r2_reconciliation_anchor_requires_selected_committed_prefix (tests.autonomous.test_ledger.LedgerTests.test_review_r2_reconciliation_anchor_requires_selected_committed_prefix) ... ok
+test_review_r2_session_account_anchor_requires_creation_prefix (tests.autonomous.test_ledger.LedgerTests.test_review_r2_session_account_anchor_requires_creation_prefix) ... ok
+test_review_r3_clock_regression_and_reverse_ids_preserve_order (tests.autonomous.test_ledger.LedgerTests.test_review_r3_clock_regression_and_reverse_ids_preserve_order) ... ok
+test_review_r3_same_timestamp_order_replay_uses_durable_append_order (tests.autonomous.test_ledger.LedgerTests.test_review_r3_same_timestamp_order_replay_uses_durable_append_order) ... ok
+test_review_r4_duplicate_manifest_record_id_is_rejected (tests.autonomous.test_ledger.LedgerTests.test_review_r4_duplicate_manifest_record_id_is_rejected) ... ok
+test_review_r4_manifest_ids_use_real_primary_keys (tests.autonomous.test_ledger.LedgerTests.test_review_r4_manifest_ids_use_real_primary_keys) ... ok
+test_review_r5_cumulative_quantity_is_exact_under_low_ambient_precision (tests.autonomous.test_ledger.LedgerTests.test_review_r5_cumulative_quantity_is_exact_under_low_ambient_precision) ... ok
+test_review_r5_high_scale_order_ignores_ambient_decimal_precision (tests.autonomous.test_ledger.LedgerTests.test_review_r5_high_scale_order_ignores_ambient_decimal_precision) ... ok
+test_schema_settings_and_append_only_protection (tests.autonomous.test_ledger.LedgerTests.test_schema_settings_and_append_only_protection) ... ok
+test_session_export_does_not_include_future_source_or_control (tests.autonomous.test_ledger.LedgerTests.test_session_export_does_not_include_future_source_or_control) ... ok
+test_session_export_is_immutable_and_idempotent (tests.autonomous.test_ledger.LedgerTests.test_session_export_is_immutable_and_idempotent) ... ok
+test_session_order_projection_is_rebuilt_at_cutoff (tests.autonomous.test_ledger.LedgerTests.test_session_order_projection_is_rebuilt_at_cutoff) ... ok
+test_startup_rejects_negative_decimal_projection (tests.autonomous.test_ledger.LedgerTests.test_startup_rejects_negative_decimal_projection) ... ok
+test_transaction_identity_is_content_bound (tests.autonomous.test_ledger.LedgerTests.test_transaction_identity_is_content_bound) ... ok
+test_unbalanced_journal_is_rejected (tests.autonomous.test_ledger.LedgerTests.test_unbalanced_journal_is_rejected) ... ok
+test_deposit_cannot_hide_drawdown (tests.autonomous.test_risk_limits.FlowTests.test_deposit_cannot_hide_drawdown) ... ok
+test_exact_thresholds_ignore_decimal_context (tests.autonomous.test_risk_limits.FlowTests.test_exact_thresholds_ignore_decimal_context) ... ok
+test_external_flow_fixture_and_adjacent_exact_boundaries (tests.autonomous.test_risk_limits.FlowTests.test_external_flow_fixture_and_adjacent_exact_boundaries) ... ok
+test_invalid_and_closure_reject_before_division (tests.autonomous.test_risk_limits.FlowTests.test_invalid_and_closure_reject_before_division) ... ok
+
+----------------------------------------------------------------------
+Ran 131 tests in 2.208s
+
+OK
+```
+
+`git diff --check -- bot/autonomous/ledger.py tests/autonomous/test_ledger.py` exited 0. No provider/network calls, orders, deployment, release activation or arming occurred. No Task 4 work was started.
+
+
+## Additional review finding: unsupported correction admission
+
+Final source/test commit: **`a4fbd8daf554e39372f429aa12954d4924073a3a`** (`fix: inhibit unsupported fill corrections atomically`), following R1–R3 source commit `07ecc179d816b30a480e51bef85c82b45090b224`.
+
+Independent review then reproduced an additional Important issue: a retained correction with a missing fee holding raised ContractViolation, rolled back its attempted economics, and left the previous complete mark ready. Root cause: correct_fill lacked the rejected-economics finding path used for unsupported fills/flows. Merely preflighting replay would not cover native serialization failures that occur after journal mutation begins.
+
+The correction economic insert and application now run inside a SQLite savepoint. Unsupported replay/serialization (ContractViolation, KeyError or TypeError) rolls back all attempted compensation before committing an unresolved incident against the retained evidence and returning False. Original identity/predecessor rejection and SQLite uncertain-failure semantics are preserved. Successful corrections retain their normal fresh-review finding. The change does not suppress failed SQL or uncertain commits.
+
+Two regressions were written and executed before this source edit. Initial unhandled ContractViolation outputs were converted to explicit assertion failures, then the RED command below produced exactly 2 failures, 0 errors, as expected:
+
+```text
+.venv-autonomous/bin/python -m unittest tests.autonomous.test_ledger.AccountingTests.test_unknown_correction_fee_retains_evidence_and_inhibits_without_economics tests.autonomous.test_ledger.AccountingTests.test_correction_serialization_failure_rolls_back_before_retaining_incident -v
+
+AssertionError: unsupported correction must retain an inhibition: insufficient asset for disposal/fee
+AssertionError: unsupported serialization must retain an inhibition: native posting scale exceeded
+Ran 2 tests in 0.042s
+FAILED (failures=2)
+```
+
+The real unknown-fee case verifies retained immutable evidence, one finding across retries, unchanged journal count/balances, no accepted correction row, persistent inhibition after a complete mark, and successful restart with unchanged economics. A native serialization fault injected after journal creation verifies exact rollback of journal transactions/postings, correction rows, accounting operations and balance projections, while retaining the evidence and unresolved state.
+
+The following final covering run supersedes the earlier 131-test result. Python remains **3.12.14**; command exit **0**; full captured output follows:
+
+```text
+.venv-autonomous/bin/python -m unittest tests.autonomous.test_contracts tests.autonomous.test_ledger tests.autonomous.test_risk_limits -v
+```
+
+```text
+test_book_delta_deletions_and_signed_metrics (tests.autonomous.test_contracts.ContractTests.test_book_delta_deletions_and_signed_metrics) ... ok
+test_canonical_and_finite (tests.autonomous.test_contracts.ContractTests.test_canonical_and_finite) ... ok
+test_canonical_rejects_lossy_keys_and_unsupported_values (tests.autonomous.test_contracts.ContractTests.test_canonical_rejects_lossy_keys_and_unsupported_values) ... ok
+test_continuous_wire_slots_obey_dictionary_ranges (tests.autonomous.test_contracts.ContractTests.test_continuous_wire_slots_obey_dictionary_ranges) ... ok
+test_decimal_instrument_scale_supports_full_precision (tests.autonomous.test_contracts.ContractTests.test_decimal_instrument_scale_supports_full_precision) ... ok
+test_decimal_precision_scale_and_explicit_rounding (tests.autonomous.test_contracts.ContractTests.test_decimal_precision_scale_and_explicit_rounding) ... ok
+test_defaults_disable_exposure_and_fix_approved_limits (tests.autonomous.test_contracts.ContractTests.test_defaults_disable_exposure_and_fix_approved_limits) ... ok
+test_dictionary_covers_all_compact_slots (tests.autonomous.test_contracts.ContractTests.test_dictionary_covers_all_compact_slots) ... ok
+test_dictionary_documents_wire_metadata_and_thesis_bit_width (tests.autonomous.test_contracts.ContractTests.test_dictionary_documents_wire_metadata_and_thesis_bit_width) ... ok
+test_direction_distribution_and_toxic_threshold (tests.autonomous.test_contracts.ContractTests.test_direction_distribution_and_toxic_threshold) ... ok
+test_discrete_wire_slots_have_exact_integer_domains (tests.autonomous.test_contracts.ContractTests.test_discrete_wire_slots_have_exact_integer_domains) ... ok
+test_eligibility_needs_evidence_and_ondo_cannot_activate (tests.autonomous.test_contracts.ContractTests.test_eligibility_needs_evidence_and_ondo_cannot_activate) ... ok
+test_encoded_state_checks_complete_numeric_shape (tests.autonomous.test_contracts.ContractTests.test_encoded_state_checks_complete_numeric_shape) ... ok
+test_every_architecture_record_is_frozen_and_typed (tests.autonomous.test_contracts.ContractTests.test_every_architecture_record_is_frozen_and_typed) ... ok
+test_frozen_strict_roundtrip (tests.autonomous.test_contracts.ContractTests.test_frozen_strict_roundtrip) ... ok
+test_hash_type_id_and_unknown_enum_are_rejected_at_wire_boundary (tests.autonomous.test_contracts.ContractTests.test_hash_type_id_and_unknown_enum_are_rejected_at_wire_boundary) ... ok
+test_immutable_nested_values_and_declared_probability_bounds (tests.autonomous.test_contracts.ContractTests.test_immutable_nested_values_and_declared_probability_bounds) ... ok
+test_invalid_measurements_are_zero_and_snapshot_masks_match (tests.autonomous.test_contracts.ContractTests.test_invalid_measurements_are_zero_and_snapshot_masks_match) ... ok
+test_late_batch_requires_rejection_without_decisions (tests.autonomous.test_contracts.ContractTests.test_late_batch_requires_rejection_without_decisions) ... ok
+test_late_model_batch_and_unverified_token_accounting_refuse (tests.autonomous.test_contracts.ContractTests.test_late_model_batch_and_unverified_token_accounting_refuse) ... ok
+test_nonnegative_account_magnitudes_and_revisions (tests.autonomous.test_contracts.ContractTests.test_nonnegative_account_magnitudes_and_revisions) ... ok
+test_numeric_candidate_mapping_is_fixed_and_exact (tests.autonomous.test_contracts.ContractTests.test_numeric_candidate_mapping_is_fixed_and_exact) ... ok
+test_order_reference_and_authorization_are_not_implicit (tests.autonomous.test_contracts.ContractTests.test_order_reference_and_authorization_are_not_implicit) ... ok
+test_source_payload_is_typed_hashed_and_immutable (tests.autonomous.test_contracts.ContractTests.test_source_payload_is_typed_hashed_and_immutable) ... ok
+test_timestamps_enums_and_nested_records (tests.autonomous.test_contracts.ContractTests.test_timestamps_enums_and_nested_records) ... ok
+test_wire_masks_have_bounded_integer_bit_widths (tests.autonomous.test_contracts.ContractTests.test_wire_masks_have_bounded_integer_bit_widths) ... ok
+test_canonical_reduced_rational_and_resource_bound (tests.autonomous.test_contracts.ExactNavTests.test_canonical_reduced_rational_and_resource_bound) ... ok
+test_decimal_projections_cannot_disagree_with_exact_authority (tests.autonomous.test_contracts.ExactNavTests.test_decimal_projections_cannot_disagree_with_exact_authority) ... ok
+test_ready_fixture_carries_exact_revision_mark_and_equity (tests.autonomous.test_contracts.ExactNavTests.test_ready_fixture_carries_exact_revision_mark_and_equity) ... ok
+test_ready_view_requires_bound_exact_evidence (tests.autonomous.test_contracts.ExactNavTests.test_ready_view_requires_bound_exact_evidence) ... ok
+test_accounting_write_boundary_failures_roll_back_every_projection (tests.autonomous.test_ledger.AccountingTests.test_accounting_write_boundary_failures_roll_back_every_projection) ... ok
+test_additive_accounting_migration_preserves_legacy_committed_export (tests.autonomous.test_ledger.AccountingTests.test_additive_accounting_migration_preserves_legacy_committed_export) ... ok
+test_buy_net_base_fee_and_sell_extra_base_fee_apply_once (tests.autonomous.test_ledger.AccountingTests.test_buy_net_base_fee_and_sell_extra_base_fee_apply_once) ... ok
+test_buy_sell_native_fees_basis_and_reservation_conservation (tests.autonomous.test_ledger.AccountingTests.test_buy_sell_native_fees_basis_and_reservation_conservation) ... ok
+test_closed_redeposit_requires_fresh_transfer_not_fresh_preclosure_mark (tests.autonomous.test_ledger.AccountingTests.test_closed_redeposit_requires_fresh_transfer_not_fresh_preclosure_mark) ... ok
+test_closure_redeposit_and_reopen_keep_halts_and_exact_history (tests.autonomous.test_ledger.AccountingTests.test_closure_redeposit_and_reopen_keep_halts_and_exact_history) ... ok
+test_committed_reservation_rechecks_held_book_and_fx_at_dispatch (tests.autonomous.test_ledger.AccountingTests.test_committed_reservation_rechecks_held_book_and_fx_at_dispatch) ... ok
+test_correction_replays_old_buy_basis_after_partial_sell (tests.autonomous.test_ledger.AccountingTests.test_correction_replays_old_buy_basis_after_partial_sell) ... ok
+test_correction_serialization_failure_rolls_back_before_retaining_incident (tests.autonomous.test_ledger.AccountingTests.test_correction_serialization_failure_rolls_back_before_retaining_incident) ... ok
+test_current_accounting_mark_rebinds_only_non_economic_revisions (tests.autonomous.test_ledger.AccountingTests.test_current_accounting_mark_rebinds_only_non_economic_revisions) ... ok
+test_delayed_closed_redeposit_preserves_exact_loss_history_and_requires_new_mark (tests.autonomous.test_ledger.AccountingTests.test_delayed_closed_redeposit_preserves_exact_loss_history_and_requires_new_mark) ... ok
+test_delayed_mark_application_cannot_refresh_held_book_or_fx (tests.autonomous.test_ledger.AccountingTests.test_delayed_mark_application_cannot_refresh_held_book_or_fx) ... ok
+test_deposit_loss_closure_restart_and_redeposit_preserve_latch (tests.autonomous.test_ledger.AccountingTests.test_deposit_loss_closure_restart_and_redeposit_preserve_latch) ... ok
+test_economic_failure_rolls_back_and_prefix_excludes_future_mark (tests.autonomous.test_ledger.AccountingTests.test_economic_failure_rolls_back_and_prefix_excludes_future_mark) ... ok
+test_exact_accounting_events_are_cutoff_prefix_bound (tests.autonomous.test_ledger.AccountingTests.test_exact_accounting_events_are_cutoff_prefix_bound) ... ok
+test_exact_flow_after_units_are_checked_on_restart (tests.autonomous.test_ledger.AccountingTests.test_exact_flow_after_units_are_checked_on_restart) ... ok
+test_fill_after_flow_still_latches_loss_in_economic_transaction (tests.autonomous.test_ledger.AccountingTests.test_fill_after_flow_still_latches_loss_in_economic_transaction) ... ok
+test_fill_known_cash_fee_can_latch_before_another_reconciliation (tests.autonomous.test_ledger.AccountingTests.test_fill_known_cash_fee_can_latch_before_another_reconciliation) ... ok
+test_flow_with_missing_fx_keeps_evidence_and_inhibits_entries (tests.autonomous.test_ledger.AccountingTests.test_flow_with_missing_fx_keeps_evidence_and_inhibits_entries) ... ok
+test_genuine_boundary_restored_after_outage_requires_current_reconciliation (tests.autonomous.test_ledger.AccountingTests.test_genuine_boundary_restored_after_outage_requires_current_reconciliation) ... ok
+test_held_book_and_fx_expire_independently_of_mark_for_readiness (tests.autonomous.test_ledger.AccountingTests.test_held_book_and_fx_expire_independently_of_mark_for_readiness) ... ok
+test_held_book_and_fx_expiry_refuses_new_reservation (tests.autonomous.test_ledger.AccountingTests.test_held_book_and_fx_expiry_refuses_new_reservation) ... ok
+test_late_fill_changed_retry_and_stale_correction_preserve_history (tests.autonomous.test_ledger.AccountingTests.test_late_fill_changed_retry_and_stale_correction_preserve_history) ... ok
+test_later_depth_cannot_be_relabeled_as_midnight (tests.autonomous.test_ledger.AccountingTests.test_later_depth_cannot_be_relabeled_as_midnight) ... ok
+test_local_evidence_cannot_claim_live_provenance_or_changed_identity (tests.autonomous.test_ledger.AccountingTests.test_local_evidence_cannot_claim_live_provenance_or_changed_identity) ... ok
+test_missing_fx_liquidation_invalidates_previous_ready_mark (tests.autonomous.test_ledger.AccountingTests.test_missing_fx_liquidation_invalidates_previous_ready_mark) ... ok
+test_missing_or_stale_depth_unknown_holding_and_boundary_are_unready (tests.autonomous.test_ledger.AccountingTests.test_missing_or_stale_depth_unknown_holding_and_boundary_are_unready) ... ok
+test_new_terminal_fill_and_open_cumulative_overfill_journal_once (tests.autonomous.test_ledger.AccountingTests.test_new_terminal_fill_and_open_cumulative_overfill_journal_once) ... ok
+test_non_usd_external_capital_requires_fx_and_preserves_nav (tests.autonomous.test_ledger.AccountingTests.test_non_usd_external_capital_requires_fx_and_preserves_nav) ... ok
+test_open_flow_cannot_refresh_expired_held_valuation_sources (tests.autonomous.test_ledger.AccountingTests.test_open_flow_cannot_refresh_expired_held_valuation_sources) ... ok
+test_projection_failure_retains_factual_transfer_and_inhibits_ready_view (tests.autonomous.test_ledger.AccountingTests.test_projection_failure_retains_factual_transfer_and_inhibits_ready_view) ... ok
+test_repeated_capital_flow_keeps_depth_for_following_loss_event (tests.autonomous.test_ledger.AccountingTests.test_repeated_capital_flow_keeps_depth_for_following_loss_event) ... ok
+test_repeating_units_repeated_flows_and_exact_view (tests.autonomous.test_ledger.AccountingTests.test_repeating_units_repeated_flows_and_exact_view) ... ok
+test_rounding_and_compensation_export_cutoff_keeps_original_economics (tests.autonomous.test_ledger.AccountingTests.test_rounding_and_compensation_export_cutoff_keeps_original_economics) ... ok
+test_stale_depth_heartbeat_and_unexplained_holdings_do_not_refresh_readiness (tests.autonomous.test_ledger.AccountingTests.test_stale_depth_heartbeat_and_unexplained_holdings_do_not_refresh_readiness) ... ok
+test_startup_rejects_day_boundary_projection_tampering (tests.autonomous.test_ledger.AccountingTests.test_startup_rejects_day_boundary_projection_tampering) ... ok
+test_startup_rejects_highwater_and_native_projection_tampering (tests.autonomous.test_ledger.AccountingTests.test_startup_rejects_highwater_and_native_projection_tampering) ... ok
+test_startup_rejects_mutable_unit_projection_tampering (tests.autonomous.test_ledger.AccountingTests.test_startup_rejects_mutable_unit_projection_tampering) ... ok
+test_submicro_basis_residual_and_duplicate_fill_evidence (tests.autonomous.test_ledger.AccountingTests.test_submicro_basis_residual_and_duplicate_fill_evidence) ... ok
+test_submicro_usd_transfer_cannot_silently_round_native_cash (tests.autonomous.test_ledger.AccountingTests.test_submicro_usd_transfer_cannot_silently_round_native_cash) ... ok
+test_terminal_fill_replay_does_not_change_reservation_on_another_intent_fill (tests.autonomous.test_ledger.AccountingTests.test_terminal_fill_replay_does_not_change_reservation_on_another_intent_fill) ... ok
+test_terminal_fill_replay_does_not_change_reservation_on_unrelated_deposit (tests.autonomous.test_ledger.AccountingTests.test_terminal_fill_replay_does_not_change_reservation_on_unrelated_deposit) ... ok
+test_third_asset_fee_fx_and_pending_unknown_conversion (tests.autonomous.test_ledger.AccountingTests.test_third_asset_fee_fx_and_pending_unknown_conversion) ... ok
+test_trailing_zero_fill_fields_are_canonical_idempotent_and_restartable (tests.autonomous.test_ledger.AccountingTests.test_trailing_zero_fill_fields_are_canonical_idempotent_and_restartable) ... ok
+test_trailing_zero_flow_is_canonical_idempotent_and_restartable (tests.autonomous.test_ledger.AccountingTests.test_trailing_zero_flow_is_canonical_idempotent_and_restartable) ... ok
+test_transfer_cost_triggers_daily_halt_atomically_and_utc_rollover (tests.autonomous.test_ledger.AccountingTests.test_transfer_cost_triggers_daily_halt_atomically_and_utc_rollover) ... ok
+test_unknown_correction_fee_retains_evidence_and_inhibits_without_economics (tests.autonomous.test_ledger.AccountingTests.test_unknown_correction_fee_retains_evidence_and_inhibits_without_economics) ... ok
+test_unknown_fill_semantics_records_incident_and_invalidates_ready_view (tests.autonomous.test_ledger.AccountingTests.test_unknown_fill_semantics_records_incident_and_invalidates_ready_view) ... ok
+test_wide_native_correction_preserves_exact_posting_targets_and_reopens (tests.autonomous.test_ledger.AccountingTests.test_wide_native_correction_preserves_exact_posting_targets_and_reopens) ... ok
+test_zero_equity_still_persists_breach_while_unarmed (tests.autonomous.test_ledger.AccountingTests.test_zero_equity_still_persists_breach_while_unarmed) ... ok
+test_busy_failure_disables_dispatch_without_partial_write (tests.autonomous.test_ledger.LedgerTests.test_busy_failure_disables_dispatch_without_partial_write) ... ok
+test_cash_competition_rechecks_pending_reservations (tests.autonomous.test_ledger.LedgerTests.test_cash_competition_rechecks_pending_reservations) ... ok
+test_changed_release_content_fails_startup_integrity (tests.autonomous.test_ledger.LedgerTests.test_changed_release_content_fails_startup_integrity) ... ok
+test_changed_venue_event_key_payload_is_rejected (tests.autonomous.test_ledger.LedgerTests.test_changed_venue_event_key_payload_is_rejected) ... ok
+test_correction_and_label_keys_are_unique (tests.autonomous.test_ledger.LedgerTests.test_correction_and_label_keys_are_unique) ... ok
+test_crash_after_dispatch_keeps_reservation_and_becomes_unknown (tests.autonomous.test_ledger.LedgerTests.test_crash_after_dispatch_keeps_reservation_and_becomes_unknown) ... ok
+test_dispatch_assessor_does_not_count_own_reservation_twice (tests.autonomous.test_ledger.LedgerTests.test_dispatch_assessor_does_not_count_own_reservation_twice) ... ok
+test_dispatch_marker_commits_and_rechecks_control (tests.autonomous.test_ledger.LedgerTests.test_dispatch_marker_commits_and_rechecks_control) ... ok
+test_duplicate_correction_retains_original_and_rejects_changed_key (tests.autonomous.test_ledger.LedgerTests.test_duplicate_correction_retains_original_and_rejects_changed_key) ... ok
+test_failed_posting_rolls_back_entire_journal (tests.autonomous.test_ledger.LedgerTests.test_failed_posting_rolls_back_entire_journal) ... ok
+test_failed_reservation_rolls_back_intent (tests.autonomous.test_ledger.LedgerTests.test_failed_reservation_rolls_back_intent) ... ok
+test_filled_status_requires_complete_cumulative_quantity (tests.autonomous.test_ledger.LedgerTests.test_filled_status_requires_complete_cumulative_quantity) ... ok
+test_foreign_keys_and_snapshot_exactly_one_reference (tests.autonomous.test_ledger.LedgerTests.test_foreign_keys_and_snapshot_exactly_one_reference) ... ok
+test_forged_assessor_verdict_never_authorizes (tests.autonomous.test_ledger.LedgerTests.test_forged_assessor_verdict_never_authorizes) ... ok
+test_invalid_money_and_missing_account_rejected (tests.autonomous.test_ledger.LedgerTests.test_invalid_money_and_missing_account_rejected) ... ok
+test_migration_checksum_tampering_refuses_open (tests.autonomous.test_ledger.LedgerTests.test_migration_checksum_tampering_refuses_open) ... ok
+test_nested_transaction_failure_cannot_commit_partial_post (tests.autonomous.test_ledger.LedgerTests.test_nested_transaction_failure_cannot_commit_partial_post) ... ok
+test_open_never_adopts_or_arms_account (tests.autonomous.test_ledger.LedgerTests.test_open_never_adopts_or_arms_account) ... ok
+test_order_events_are_typed_idempotent_and_keep_capacity (tests.autonomous.test_ledger.LedgerTests.test_order_events_are_typed_idempotent_and_keep_capacity) ... ok
+test_reopen_preserves_journal_and_disarms (tests.autonomous.test_ledger.LedgerTests.test_reopen_preserves_journal_and_disarms) ... ok
+test_reopen_rejects_removed_evidence_protection (tests.autonomous.test_ledger.LedgerTests.test_reopen_rejects_removed_evidence_protection) ... ok
+test_reservation_commits_and_cross_release_action_is_unique (tests.autonomous.test_ledger.LedgerTests.test_reservation_commits_and_cross_release_action_is_unique) ... ok
+test_reservation_duplicate_is_content_bound (tests.autonomous.test_ledger.LedgerTests.test_reservation_duplicate_is_content_bound) ... ok
+test_reservation_rechecks_revision_and_capacity (tests.autonomous.test_ledger.LedgerTests.test_reservation_rechecks_revision_and_capacity) ... ok
+test_reservation_unready_fails_closed (tests.autonomous.test_ledger.LedgerTests.test_reservation_unready_fails_closed) ... ok
+test_review_job_dedupe_and_missing_reference (tests.autonomous.test_ledger.LedgerTests.test_review_job_dedupe_and_missing_reference) ... ok
+test_review_r1_nested_dispatch_rejects_before_mutation (tests.autonomous.test_ledger.LedgerTests.test_review_r1_nested_dispatch_rejects_before_mutation) ... ok
+test_review_r1_uncommitted_reservation_cannot_dispatch (tests.autonomous.test_ledger.LedgerTests.test_review_r1_uncommitted_reservation_cannot_dispatch) ... ok
+test_review_r2_all_event_receipt_knowledge_and_segment_endpoints_are_causal (tests.autonomous.test_ledger.LedgerTests.test_review_r2_all_event_receipt_knowledge_and_segment_endpoints_are_causal) ... ok
+test_review_r2_clock_regression_cutoff_preserves_committed_event_prefix (tests.autonomous.test_ledger.LedgerTests.test_review_r2_clock_regression_cutoff_preserves_committed_event_prefix) ... ok
+test_review_r2_delayed_first_export_uses_historical_revision_and_generation (tests.autonomous.test_ledger.LedgerTests.test_review_r2_delayed_first_export_uses_historical_revision_and_generation) ... ok
+test_review_r2_event_before_commit_capture_uses_previous_committed_prefix (tests.autonomous.test_ledger.LedgerTests.test_review_r2_event_before_commit_capture_uses_previous_committed_prefix) ... ok
+test_review_r2_nested_result_receipt_participates_in_revision_visibility (tests.autonomous.test_ledger.LedgerTests.test_review_r2_nested_result_receipt_participates_in_revision_visibility) ... ok
+test_review_r2_non_economic_import_commits_new_prefix_without_revision_change (tests.autonomous.test_ledger.LedgerTests.test_review_r2_non_economic_import_commits_new_prefix_without_revision_change) ... ok
+test_review_r2_reconciliation_anchor_requires_selected_committed_prefix (tests.autonomous.test_ledger.LedgerTests.test_review_r2_reconciliation_anchor_requires_selected_committed_prefix) ... ok
+test_review_r2_session_account_anchor_requires_creation_prefix (tests.autonomous.test_ledger.LedgerTests.test_review_r2_session_account_anchor_requires_creation_prefix) ... ok
+test_review_r3_clock_regression_and_reverse_ids_preserve_order (tests.autonomous.test_ledger.LedgerTests.test_review_r3_clock_regression_and_reverse_ids_preserve_order) ... ok
+test_review_r3_same_timestamp_order_replay_uses_durable_append_order (tests.autonomous.test_ledger.LedgerTests.test_review_r3_same_timestamp_order_replay_uses_durable_append_order) ... ok
+test_review_r4_duplicate_manifest_record_id_is_rejected (tests.autonomous.test_ledger.LedgerTests.test_review_r4_duplicate_manifest_record_id_is_rejected) ... ok
+test_review_r4_manifest_ids_use_real_primary_keys (tests.autonomous.test_ledger.LedgerTests.test_review_r4_manifest_ids_use_real_primary_keys) ... ok
+test_review_r5_cumulative_quantity_is_exact_under_low_ambient_precision (tests.autonomous.test_ledger.LedgerTests.test_review_r5_cumulative_quantity_is_exact_under_low_ambient_precision) ... ok
+test_review_r5_high_scale_order_ignores_ambient_decimal_precision (tests.autonomous.test_ledger.LedgerTests.test_review_r5_high_scale_order_ignores_ambient_decimal_precision) ... ok
+test_schema_settings_and_append_only_protection (tests.autonomous.test_ledger.LedgerTests.test_schema_settings_and_append_only_protection) ... ok
+test_session_export_does_not_include_future_source_or_control (tests.autonomous.test_ledger.LedgerTests.test_session_export_does_not_include_future_source_or_control) ... ok
+test_session_export_is_immutable_and_idempotent (tests.autonomous.test_ledger.LedgerTests.test_session_export_is_immutable_and_idempotent) ... ok
+test_session_order_projection_is_rebuilt_at_cutoff (tests.autonomous.test_ledger.LedgerTests.test_session_order_projection_is_rebuilt_at_cutoff) ... ok
+test_startup_rejects_negative_decimal_projection (tests.autonomous.test_ledger.LedgerTests.test_startup_rejects_negative_decimal_projection) ... ok
+test_transaction_identity_is_content_bound (tests.autonomous.test_ledger.LedgerTests.test_transaction_identity_is_content_bound) ... ok
+test_unbalanced_journal_is_rejected (tests.autonomous.test_ledger.LedgerTests.test_unbalanced_journal_is_rejected) ... ok
+test_deposit_cannot_hide_drawdown (tests.autonomous.test_risk_limits.FlowTests.test_deposit_cannot_hide_drawdown) ... ok
+test_exact_thresholds_ignore_decimal_context (tests.autonomous.test_risk_limits.FlowTests.test_exact_thresholds_ignore_decimal_context) ... ok
+test_external_flow_fixture_and_adjacent_exact_boundaries (tests.autonomous.test_risk_limits.FlowTests.test_external_flow_fixture_and_adjacent_exact_boundaries) ... ok
+test_invalid_and_closure_reject_before_division (tests.autonomous.test_risk_limits.FlowTests.test_invalid_and_closure_reject_before_division) ... ok
+
+----------------------------------------------------------------------
+Ran 133 tests in 2.265s
+
+OK
+```
+
+Final owned source/test/report `git diff --check` passed. Independent reviewer is evaluating this final source endpoint; this report does not grant review approval. No providers, network, orders, deployment or Task 4 actions were used.
