@@ -1128,6 +1128,138 @@ class AccountingTests(unittest.TestCase):
         with self.assertRaises(ContractViolation):self.ledger.correct_fill(self.evidence('stale','correction',correction))
         self.assertEqual(1,self.ledger.connection.execute('SELECT count(*) FROM fill_corrections').fetchone()[0])
 
+    def test_terminal_fill_replay_does_not_change_reservation_on_unrelated_deposit(self):
+        self.initialize()
+        self.intent('completed',quantity='1')
+        self.fill('completed-fill','completed','1','100','USD','0')
+        result=VenueOrderResult(OrderReference('paper-test','completed','completed','venue-completed'),
+            IntentState.FILLED,Decimal('1'),Decimal('0'),self.now)
+        self.ledger.append_order_event(OrderEvent('completed-event','completed',IntentState.FILLED,result,self.now))
+        books={'AAVE':{'at_us':self.now,'bids':[['100','10']]}}
+        self.mark('completed-reconciliation',books=books)
+        self.assertTrue(self.ledger.account_view('paper-test').ready)
+        before=tuple(self.ledger.connection.execute("SELECT * FROM reservations WHERE intent_id='completed'").fetchone())
+        self.assertTrue(self.flow('unrelated-capital',1000000))
+        self.assertEqual([],list(self.ledger.connection.execute(
+            "SELECT * FROM accounting_findings WHERE reason='late fill or cumulative order disagreement'")))
+        self.assertEqual(before,tuple(self.ledger.connection.execute("SELECT * FROM reservations WHERE intent_id='completed'").fetchone()))
+        self.mark('post-deposit-reconciliation',books=books)
+        self.assertTrue(self.ledger.account_view('paper-test').ready)
+
+    def test_terminal_fill_replay_does_not_change_reservation_on_another_intent_fill(self):
+        self.initialize()
+        self.intent('completed',quantity='1')
+        self.fill('completed-fill','completed','1','100','USD','0')
+        result=VenueOrderResult(OrderReference('paper-test','completed','completed','venue-completed'),
+            IntentState.FILLED,Decimal('1'),Decimal('0'),self.now)
+        self.ledger.append_order_event(OrderEvent('completed-event','completed',IntentState.FILLED,result,self.now))
+        self.mark('completed-reconciliation',books={'AAVE':{'at_us':self.now,'bids':[['100','10']]}})
+        self.assertTrue(self.ledger.account_view('paper-test').ready)
+        before=tuple(self.ledger.connection.execute("SELECT * FROM reservations WHERE intent_id='completed'").fetchone())
+        self.intent('other',quantity='1')
+        self.fill('other-fill','other','1','100','USD','0')
+        self.assertEqual([],list(self.ledger.connection.execute(
+            "SELECT * FROM accounting_findings WHERE reason='late fill or cumulative order disagreement'")))
+        self.assertEqual(before,tuple(self.ledger.connection.execute("SELECT * FROM reservations WHERE intent_id='completed'").fetchone()))
+        self.mark('post-fill-reconciliation',books={'AAVE':{'at_us':self.now,'bids':[['100','10']]}})
+        self.assertTrue(self.ledger.account_view('paper-test').ready)
+
+    def test_new_terminal_fill_and_open_cumulative_overfill_journal_once(self):
+        for terminal in (False,True):
+            with self.subTest(terminal=terminal):
+                if terminal:self.tearDown();self.setUp()
+                self.initialize()
+                self.intent('buy',quantity='1')
+                self.fill('first','buy','1','100','USD','0')
+                if terminal:
+                    result=VenueOrderResult(OrderReference('paper-test','buy','buy','venue-buy'),
+                        IntentState.FILLED,Decimal('1'),Decimal('0'),self.now)
+                    self.ledger.append_order_event(OrderEvent('terminal','buy',IntentState.FILLED,result,self.now))
+                payload=self.fill('new-fill','buy','1','100','USD','0')
+                count=self.ledger.connection.execute('SELECT count(*) FROM journal_transactions').fetchone()[0]
+                self.assertFalse(self.ledger.record_fill(self.evidence('new-fill','fill',payload)))
+                self.assertEqual(count,self.ledger.connection.execute('SELECT count(*) FROM journal_transactions').fetchone()[0])
+                self.assertEqual(1,self.ledger.connection.execute(
+                    "SELECT count(*) FROM accounting_findings WHERE reason='late fill or cumulative order disagreement'").fetchone()[0])
+                self.mark('current',books={'AAVE':{'at_us':self.now,'bids':[['100','10']]}})
+                self.assertFalse(self.ledger.account_view('paper-test').ready)
+                self.assertEqual('2',self.balances()['AAVE'])
+
+    def test_wide_native_correction_preserves_exact_posting_targets_and_reopens(self):
+        from fractions import Fraction
+        self.initialize()
+        self.intent('buy',quantity='10')
+        original=self.fill('wide-original','buy','10','0.000001','USD','0',price='0.0000001')
+        tiny='0.00000000000000000000000000000000000001'
+        replacement=dict(original,base_quantity=tiny,price='100000000000000000000000000000000')
+        correction={'fill_id':'wide-original','previous_payload_hash':content_hash(original),'replacement':replacement}
+        evidence=self.evidence('wide-correction','correction',correction)
+        self.assertTrue(self.ledger.correct_fill(evidence))
+        self.assertFalse(self.ledger.correct_fill(evidence))
+        self.assertEqual(tiny,self.balances()['AAVE'])
+        _,_,target,_,_,_=self.ledger._replay_economics('paper-test')
+        actual={}
+        for row in self.ledger.connection.execute(
+                'SELECT ledger_account,asset,native_delta FROM journal_postings WHERE asset IS NOT NULL'):
+            key=row['ledger_account'],row['asset']
+            actual[key]=actual.get(key,Fraction(0))+Fraction(Decimal(row['native_delta']))
+        self.assertEqual({k:v for k,v in target.items() if v},{k:v for k,v in actual.items() if v})
+        self.assertEqual(Fraction(Decimal(tiny)),actual['inventory:AAVE','AAVE'])
+        before=self.balances()
+        self.ledger.close();self.ledger=load_ledger().open(self.path)
+        self.ledger._clock_us=lambda:self.now
+        self.assertEqual(before,self.balances())
+        self.assertFalse(self.ledger.account_view('paper-test').ready)
+
+    def test_trailing_zero_flow_is_canonical_idempotent_and_restartable(self):
+        from bot.autonomous.contracts import strict_json
+        self.initialize()
+        payload={'transfer_key':'formatted-transfer','asset':'USD','quantity':'1.0',
+            'usd_value_u':1000000,'fee_usd_u':0,
+            'preflow_mark_id':self.ledger.account_view('paper-test').exact_nav.mark_id}
+        evidence=self.evidence('formatted-transfer','flow',payload)
+        self.assertTrue(self.ledger.record_flow(evidence))
+        self.assertEqual('1',self.ledger.connection.execute('SELECT native_qty FROM external_flows').fetchone()[0])
+        self.assertFalse(self.ledger.record_flow(evidence))
+        self.assertFalse(self.ledger.record_flow(self.evidence('transfer-retry','flow',payload)))
+        retained=self.ledger.connection.execute('SELECT payload_json,payload_hash FROM accounting_evidence WHERE evidence_id=?',(evidence,)).fetchone()
+        self.assertEqual(payload,strict_json(retained['payload_json']))
+        self.assertEqual(content_hash(payload),retained['payload_hash'])
+        self.assertEqual(1,self.ledger.connection.execute('SELECT count(*) FROM external_flows').fetchone()[0])
+        self.mark('canonical-flow-current')
+        before=self.balances();authority=self.ledger.account_view('paper-test').exact_nav
+        self.ledger.close();self.ledger=load_ledger().open(self.path)
+        self.ledger._clock_us=lambda:self.now
+        self.assertEqual(before,self.balances())
+        self.assertEqual(authority.units,self.ledger.account_view('paper-test').exact_nav.units)
+        self.assertFalse(self.ledger.account_view('paper-test').ready)
+        self.mark('canonical-flow-restarted')
+        self.assertTrue(self.ledger.account_view('paper-test').ready)
+
+    def test_trailing_zero_fill_fields_are_canonical_idempotent_and_restartable(self):
+        from bot.autonomous.contracts import strict_json
+        self.initialize()
+        self.intent('buy',quantity='1')
+        payload=self.fill('formatted-fill','buy','1.0','100.00','USD','0.0100',price='100.000')
+        row=self.ledger.connection.execute('SELECT base_qty,quote_qty,price,fee_qty,payload_hash FROM fills').fetchone()
+        self.assertIsNotNone(row)
+        self.assertEqual(('1','100','100','0.01'),tuple(row)[:4])
+        self.assertEqual(content_hash(payload),row['payload_hash'])
+        self.assertFalse(self.ledger.record_fill(self.evidence('formatted-fill','fill',payload)))
+        self.assertFalse(self.ledger.record_fill(self.evidence('fill-retry','fill',payload)))
+        retained=self.ledger.connection.execute("SELECT payload_json FROM accounting_evidence WHERE evidence_id='formatted-fill'").fetchone()[0]
+        self.assertEqual(payload,strict_json(retained))
+        self.assertEqual(1,self.ledger.connection.execute('SELECT count(*) FROM fills').fetchone()[0])
+        self.mark('canonical-fill-current',books={'AAVE':{'at_us':self.now,'bids':[['100','1']]}})
+        before=self.balances();authority=self.ledger.account_view('paper-test').exact_nav
+        self.ledger.close();self.ledger=load_ledger().open(self.path)
+        self.ledger._clock_us=lambda:self.now
+        self.assertEqual(before,self.balances())
+        self.assertEqual(authority.nav,self.ledger.account_view('paper-test').exact_nav.nav)
+        self.assertFalse(self.ledger.account_view('paper-test').ready)
+        self.mark('canonical-fill-restarted',books={'AAVE':{'at_us':self.now,'bids':[['100','1']]}})
+        self.assertTrue(self.ledger.account_view('paper-test').ready)
+
     def test_stale_depth_heartbeat_and_unexplained_holdings_do_not_refresh_readiness(self):
         self.initialize(extra=({'asset':'OTHER','quantity':'1','basis_usd_u':1000000},))
         self.mark('complete-other',books={'OTHER':{'at_us':self.now,'bids':[['1','1']]}})

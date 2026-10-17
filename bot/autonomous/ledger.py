@@ -24,6 +24,7 @@ from .contracts import (
     Reservation, RiskLimits, RiskVerdict, SessionArchive, SessionCutoff, ReviewJob,
     candidate_wire_id, canonical_bytes, checked_money, content_hash, decimal_text,
     decimal_value, strict_json, ExactRatio, ExactNavEvidence, Holding,
+    MAX_DECIMAL_SCALE,
 )
 
 _MIGRATION = Path(__file__).resolve().parents[2] / 'data/migrations/001_autonomous_ledger.sql'
@@ -136,6 +137,27 @@ def nav_after_flow(equity: Decimal, units: Decimal, flow: Decimal) -> tuple[Deci
 def _project(value: Fraction) -> Decimal:
     """38 significant digits / <=38 places, floor projection only; not authority."""
     return ExactRatio.of(value).projection()
+
+
+def _native_posting_quantities(value: Fraction) -> tuple[str, ...]:
+    """Serialize exact native changes as bounded integer/fractional legs.
+
+    Two supported native quantities can have a difference wider than either
+    quantity's 38 significant digits. Splitting at the decimal point preserves
+    that difference without rounding any asset quantity.
+    """
+    scale=10**MAX_DECIMAL_SCALE
+    scaled=abs(value)*scale
+    if scaled.denominator!=1:raise ContractViolation('native posting scale exceeded')
+    whole,fractional=divmod(scaled.numerator,scale)
+    sign='-' if value<0 else ''
+    raw=[]
+    if whole:raw.append(sign+str(whole))
+    if fractional:raw.append(sign+'0.'+str(fractional).rjust(MAX_DECIMAL_SCALE,'0'))
+    legs=tuple(decimal_text(decimal_value(text)) for text in raw)
+    if sum((Fraction(decimal_value(text)) for text in legs),Fraction(0))!=value:
+        raise ContractViolation('native posting serialization mismatch')
+    return legs
 
 
 def _ratio(raw: str) -> Fraction:
@@ -1103,6 +1125,7 @@ class Ledger:
 
     def _apply_economics(self, e: sqlite3.Row, p: dict, kind: str) -> str:
         account_id=e['account_id'];c=self.connection
+        prior_filled=self._replay_economics(account_id)[4]
         balances,totals,native,residuals,filled,pending_fees=self._replay_economics(account_id,(kind,p,e))
         tx='economic-'+content_hash(e['evidence_id']);now=self._clock_us()
         sequence=c.execute('SELECT coalesce(max(sequence),0)+1 FROM journal_transactions').fetchone()[0]
@@ -1119,10 +1142,16 @@ class Ledger:
             if delta:lines.append((name,None,None,delta))
         for name,asset in sorted(native.keys()|prior_native.keys()):
             delta=native.get((name,asset),Fraction(0))-prior_native.get((name,asset),Fraction(0))
-            if delta:lines.append((name,asset,decimal_text(_project(delta)),0))
+            lines.extend((name,asset,quantity,0) for quantity in _native_posting_quantities(delta))
         lines.extend([('rounding',None,None,0),('settlement',None,None,0)])
         validate_postings(tuple((name,amount) for name,_,_,amount in lines))
         for i,(name,asset,qty,amount) in enumerate(lines):c.execute('INSERT INTO journal_postings VALUES (?,?,?,?,?,?,?)',(tx,i,name,asset,qty,amount,now))
+        serialized_native=prior_native.copy()
+        for row in c.execute('SELECT ledger_account,asset,native_delta FROM journal_postings WHERE transaction_id=? AND asset IS NOT NULL',(tx,)):
+            key=row['ledger_account'],row['asset']
+            serialized_native[key]=serialized_native.get(key,Fraction(0))+Fraction(decimal_value(row['native_delta']))
+        if {k:v for k,v in serialized_native.items() if v}!={k:v for k,v in native.items() if v}:
+            raise ContractViolation('serialized native journal disagrees with exact replay')
         for i,residual in enumerate(residuals):
             if abs(residual)>1:raise ContractViolation('unbounded monetary rounding')
             c.execute('INSERT INTO accounting_rounding VALUES (?,?,?,?,?)',(tx+'-'+str(i),tx,ExactRatio.of(residual).to_json(),'partial basis floor/final residual; fee ceiling; settled quote <=1 microdollar',now))
@@ -1131,6 +1160,10 @@ class Ledger:
         c.execute('INSERT INTO accounting_operations VALUES (?,?,?,?,?,?)',(e['evidence_id'],account_id,e['evidence_id'],kind,tx,now))
         self.invalidate_account(account_id)
         for intent_id,total in filled.items():
+            # Full-history replay rebuilds balances, but only a changed cumulative
+            # fill belongs to this operation. Unchanged terminal history must not
+            # recreate reservations or report another late-fill incident.
+            if total==prior_filled.get(intent_id,Fraction(0)):continue
             intent=c.execute('SELECT * FROM order_intents WHERE intent_id=?',(intent_id,)).fetchone()
             proposal=OrderProposal.from_json(intent['proposal_json'])
             original=Fraction(decimal_value(intent['qty']));remaining=max(Fraction(0),original-total)
@@ -1169,7 +1202,10 @@ class Ledger:
             except (ContractViolation,KeyError,TypeError) as exc:
                 self._finding(e,'unaccounted fill: '+str(exc))
                 return False
-            c.execute('INSERT INTO fills VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',(p['fill_id'],e['account_id'],p['intent_id'],p['venue'],p['trade_id'],p['order_id'],p['instrument'],p['side'],p['base_quantity'],p['quote_quantity'],p['price'],p['fee_asset'],p['fee_quantity'],e['event_at_us'],e['received_at_us'],e['payload_hash'],self._clock_us()))
+            # Normalize database projections with the same rule startup checks;
+            # the retained source payload/hash remains the idempotency identity.
+            base,quote,price,fee=(decimal_text(decimal_value(p[key])) for key in ('base_quantity','quote_quantity','price','fee_quantity'))
+            c.execute('INSERT INTO fills VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',(p['fill_id'],e['account_id'],p['intent_id'],p['venue'],p['trade_id'],p['order_id'],p['instrument'],p['side'],base,quote,price,p['fee_asset'],fee,e['event_at_us'],e['received_at_us'],e['payload_hash'],self._clock_us()))
             self._apply_economics(e,p,'fill')
             self._mark_after_economics(e)
             return True
@@ -1378,7 +1414,7 @@ class Ledger:
             except (ContractViolation,KeyError,TypeError) as exc:
                 self._finding(e,'unaccounted transfer: '+str(exc));return False
             tx=self._apply_economics(e,p,'flow')
-            c.execute('INSERT INTO external_flows VALUES (?,?,?,?,?,?,?,?,?,?,?)',(evidence_id,account_id,p['transfer_key'],p['asset'],p['quantity'],value,decimal_text(_project(delta)),mark['mark_id'],tx,e['event_at_us'],self._clock_us()))
+            c.execute('INSERT INTO external_flows VALUES (?,?,?,?,?,?,?,?,?,?,?)',(evidence_id,account_id,p['transfer_key'],p['asset'],decimal_text(decimal_value(p['quantity'])),value,decimal_text(_project(delta)),mark['mark_id'],tx,e['event_at_us'],self._clock_us()))
             c.execute('INSERT INTO exact_flows VALUES (?,?,?,?,?,?,?)',(evidence_id,account_id,mark['mark_id'],delta_record.to_json(),unit_record.to_json(),int(closed),self._clock_us()))
             c.execute('UPDATE accounting_state SET closed=?,units_json=? WHERE account_id=?',(int(closed),unit_record.to_json(),account_id))
             if not closed:
