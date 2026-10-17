@@ -13,6 +13,7 @@ from contextlib import contextmanager
 from dataclasses import replace
 from decimal import Context, Decimal, DecimalException, ROUND_CEILING, localcontext
 from functools import wraps
+from fractions import Fraction
 from pathlib import Path
 from typing import Callable, Iterator
 
@@ -22,10 +23,11 @@ from .contracts import (
     OrderEvent, OrderProposal, Permit, PersistenceUnavailable, PreparedIntent,
     Reservation, RiskLimits, RiskVerdict, SessionArchive, SessionCutoff, ReviewJob,
     candidate_wire_id, canonical_bytes, checked_money, content_hash, decimal_text,
-    decimal_value, strict_json,
+    decimal_value, strict_json, ExactRatio, ExactNavEvidence, Holding,
 )
 
 _MIGRATION = Path(__file__).resolve().parents[2] / 'data/migrations/001_autonomous_ledger.sql'
+_MIGRATIONS = (_MIGRATION, _MIGRATION.with_name('002_autonomous_accounting.sql'))
 _TERMINAL = {IntentState.FILLED, IntentState.CANCELED, IntentState.REJECTED}
 _TRANSITIONS = {
     IntentState.RESERVED: {IntentState.DISPATCHING, IntentState.REJECTED},
@@ -39,6 +41,12 @@ _TRANSITIONS = {
 # Visibility policies describe observation/receipt/knowledge time, not future
 # deadlines, expiry windows, forecast maturity, or other declared metadata.
 _EXPORT_TIMES = {
+    'accounting_evidence': ('event_at_us','received_at_us','known_at_us','recorded_at_us'),
+    'accounting_operations': ('recorded_at_us',),
+    'exact_marks': ('recorded_at_us',),
+    'exact_flows': ('recorded_at_us',),
+    'accounting_findings': ('recorded_at_us',),
+    'accounting_rounding': ('recorded_at_us',),
     'accounts': ('created_at_us',),
     'account_revision_history': ('recorded_at_us','known_at_us'),
     'control_events': ('recorded_at_us',),
@@ -66,9 +74,16 @@ _EXPORT_TIMES = {
     'release_events': ('recorded_at_us',),
     'evaluation_runs': ('recorded_at_us',),
 }
-_EXPORT_OMIT = {'schema_migrations','review_sessions','review_jobs','account_control',
+_EXPORT_OMIT = {'accounting_state','schema_migrations','review_sessions','review_jobs','account_control',
     'account_readiness','balance_positions','candidate_control','reservations'}
+# Only these explicitly introduced migration-002 tables have a proven empty
+# prefix in a migration-001 history record. Future tables need their own policy.
+_ACCOUNTING_EXPORT_TABLES = frozenset({'accounting_evidence','accounting_operations',
+    'exact_marks','exact_flows','accounting_findings','accounting_rounding'})
 _MANIFEST_KEYS = {
+    'accounting_evidence': ('evidence_id',), 'accounting_operations': ('operation_id',),
+    'exact_marks': ('mark_id',), 'exact_flows': ('flow_id',),
+    'accounting_findings': ('finding_id',), 'accounting_rounding': ('rounding_id',),
     'source_events': ('event_id',), 'source_invalidations': ('invalidation_id',),
     'event_segments': ('segment_hash',), 'forecasts': ('forecast_id',),
     'outcome_labels': ('label_id',), 'label_events': ('label_event_id',),
@@ -108,6 +123,29 @@ def _identifier(value: str) -> str:
     if type(value) is not str or not value or len(value) > 256 or not value.isascii():
         raise ContractViolation('invalid identifier')
     return value
+
+
+def nav_after_flow(equity: Decimal, units: Decimal, flow: Decimal) -> tuple[Decimal,Decimal,Decimal]:
+    for value in (equity,units,flow): decimal_text(value)
+    e,u,f=map(Fraction,(equity,units,flow))
+    if e<=0 or u<=0 or e+f<=0: raise ContractViolation('invalid account NAV')
+    with localcontext(Context(prec=50)):
+        return tuple(Decimal(v.numerator)/Decimal(v.denominator) for v in (e+f,u*(e+f)/e,e/u))
+
+
+def _project(value: Fraction) -> Decimal:
+    """38 significant digits / <=38 places, floor projection only; not authority."""
+    return ExactRatio.of(value).projection()
+
+
+def _ratio(raw: str) -> Fraction:
+    return ExactRatio.from_json(raw).fraction()
+
+
+def _money(value: Fraction, *, ceiling=False) -> int:
+    n,d=value.numerator,value.denominator
+    return checked_money(-((-n)//d) if ceiling else n//d)
+
 
 
 class Ledger:
@@ -194,25 +232,20 @@ class Ledger:
             raise
 
     def _migrate(self) -> None:
-        sql = _MIGRATION.read_text()
-        checksum = hashlib.sha256(sql.encode()).hexdigest()
-        exists = self.connection.execute("SELECT 1 FROM sqlite_master WHERE name='schema_migrations'").fetchone()
-        if exists:
-            migrations = self.connection.execute('SELECT version,checksum FROM schema_migrations ORDER BY version').fetchall()
-            if [(r[0], r[1]) for r in migrations] != [(1, checksum)]:
-                raise PersistenceUnavailable('migration checksum/version mismatch')
-            return
-        if self.connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'").fetchone():
+        exists=self.connection.execute("SELECT 1 FROM sqlite_master WHERE name='schema_migrations'").fetchone()
+        applied=self.connection.execute('SELECT version,checksum FROM schema_migrations ORDER BY version').fetchall() if exists else []
+        expected=[(i,hashlib.sha256(path.read_bytes()).hexdigest()) for i,path in enumerate(_MIGRATIONS,1)]
+        if [tuple(r) for r in applied]!=expected[:len(applied)] or len(applied)>len(expected):
+            raise PersistenceUnavailable('migration checksum/version mismatch')
+        if not exists and self.connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'").fetchone():
             raise PersistenceUnavailable('refusing unrecognized database adoption')
-        # executescript controls its own transaction; include every DDL and marker
-        # in that transaction, so a failed migration leaves no partial schema.
-        try:
-            self.connection.executescript('BEGIN IMMEDIATE;\n' + sql +
-                f"\nINSERT INTO schema_migrations VALUES(1,'{checksum}',{self._clock_us()});\nCOMMIT;")
-        except sqlite3.Error:
-            if self.connection.in_transaction:
-                self.connection.rollback()
-            raise
+        for (version,checksum),path in zip(expected[len(applied):],_MIGRATIONS[len(applied):]):
+            try:
+                self.connection.executescript('BEGIN IMMEDIATE;\n'+path.read_text()+
+                    f"\nINSERT INTO schema_migrations VALUES({version},'{checksum}',{self._clock_us()});\nCOMMIT;")
+            except sqlite3.Error:
+                if self.connection.in_transaction:self.connection.rollback()
+                raise
 
     def _integrity_check(self) -> None:
         if self.connection.execute('PRAGMA quick_check').fetchone()[0] != 'ok':
@@ -223,7 +256,8 @@ class Ledger:
         # must not silently weaken an otherwise checksummed schema).
         reference = sqlite3.connect(':memory:')
         try:
-            reference.executescript(_MIGRATION.read_text())
+            for path in _MIGRATIONS:
+                reference.executescript(path.read_text())
             expected = {row[0]:row[1] for row in reference.execute("SELECT name,sql FROM sqlite_master WHERE sql IS NOT NULL")}
         finally:
             reference.close()
@@ -280,6 +314,8 @@ class Ledger:
                         number = decimal_value(value)
                         if decimal_text(number)!=value or number<0 and table not in {'journal_postings','external_flows','outcome_labels'}:
                             raise PersistenceUnavailable('invalid decimal in '+table)
+
+        self._check_accounting_integrity()
 
     def _recover(self) -> None:
         now = self._clock_us()
@@ -382,18 +418,31 @@ class Ledger:
         # Retain even terminal reservations until the reconciler explicitly verifies
         # cumulative fills and final fees. Terminal order status alone proves neither.
         reservations = tuple(self._reservation(r) for r in self.connection.execute('SELECT r.* FROM reservations r JOIN order_intents i USING(intent_id) WHERE i.account_id=? AND (r.cash_usd_u>0 OR r.gross_usd_u>0 OR r.loss_budget_usd_u>0 OR r.remaining_qty!=\'0\') ORDER BY r.intent_id',(account_id,)))
-        mark = self.connection.execute('SELECT * FROM equity_marks WHERE account_id=? ORDER BY marked_at_us DESC,recorded_at_us DESC,mark_id DESC LIMIT 1',(account_id,)).fetchone()
+        mark = self.connection.execute('SELECT * FROM equity_marks WHERE account_id=? ORDER BY rowid DESC LIMIT 1',(account_id,)).fetchone()
         reconcile = self.connection.execute('SELECT * FROM reconciliations WHERE reconcile_id=? AND account_id=?',(control['reconcile_id'],account_id)).fetchone()
         ready = bool(runtime['ready'] and mark and reconcile and reconcile['status']=='completed' and reconcile['finished_at_us'] is not None and runtime['private_heartbeat_us'] is not None and mark['valuation_version']==runtime['valuation_version'] and mark['equity_usd_u']>0)
-        # Held-asset liquidation evidence comes from Task3. Until its immutable
-        # holding valuation projection is integrated, any non-USD balance blocks.
-        ready = ready and all(b.asset=='USD' or b.quantity==0 for b in balances)
+        exact_row=self.connection.execute('SELECT * FROM exact_marks WHERE mark_id=?',(mark['mark_id'],)).fetchone() if mark else None
+        revision=self._revision(account_id)
+        exact=replace(ExactNavEvidence.from_json(exact_row['exact_json']),revision=revision) if exact_row else None
+        holdings=tuple(Holding.from_dict(h) for h in strict_json(exact_row['holdings_json'])) if exact_row else ()
+        state=self.connection.execute('SELECT * FROM accounting_state WHERE account_id=?',(account_id,)).fetchone()
+        closed=bool(state and state['closed'])
+        ready=ready and exact is not None and exact_row['journal_sequence']==revision.journal_sequence and exact_row['reconcile_id']==control['reconcile_id'] and bool(exact_row['ready'])
+        ready=ready and not closed and not (state and state['unresolved'])
+        now=self._clock_us()
+        ready=ready and all(t is not None and 0<=now-t<=age for t,age in (
+            (mark['marked_at_us'] if mark else None,2000000),
+            (runtime['private_heartbeat_us'],5000000),
+            (reconcile['finished_at_us'] if reconcile else None,15000000)))
+        ready=ready and {b.asset:b.quantity for b in balances if b.asset!='USD' and b.quantity}=={h.base_asset:h.quantity for h in holdings}
+        if state:ready=ready and state['day_start_us']==now//86400000000*86400000000
         baseline = tuple(decimal_value(mark[k]) for k in ('units','nav','high_water_nav','day_open_nav')) if mark else (Decimal(0),)*4
         ready = ready and min(baseline)>0 and baseline[2]>=baseline[1]
-        return AccountView(account_id=account_id,mode=Mode(account['mode']),revision=self._revision(account_id),
-            liquidation_equity_usd_u=mark['equity_usd_u'] if mark else 0,
+        if closed:exact=None
+        return AccountView(account_id=account_id,mode=Mode(account['mode']),revision=revision,
+            liquidation_equity_usd_u=0 if closed else mark['equity_usd_u'] if mark else 0,
             units=baseline[0],nav=baseline[1],high_water_nav=baseline[2],day_open_nav=baseline[3],
-            balances=balances,reservations=reservations,
+            balances=balances,holdings=holdings,reservations=reservations,exact_nav=exact,
             open_intent_ids=tuple(r['intent_id'] for r in intents if IntentState(r['state']) not in _TERMINAL),
             unknown_intent_ids=tuple(r['intent_id'] for r in intents if r['state']=='unknown'),
             reconcile_id=reconcile['reconcile_id'] if reconcile else None,
@@ -493,7 +542,8 @@ class Ledger:
                     raise ContractViolation('position/gross capacity exceeded')
                 if proposal.loss_budget_usd_u<=0 or proposal.loss_budget_usd_u>equity*limits.max_entry_loss_fraction or proposal.loss_budget_usd_u+sum(r.loss_budget_usd_u for r in pending)>equity*limits.max_pending_loss_fraction:
                     raise ContractViolation('modeled loss capacity exceeded')
-                if account.nav<=account.high_water_nav*Decimal('.85') or account.nav<=account.day_open_nav*Decimal('.98'):
+                from .risk import loss_triggers
+                if any(loss_triggers(*(v.fraction() for v in (account.exact_nav.nav,account.exact_nav.high_water_nav,account.exact_nav.day_open_nav)))):
                     raise ContractViolation('NAV loss limit')
                 if notional>market.available_buy_notional_usd_u:
                     raise ContractViolation('insufficient bounded depth')
@@ -742,6 +792,8 @@ class Ledger:
                 raise ContractViolation('cutoff has no proven committed account prefix')
             watermarks=strict_json(historical['evidence_watermarks_json'])
             expected_tables=set(_EXPORT_TIMES)-{'account_revision_history'}
+            if type(watermarks) is dict and set(watermarks)==expected_tables-_ACCOUNTING_EXPORT_TABLES:
+                watermarks={**watermarks,**{table:0 for table in _ACCOUNTING_EXPORT_TABLES}}
             if type(watermarks) is not dict or set(watermarks)!=expected_tables or any(type(value) is not int or value<0 for value in watermarks.values()):
                 raise ContractViolation('invalid committed evidence watermark map')
             revision=AccountRevision(historical['journal_sequence'],historical['version'])
@@ -828,3 +880,533 @@ class Ledger:
             archive = SessionArchive(session_id,cutoff,revision,export_hash,event_manifest,forecast_manifest,outcome_manifest,artifact_manifest,manifest_hash)
             c.execute("INSERT INTO review_sessions VALUES (?,?,?,?,?,'completed',?,?,?)",(session_id,account_id,cutoff.cutoff_us,cutoff.reconcile_id,manifest_hash,archive.to_json(),canonical_bytes(export).decode(),self._clock_us()))
             return archive
+
+    # Accounting imports are deliberately paper-only. Task 13 must add an
+    # authenticated acquisition adapter; raw JSON/Boolean/hash is not venue proof.
+    def import_local_evidence(self, account_id: str, evidence_id: str, kind: str,
+            payload: dict, *, event_at_us: int, received_at_us: int, known_at_us: int) -> str:
+        _identifier(evidence_id)
+        if kind not in {'initial','mark','fill','flow','correction','fx'} or type(payload) is not dict:
+            raise ContractViolation('invalid accounting evidence kind/payload')
+        if any(type(t) is not int or t<0 for t in (event_at_us,received_at_us,known_at_us)) or not event_at_us<=received_at_us<=known_at_us<=self._clock_us():
+            raise ContractViolation('noncausal accounting evidence')
+        raw=canonical_bytes(payload).decode()
+        strict_json(raw)  # bound retained input before database mutation
+        with self.transaction() as c:
+            if self._require_account(account_id)['mode']!='paper':
+                raise ContractViolation('local fixture is not authenticated venue evidence')
+            identity=(account_id,kind,'local-paper',raw,content_hash(payload),event_at_us,received_at_us,known_at_us)
+            previous=c.execute('SELECT * FROM accounting_evidence WHERE evidence_id=?',(evidence_id,)).fetchone()
+            if previous:
+                if tuple(previous[k] for k in ('account_id','kind','provenance','payload_json','payload_hash','event_at_us','received_at_us','known_at_us'))!=identity:
+                    raise ContractViolation('evidence identity/content conflict')
+            else:
+                c.execute('INSERT INTO accounting_evidence VALUES (?,?,?,?,?,?,?,?,?,?)',(evidence_id,*identity,self._clock_us()))
+            return evidence_id
+
+    def _evidence(self, evidence_id: str, kind: str) -> tuple[sqlite3.Row,dict]:
+        row=self.connection.execute('SELECT * FROM accounting_evidence WHERE evidence_id=?',(_identifier(evidence_id),)).fetchone()
+        if row is None or row['kind']!=kind or row['known_at_us']>self._clock_us():
+            raise ContractViolation('missing/wrong/future economic evidence')
+        if self._require_account(row['account_id'])['mode']!='paper' or row['provenance']!='local-paper':
+            raise ContractViolation('authenticated venue adapter not installed')
+        payload=strict_json(row['payload_json'])
+        if content_hash(payload)!=row['payload_hash']:raise ContractViolation('economic evidence hash mismatch')
+        return row,payload
+
+    def _finding(self, row: sqlite3.Row, reason: str) -> None:
+        c=self.connection
+        key='finding-'+content_hash((row['evidence_id'],reason))
+        c.execute('INSERT OR IGNORE INTO accounting_findings VALUES (?,?,?,?,?)',(key,row['account_id'],row['evidence_id'],reason,self._clock_us()))
+        c.execute('UPDATE accounting_state SET unresolved=1 WHERE account_id=?',(row['account_id'],))
+        self.invalidate_account(row['account_id'])
+        # Review incidents never silently disappear after a favorable correction.
+        epoch=c.execute('SELECT permit_epoch FROM account_control WHERE account_id=?',(row['account_id'],)).fetchone()[0]
+        c.execute("INSERT OR IGNORE INTO control_events VALUES (?,?,?,?,'review','accounting',?,?)",(key,row['account_id'],key,epoch,reason,self._clock_us()))
+        c.execute("UPDATE account_control SET permit='none',version=version+1,halt_reason=?,updated_at_us=? WHERE account_id=?",(reason,self._clock_us(),row['account_id']))
+
+    def _state(self, account_id: str) -> sqlite3.Row:
+        row=self.connection.execute('SELECT * FROM accounting_state WHERE account_id=?',(account_id,)).fetchone()
+        if row is None:raise ContractViolation('account economics not initialized')
+        return row
+
+    @staticmethod
+    def _quantity(raw: str, *, positive=False) -> Fraction:
+        value=Fraction(decimal_value(raw))
+        if value<0 or (positive and value==0):raise ContractViolation('invalid native magnitude')
+        return value
+
+    def _fx(self, account_id: str, evidence_id: str, asset: str, quantity: Fraction, at_us: int) -> Fraction:
+        row,p=self._evidence(evidence_id,'fx')
+        if row['account_id']!=account_id or not 0<=at_us-row['event_at_us']<=2_000_000:
+            raise ContractViolation('stale/wrong-account FX evidence')
+        current=asset
+        value=quantity
+        legs=p.get('legs')
+        if type(legs) is not list or not 1<=len(legs)<=4:raise ContractViolation('missing FX conversion legs')
+        for leg in legs:
+            if leg['from_asset']!=current:raise ContractViolation('disconnected FX direction')
+            value*=self._quantity(leg['to_units_per_from_unit'],positive=True)
+            current=leg['to_asset']
+        if current!='USD':raise ContractViolation('FX does not resolve USD')
+        return value*1000000
+
+    def _replay_economics(self, account_id: str, extra: tuple[str,dict,sqlite3.Row] | None = None):
+        """Replay all acquisitions and disposals, including corrected old basis.
+
+        Integer basis is allocated down on partial disposals; the final disposal
+        takes the entire residual. Every discarded fraction is retained, bounded
+        to <1 microdollar per allocation. No unexplained balance is rounded away.
+        """
+        rows=[]
+        for op in self.connection.execute('SELECT * FROM accounting_operations WHERE account_id=? ORDER BY rowid',(account_id,)):
+            e,p=self._evidence(op['evidence_id'],op['kind'])
+            rows.append((op['kind'],p,e))
+        if extra:rows.append(extra)
+        replacements={}
+        for kind,p,e in rows:
+            if kind=='correction':replacements[p['fill_id']]=p['replacement']
+        balances={}; totals={}; native={}; residuals=[]; filled={}; pending_fees=False
+        def add(name,amount,asset=None,quantity=Fraction(0)):
+            totals[name]=checked_money(totals.get(name,0)+amount)
+            if asset is not None:native[name,asset]=native.get((name,asset),Fraction(0))+quantity
+        def movement(asset,quantity,basis):
+            owned,cost=balances.get(asset,(Fraction(0),0))
+            owned+=quantity;cost=checked_money(cost+basis)
+            if owned<0 or cost<0 or (owned==0 and cost):raise ContractViolation('unknown basis or insufficient owned asset')
+            # Native projections must remain exactly representable within contract bounds.
+            projected=_project(owned)
+            if Fraction(projected)!=owned:raise ContractViolation('native precision exceeded')
+            balances[asset]=(owned,cost)
+        def disposal(asset,quantity):
+            owned,cost=balances.get(asset,(Fraction(0),0))
+            if quantity>owned or owned<=0:raise ContractViolation('insufficient asset for disposal/fee')
+            exact=Fraction(cost)*quantity/owned
+            basis=cost if quantity==owned else _money(exact)
+            residuals.append(exact-basis)
+            movement(asset,-quantity,-basis)
+            return basis
+        for kind,p,e in rows:
+            if kind=='correction':continue
+            if kind=='initial':
+                seen=set()
+                for b in p['balances']:
+                    asset=_identifier(b['asset']);qty=self._quantity(b['quantity']);basis=checked_money(b['basis_usd_u'])
+                    if asset in seen or basis<0 or (asset=='USD' and qty*1000000!=basis):raise ContractViolation('invalid opening basis')
+                    seen.add(asset);movement(asset,qty,basis)
+                    add('cash' if asset=='USD' else 'inventory:'+asset,basis,asset,qty)
+                    add('capital',-basis,asset,-qty)
+            elif kind=='flow':
+                asset=_identifier(p['asset'])
+                value=checked_money(p['usd_value_u']);fee=checked_money(p['fee_usd_u'])
+                quantity=Fraction(decimal_value(p['quantity']))
+                exact_value=quantity*1000000 if asset=='USD' else self._fx(account_id,p.get('fx_id','missing-fx'),asset,quantity,e['event_at_us'])
+                if (asset=='USD' and exact_value.denominator!=1) or _money(exact_value)!=value or fee<0 or not quantity or (quantity>0)!=(value>0):
+                    raise ContractViolation('flow quantity/value or fee mismatch')
+                residuals.append(exact_value-value)
+                if quantity>0:
+                    basis=value;movement(asset,quantity,basis)
+                else:
+                    basis=-disposal(asset,-quantity)
+                    add('realized_profit',basis-value)
+                add('cash' if asset=='USD' else 'inventory:'+asset,basis,asset,quantity)
+                add('capital',-value,asset,-quantity)
+                if fee:movement('USD',-Fraction(fee,1000000),-fee)
+                add('cash',-fee,'USD',-Fraction(fee,1000000))
+                add('fee_expense',fee,'USD',Fraction(fee,1000000))
+            elif kind=='fill':
+                p=replacements.get(p['fill_id'],p)
+                intent=self.connection.execute('SELECT * FROM order_intents WHERE intent_id=? AND account_id=?',(p['intent_id'],account_id)).fetchone()
+                if intent is None or p['instrument']!=intent['instrument'] or p['side']!=intent['side'] or p['venue']!=self._require_account(account_id)['venue']:
+                    raise ContractViolation('fill identity does not match account/intent')
+                if not p['instrument'].endswith('-USD'):raise ContractViolation('USD execution quote required')
+                asset=p['instrument'][:-4];base=self._quantity(p['base_quantity'],positive=True)
+                quote=self._quantity(p['quote_quantity'],positive=True)*1000000
+                if quote.denominator!=1:raise ContractViolation('settled quote exceeds microdollar precision')
+                notional=checked_money(quote.numerator);price=self._quantity(p['price'],positive=True)
+                fee=self._quantity(p['fee_quantity']);fee_asset=_identifier(p['fee_asset'])
+                if type(p['fee_final']) is not bool:raise ContractViolation('explicit final-fee evidence required')
+                pending_fees|=not p['fee_final']
+                semantics=p['base_semantics']
+                if semantics=='buy_net' and p['side']=='buy' and fee_asset==asset:base+=fee
+                elif semantics!='gross':raise ContractViolation('unknown fill/native fee semantics')
+                if abs(base*price*1000000-quote)>1:raise ContractViolation('settled quote inconsistency exceeds one microdollar')
+                residuals.append(base*price*1000000-quote)
+                if p['side']=='buy':
+                    movement(asset,base,notional);movement('USD',-quote/1000000,-notional)
+                    add('inventory:'+asset,notional,asset,base);add('cash',-notional,'USD',-quote/1000000)
+                    add('settlement',0,asset,-base);add('settlement',0,'USD',quote/1000000)
+                else:
+                    basis=disposal(asset,base);movement('USD',quote/1000000,notional)
+                    add('inventory:'+asset,-basis,asset,-base);add('cash',notional,'USD',quote/1000000)
+                    add('realized_profit',-(notional-basis));add('settlement',0,asset,base);add('settlement',0,'USD',-quote/1000000)
+                filled[p['intent_id']]=filled.get(p['intent_id'],Fraction(0))+base
+                if fee:
+                    if fee_asset=='USD':
+                        exact_fee=fee*1000000
+                        if exact_fee.denominator!=1:raise ContractViolation('USD fee precision exceeded')
+                        value=checked_money(exact_fee.numerator);movement('USD',-fee,-value)
+                        add('cash',-value,'USD',-fee);add('fee_expense',value,'USD',fee)
+                    else:
+                        basis=disposal(fee_asset,fee)
+                        try:
+                            exact_fee=fee*price*1000000 if fee_asset==asset else self._fx(account_id,p.get('fee_fx_id','missing-fx'),fee_asset,fee,e['event_at_us'])
+                        except ContractViolation:
+                            # Confirm native delivery and principal. Unvalued fees
+                            # remain in suspense, never a fabricated zero expense.
+                            pending_fees=True
+                            add('inventory:'+fee_asset,-basis,fee_asset,-fee)
+                            add('unvalued_fee',basis,fee_asset,fee)
+                            continue
+                        value=_money(exact_fee,ceiling=True)
+                        residuals.append(Fraction(value)-exact_fee)
+                        add('inventory:'+fee_asset,-basis,fee_asset,-fee);add('fee_expense',value,fee_asset,fee)
+                        add('realized_profit',-(value-basis))
+        if sum(totals.values())!=0:raise ContractViolation('economic replay is unbalanced')
+        for asset in {a for _,a in native}:
+            if sum(v for (_,a),v in native.items() if a==asset):raise ContractViolation('native asset conservation failure')
+        return balances,totals,native,residuals,filled,pending_fees
+
+    def _apply_economics(self, e: sqlite3.Row, p: dict, kind: str) -> str:
+        account_id=e['account_id'];c=self.connection
+        balances,totals,native,residuals,filled,pending_fees=self._replay_economics(account_id,(kind,p,e))
+        tx='economic-'+content_hash(e['evidence_id']);now=self._clock_us()
+        sequence=c.execute('SELECT coalesce(max(sequence),0)+1 FROM journal_transactions').fetchone()[0]
+        source_kind={'initial':'journal','fill':'fill','flow':'transfer','correction':'correction'}[kind]
+        source_id=p['fill_id'] if kind=='fill' else e['evidence_id']
+        c.execute('INSERT INTO journal_transactions VALUES (?,?,?,?,?,?,?)',(tx,sequence,account_id,source_kind,source_id,e['event_at_us'],now))
+        prior_totals={r[0]:r[1] for r in c.execute('SELECT ledger_account,sum(usd_delta_u) FROM journal_postings JOIN journal_transactions USING(transaction_id) WHERE account_id=? GROUP BY ledger_account',(account_id,))}
+        prior_native={}
+        for r in c.execute('SELECT ledger_account,asset,native_delta FROM journal_postings JOIN journal_transactions USING(transaction_id) WHERE account_id=? AND asset IS NOT NULL',(account_id,)):
+            prior_native[r[0],r[1]]=prior_native.get((r[0],r[1]),Fraction(0))+Fraction(decimal_value(r[2]))
+        lines=[]
+        for name in sorted(totals.keys()|prior_totals.keys()):
+            delta=checked_money(totals.get(name,0)-prior_totals.get(name,0))
+            if delta:lines.append((name,None,None,delta))
+        for name,asset in sorted(native.keys()|prior_native.keys()):
+            delta=native.get((name,asset),Fraction(0))-prior_native.get((name,asset),Fraction(0))
+            if delta:lines.append((name,asset,decimal_text(_project(delta)),0))
+        lines.extend([('rounding',None,None,0),('settlement',None,None,0)])
+        validate_postings(tuple((name,amount) for name,_,_,amount in lines))
+        for i,(name,asset,qty,amount) in enumerate(lines):c.execute('INSERT INTO journal_postings VALUES (?,?,?,?,?,?,?)',(tx,i,name,asset,qty,amount,now))
+        for i,residual in enumerate(residuals):
+            if abs(residual)>1:raise ContractViolation('unbounded monetary rounding')
+            c.execute('INSERT INTO accounting_rounding VALUES (?,?,?,?,?)',(tx+'-'+str(i),tx,ExactRatio.of(residual).to_json(),'partial basis floor/final residual; fee ceiling; settled quote <=1 microdollar',now))
+        for asset,(qty,basis) in balances.items():
+            c.execute('INSERT INTO balance_positions VALUES (?,?,?,?,?,1) ON CONFLICT(account_id,asset) DO UPDATE SET native_qty=excluded.native_qty,cost_basis_usd_u=excluded.cost_basis_usd_u,journal_sequence=excluded.journal_sequence,version=balance_positions.version+1',(account_id,asset,decimal_text(_project(qty)),basis,sequence))
+        c.execute('INSERT INTO accounting_operations VALUES (?,?,?,?,?,?)',(e['evidence_id'],account_id,e['evidence_id'],kind,tx,now))
+        self.invalidate_account(account_id)
+        for intent_id,total in filled.items():
+            intent=c.execute('SELECT * FROM order_intents WHERE intent_id=?',(intent_id,)).fetchone()
+            proposal=OrderProposal.from_json(intent['proposal_json'])
+            original=Fraction(decimal_value(intent['qty']));remaining=max(Fraction(0),original-total)
+            # Retain all final-fee capacity and modeled-loss capacity until Task13
+            # proves terminal cumulative settlement. Principal alone is consumed.
+            gross=_money(remaining*Fraction(decimal_value(intent['limit_price']))*1000000,ceiling=True)
+            cash=gross+intent['max_fee_usd_u'] if intent['side']=='buy' else 0
+            c.execute('UPDATE reservations SET cash_usd_u=?,base_qty=?,gross_usd_u=?,remaining_qty=?,version=version+1,updated_at_us=? WHERE intent_id=?',(checked_money(cash),decimal_text(_project(remaining)),gross,decimal_text(_project(remaining)),now,intent_id))
+            if total>original or intent['state'] in ('filled','canceled','rejected'):
+                self._finding(e,'late fill or cumulative order disagreement')
+        if pending_fees:self._finding(e,'final fees incomplete')
+        return tx
+
+    def initialize_account(self, evidence_id: str) -> bool:
+        with self.transaction() as c:
+            e,p=self._evidence(evidence_id,'initial');account_id=e['account_id']
+            if c.execute('SELECT 1 FROM accounting_operations WHERE evidence_id=?',(evidence_id,)).fetchone():return False
+            if c.execute('SELECT 1 FROM accounting_state WHERE account_id=?',(account_id,)).fetchone() or self._revision(account_id).journal_sequence:
+                raise ContractViolation('initialization cannot reset existing economics')
+            units=self._quantity(p['units'],positive=True)
+            zero=ExactRatio.of(Fraction(0)).to_json()
+            c.execute('INSERT INTO accounting_state(account_id,units_json,high_water_json,day_open_json,closed,unresolved) VALUES (?,?,?,?,0,0)',(account_id,ExactRatio.of(units).to_json(),zero,zero))
+            self._apply_economics(e,p,'initial')
+            return True
+
+    def record_fill(self, evidence_id: str) -> bool:
+        with self.transaction() as c:
+            e,p=self._evidence(evidence_id,'fill');self._state(e['account_id'])
+            previous=c.execute('SELECT * FROM fills WHERE fill_id=? OR (account_id=? AND venue=? AND venue_trade_id=?)',(p['fill_id'],e['account_id'],p['venue'],p['trade_id'])).fetchone()
+            if previous:
+                if previous['payload_hash']==e['payload_hash']:return False
+                self._finding(e,'changed fill identity requires verified correction')
+                return False
+            try:
+                self._replay_economics(e['account_id'],('fill',p,e))
+            except (ContractViolation,KeyError,TypeError) as exc:
+                self._finding(e,'unaccounted fill: '+str(exc))
+                return False
+            c.execute('INSERT INTO fills VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',(p['fill_id'],e['account_id'],p['intent_id'],p['venue'],p['trade_id'],p['order_id'],p['instrument'],p['side'],p['base_quantity'],p['quote_quantity'],p['price'],p['fee_asset'],p['fee_quantity'],e['event_at_us'],e['received_at_us'],e['payload_hash'],self._clock_us()))
+            self._apply_economics(e,p,'fill')
+            self._mark_after_economics(e)
+            return True
+
+    def correct_fill(self, evidence_id: str) -> bool:
+        with self.transaction() as c:
+            e,p=self._evidence(evidence_id,'correction')
+            previous=c.execute('SELECT * FROM fill_corrections WHERE correction_id=?',(evidence_id,)).fetchone()
+            if previous:return False  # imported evidence ID already binds complete content
+            original=c.execute('SELECT * FROM fills WHERE fill_id=? AND account_id=?',(p['fill_id'],e['account_id'])).fetchone()
+            if original is None:raise ContractViolation('missing original fill')
+            last=c.execute('SELECT corrected_payload_hash FROM fill_corrections WHERE fill_id=? ORDER BY rowid DESC LIMIT 1',(p['fill_id'],)).fetchone()
+            if p['previous_payload_hash']!=(last[0] if last else original['payload_hash']):raise ContractViolation('stale correction predecessor')
+            replacement=p['replacement']
+            if any(replacement[k]!=original[column] for k,column in (('fill_id','fill_id'),('intent_id','intent_id'),('venue','venue'),('trade_id','venue_trade_id'),('order_id','venue_order_id'),('instrument','instrument'),('side','side'))):
+                raise ContractViolation('correction changes immutable trade identity')
+            c.execute('INSERT INTO fill_corrections VALUES (?,?,?,?,?,NULL,?,?,?)',(evidence_id,p['fill_id'],p['previous_payload_hash'],canonical_bytes(replacement).decode(),content_hash(replacement),e['received_at_us'],'verified local paper correction',self._clock_us()))
+            self._apply_economics(e,p,'correction')
+            self._finding(e,'fill correction requires fresh economic review')
+            self._mark_after_economics(e)
+            return True
+
+    def _latch_losses(self, account_id: str, mark_id: str, nav: Fraction, high: Fraction, day: Fraction, *, rollover=False) -> None:
+        from .risk import loss_triggers
+        if min(high,day)<=0:return
+        drawdown,daily=loss_triggers(nav,high,day) if nav>0 else (True,True)
+        c=self.connection;now=self._clock_us()
+        old=c.execute('SELECT * FROM account_control WHERE account_id=?',(account_id,)).fetchone()
+        daily_next=int(daily or (old['daily_halted'] and not rollover))
+        drawdown_next=int(drawdown or old['drawdown_latched'])
+        if (drawdown_next,daily_next)==(old['drawdown_latched'],old['daily_halted']):return
+        key='loss-'+content_hash(mark_id)
+        c.execute("UPDATE account_control SET drawdown_latched=?,daily_halted=?,version=version+1,updated_at_us=? WHERE account_id=?",(drawdown_next,daily_next,now,account_id))
+        c.execute("INSERT INTO control_events VALUES (?,?,?,?,'risk_halt','accounting',?,?)",(key,account_id,key,old['permit_epoch'],'exact NAV loss boundary/UTC rollover',now))
+
+    def _write_mark(self, e: sqlite3.Row, mark_id: str, equity: int, units: Fraction,
+            high: Fraction, day: Fraction, holdings: tuple[Holding,...], reconcile_id: str | None,
+            ready: bool, *, rollover=False) -> str:
+        c=self.connection;account_id=e['account_id'];now=self._clock_us()
+        nav=Fraction(equity,1000000)/units if units>0 else Fraction(0)
+        high=max(high,nav)
+        valuation=c.execute('SELECT valuation_version FROM account_readiness WHERE account_id=?',(account_id,)).fetchone()[0]+1
+        dd=max(Fraction(0),1-nav/high) if high>0 else Fraction(0)
+        dl=max(Fraction(0),1-nav/day) if day>0 else Fraction(0)
+        values=[decimal_text(_project(v)) for v in (units,max(nav,Fraction(0)),max(high,Fraction(0)),max(day,Fraction(0)),dd,dl)]
+        c.execute('INSERT INTO equity_marks VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)',(mark_id,account_id,e['payload_hash'],checked_money(equity),*values,valuation,e['event_at_us'],now))
+        c.execute('UPDATE accounting_state SET units_json=?,high_water_json=?,day_open_json=?,last_mark_id=? WHERE account_id=?',(ExactRatio.of(units).to_json(),ExactRatio.of(high).to_json(),ExactRatio.of(day).to_json(),mark_id,account_id))
+        c.execute('UPDATE account_readiness SET ready=?,valuation_version=?,version=version+1 WHERE account_id=?',(int(ready),valuation,account_id))
+        self._latch_losses(account_id,mark_id,nav,high,day,rollover=rollover)
+        if min(units,nav,high,day)>0:
+            exact=ExactNavEvidence(account_id,mark_id,self._revision(account_id),valuation,equity,
+                *(ExactRatio.of(v) for v in (units,nav,high,day)),e['payload_hash'])
+            c.execute('INSERT INTO exact_marks VALUES (?,?,?,?,?,?,?,?,?)',(mark_id,account_id,e['evidence_id'],exact.to_json(),canonical_bytes(holdings).decode(),exact.revision.journal_sequence,reconcile_id,int(ready),now))
+        else:
+            c.execute('UPDATE account_readiness SET ready=0 WHERE account_id=?',(account_id,))
+        return mark_id
+
+    def record_mark(self, evidence_id: str, *, _derived: bool = False) -> str:
+        with self.transaction() as c:
+            e,p=self._evidence(evidence_id,'mark');account_id=e['account_id'];state=self._state(account_id)
+            mark_id='mark-'+content_hash(evidence_id)
+            if c.execute('SELECT 1 FROM equity_marks WHERE mark_id=?',(mark_id,)).fetchone():return mark_id
+            now=self._clock_us();reasons=[];holdings=[]
+            balances=list(c.execute('SELECT * FROM balance_positions WHERE account_id=? ORDER BY asset',(account_id,)))
+            actual={r['asset']:r['native_qty'] for r in balances}
+            if p['balances']!=actual:reasons.append('all-holdings reconciliation differs')
+            actual_orders=[r[0] for r in c.execute("SELECT intent_id FROM order_intents WHERE account_id=? AND state NOT IN ('filled','canceled','rejected') ORDER BY intent_id",(account_id,))]
+            if p['open_intent_ids']!=actual_orders:reasons.append('open-order reconciliation differs')
+            heartbeat=p['heartbeat_at_us']
+            if type(heartbeat) is not int or not 0<=e['event_at_us']-heartbeat<=5_000_000 or heartbeat>e['known_at_us']:reasons.append('missing/stale/future private observation')
+            current_fresh=type(heartbeat) is int and 0<=now-heartbeat<=5_000_000 and 0<=now-e['event_at_us']<=2_000_000
+            # A retained midnight observation may restore that baseline after an
+            # outage only if economics have not changed since the observation.
+            if c.execute('SELECT 1 FROM journal_transactions WHERE account_id=? AND (event_at_us>? OR recorded_at_us>?) LIMIT 1',(account_id,e['event_at_us'],e['event_at_us'])).fetchone():
+                reasons.append('historical valuation does not cover current economics')
+            liabilities=checked_money(p['liabilities_usd_u']);exit_cost=checked_money(p['exit_cost_usd_u'])
+            if min(liabilities,exit_cost)<0:raise ContractViolation('negative liabilities/exit costs')
+            equity=-liabilities-exit_cost
+            books=p['books']
+            if type(books) is not dict:raise ContractViolation('invalid depth evidence')
+            for balance in balances:
+                asset=balance['asset'];quantity=Fraction(decimal_value(balance['native_qty']))
+                if asset=='USD':
+                    equity+=_money(quantity*1000000);continue
+                if quantity==0:continue
+                book=books.get(asset)
+                if not book or type(book.get('at_us')) is not int or not 0<=e['event_at_us']-book['at_us']<=2_000_000 or book['at_us']>e['known_at_us']:
+                    reasons.append('missing/stale executable depth for '+asset);continue
+                remaining=quantity;value=Fraction(0);prior=None
+                bids=book.get('bids')
+                if type(bids) is not list or len(bids)>10000:raise ContractViolation('bounded executable bids required')
+                for level in bids:
+                    if type(level) is not list or len(level)!=2:raise ContractViolation('invalid executable bid')
+                    price=self._quantity(level[0]);size=self._quantity(level[1])
+                    if prior is not None and price>prior:raise ContractViolation('unsorted liquidation bids')
+                    prior=price;take=min(remaining,size);value+=take*price;remaining-=take
+                    if remaining==0:break
+                if remaining:reasons.append('insufficient executable depth for '+asset);continue
+                quote=book.get('quote_asset','USD')
+                try:
+                    usd=value*1000000 if quote=='USD' else self._fx(account_id,book.get('fx_id','missing-fx'),quote,value,e['event_at_us'])
+                except ContractViolation:
+                    reasons.append('missing/stale verified liquidation FX for '+asset)
+                    continue
+                marked=_money(usd)
+                equity=checked_money(equity+marked)
+                holdings.append(Holding(asset+'-'+quote,asset,decimal_value(balance['native_qty']),balance['cost_basis_usd_u'],marked,book['at_us'],e['payload_hash']))
+            units=_ratio(state['units_json']);high=_ratio(state['high_water_json']);day=_ratio(state['day_open_json'])
+            if state['closed']:reasons.append('account closed')
+            if units<=0:reasons.append('nonpositive account units')
+            day_start=e['event_at_us']//86400000000*86400000000
+            rollover=False;boundary_missing=False
+            if state['day_start_us']!=day_start:
+                if e['event_at_us']!=day_start or reasons or _derived or equity<=0:
+                    boundary_missing=True
+                else:
+                    day=Fraction(equity,1000000)/units
+                    c.execute('UPDATE accounting_state SET day_start_us=?,rollover_pending=1 WHERE account_id=?',(day_start,account_id))
+                    rollover=True
+            if reasons:
+                for reason in reasons:
+                    c.execute('INSERT OR IGNORE INTO accounting_findings VALUES (?,?,?,?,?)',('mark-finding-'+content_hash((evidence_id,reason)),account_id,evidence_id,reason,now))
+                self.invalidate_account(account_id)
+                # Incomplete liquidation must not invent zero values or authoritative
+                # loss marks. Preserve prior immutable mark and expose unready state.
+                return mark_id
+            ready=not _derived and current_fresh and not boundary_missing and not state['unresolved'] and equity>0
+            if boundary_missing:
+                c.execute('INSERT OR IGNORE INTO accounting_findings VALUES (?,?,?,?,?)',('boundary-'+content_hash(evidence_id),account_id,evidence_id,'missing genuine UTC boundary valuation',now))
+            reconcile=None
+            if ready:
+                reconcile='reconcile-'+content_hash(evidence_id)
+                c.execute("INSERT INTO reconciliations VALUES (?,?,?,?,NULL,'completed',?,?, '[]',?)",(reconcile,account_id,e['event_at_us'],e['received_at_us'],canonical_bytes(p['balances']).decode(),canonical_bytes(p['open_intent_ids']).decode(),now))
+                c.execute('UPDATE account_control SET reconcile_id=?,version=version+1,updated_at_us=? WHERE account_id=?',(reconcile,now,account_id))
+                c.execute('UPDATE account_readiness SET private_heartbeat_us=? WHERE account_id=?',(heartbeat,account_id))
+            reset_daily=ready and (rollover or bool(state['rollover_pending']))
+            result=self._write_mark(e,mark_id,equity,units,high,day,tuple(holdings),reconcile,ready,rollover=reset_daily)
+            if ready:c.execute('UPDATE accounting_state SET rollover_pending=0 WHERE account_id=?',(account_id,))
+            return result
+
+    def _mark_after_economics(self, event: sqlite3.Row) -> None:
+        """Reuse still-current executable depth, never prior reconciliation proof.
+
+        A derived mark can latch loss and can never make an account ready. Its
+        payload binds both the original observation and the new economic event.
+        """
+        state=self._state(event['account_id'])
+        last=self.connection.execute('SELECT * FROM exact_marks WHERE mark_id=?',(state['last_mark_id'],)).fetchone()
+        if last is None:return
+        # Flow marks have no depth of their own. Preserve the most recent retained
+        # depth observation across flows; its original timestamps still expire.
+        source=self.connection.execute("SELECT e.* FROM exact_marks m JOIN accounting_evidence e USING(evidence_id) WHERE m.account_id=? AND e.kind='mark' ORDER BY m.rowid DESC LIMIT 1",(event['account_id'],)).fetchone()
+        if source is None:return
+        p=strict_json(source['payload_json'])
+        p['derived_from']=source['evidence_id'];p['economic_event']=event['evidence_id']
+        p['balances']={r['asset']:r['native_qty'] for r in self.connection.execute('SELECT * FROM balance_positions WHERE account_id=?',(event['account_id'],))}
+        p['open_intent_ids']=[r[0] for r in self.connection.execute("SELECT intent_id FROM order_intents WHERE account_id=? AND state NOT IN ('filled','canceled','rejected') ORDER BY intent_id",(event['account_id'],))]
+        key='derived-'+content_hash(event['evidence_id'])
+        now=self._clock_us()
+        self.import_local_evidence(event['account_id'],key,'mark',p,event_at_us=now,received_at_us=now,known_at_us=now)
+        self.record_mark(key,_derived=True)
+
+    def record_flow(self, evidence_id: str) -> bool:
+        with self.transaction() as c:
+            e,p=self._evidence(evidence_id,'flow');account_id=e['account_id'];state=self._state(account_id)
+            previous=c.execute('SELECT * FROM external_flows WHERE account_id=? AND venue_transfer_key=?',(account_id,p['transfer_key'])).fetchone()
+            if previous:
+                operation=c.execute('SELECT evidence_id FROM accounting_operations WHERE transaction_id=?',(previous['transaction_id'],)).fetchone()
+                original=c.execute('SELECT payload_hash FROM accounting_evidence WHERE evidence_id=?',(operation[0],)).fetchone()[0]
+                if original!=e['payload_hash']:self._finding(e,'changed transfer identity')
+                return False
+            mark=c.execute('SELECT * FROM equity_marks WHERE mark_id=? AND account_id=?',(p['preflow_mark_id'],account_id)).fetchone()
+            exact=c.execute('SELECT * FROM exact_marks WHERE mark_id=?',(p['preflow_mark_id'],)).fetchone()
+            value=checked_money(p['usd_value_u']);fee=checked_money(p['fee_usd_u'])
+            if mark is None or exact is None or state['last_mark_id']!=mark['mark_id'] or not 0<=self._clock_us()-mark['marked_at_us']<=2_000_000 or (not state['closed'] and exact['journal_sequence']!=self._revision(account_id).journal_sequence):
+                self._finding(e,'transfer lacks current complete preflow valuation');return False
+            authority=ExactNavEvidence.from_json(exact['exact_json']);old_units=authority.units.fraction()
+            if state['closed']:
+                if value<=0:self._finding(e,'closed account requires positive redeposit');return False
+                units=Fraction(value,1000000)/authority.nav.fraction();equity=value-fee;delta=units
+            else:
+                before=mark['equity_usd_u'];equity=checked_money(before+value-fee)
+                if before+value<0 or equity<0:self._finding(e,'transfer exceeds liquidation equity');return False
+                delta=old_units*Fraction(value,before);units=old_units+delta
+            try:
+                unit_record=ExactRatio.of(units);delta_record=ExactRatio.of(delta)
+                _project(delta);_project(units)
+                if units>0:
+                    _project(Fraction(equity,1000000)/units)
+            except (ContractViolation,DecimalException):
+                self._finding(e,'exact rational/display resource exhaustion; factual transfer retained');return False
+            closed=units==0
+            if closed and (fee or equity or any(r['asset']!='USD' and decimal_value(r['native_qty']) for r in c.execute('SELECT * FROM balance_positions WHERE account_id=?',(account_id,)))):
+                self._finding(e,'closure must settle all assets and costs');return False
+            try:
+                self._replay_economics(account_id,('flow',p,e))
+            except (ContractViolation,KeyError,TypeError) as exc:
+                self._finding(e,'unaccounted transfer: '+str(exc));return False
+            tx=self._apply_economics(e,p,'flow')
+            c.execute('INSERT INTO external_flows VALUES (?,?,?,?,?,?,?,?,?,?,?)',(evidence_id,account_id,p['transfer_key'],p['asset'],p['quantity'],value,decimal_text(_project(delta)),mark['mark_id'],tx,e['event_at_us'],self._clock_us()))
+            c.execute('INSERT INTO exact_flows VALUES (?,?,?,?,?,?,?)',(evidence_id,account_id,mark['mark_id'],delta_record.to_json(),unit_record.to_json(),int(closed),self._clock_us()))
+            c.execute('UPDATE accounting_state SET closed=?,units_json=? WHERE account_id=?',(int(closed),unit_record.to_json(),account_id))
+            if not closed:
+                holdings=tuple(Holding.from_dict(h) for h in strict_json(exact['holdings_json']))
+                if p['asset']=='USD':
+                    self._write_mark(e,'flow-mark-'+content_hash(evidence_id),equity,units,authority.high_water_nav.fraction(),authority.day_open_nav.fraction(),holdings,None,False)
+                else:
+                    self._mark_after_economics(e)
+            return True
+
+    def _check_accounting_integrity(self) -> None:
+        c=self.connection
+        for row in c.execute('SELECT * FROM accounting_evidence'):
+            if content_hash(strict_json(row['payload_json']))!=row['payload_hash'] or not row['event_at_us']<=row['received_at_us']<=row['known_at_us']:
+                raise PersistenceUnavailable('accounting source integrity failure')
+        for row in c.execute('SELECT * FROM exact_marks'):
+            exact=ExactNavEvidence.from_json(row['exact_json'])
+            mark=c.execute('SELECT * FROM equity_marks WHERE mark_id=?',(row['mark_id'],)).fetchone()
+            if exact.account_id!=row['account_id'] or exact.mark_id!=row['mark_id'] or exact.equity_usd_u!=mark['equity_usd_u'] or exact.valuation_version!=mark['valuation_version'] or exact.lineage_hash!=mark['lineage_hash'] or exact.revision.journal_sequence!=row['journal_sequence']:
+                raise PersistenceUnavailable('exact mark lineage mismatch')
+            for key in ('units','nav','high_water_nav','day_open_nav'):
+                if _project(getattr(exact,key).fraction())!=decimal_value(mark[key]):raise PersistenceUnavailable('exact mark projection mismatch')
+            tuple(Holding.from_dict(h) for h in strict_json(row['holdings_json']))
+        closed_accounts={}
+        for row in c.execute('SELECT * FROM exact_flows ORDER BY rowid'):
+            delta=_ratio(row['units_delta_json']);after=_ratio(row['units_after_json'])
+            flow=c.execute('SELECT * FROM external_flows WHERE flow_id=?',(row['flow_id'],)).fetchone()
+            mark=c.execute('SELECT exact_json FROM exact_marks WHERE mark_id=?',(row['preflow_mark_id'],)).fetchone()
+            prior=ExactNavEvidence.from_json(mark[0])
+            expected_delta=prior.units.fraction()*Fraction(flow['usd_value_u'],prior.equity_usd_u)
+            expected_after=expected_delta if closed_accounts.get(row['account_id'],False) else prior.units.fraction()+expected_delta
+            if row['account_id']!=flow['account_id'] or row['account_id']!=prior.account_id or row['preflow_mark_id']!=flow['preflow_mark_id'] or delta!=expected_delta or after!=expected_after or _project(delta)!=decimal_value(flow['units_delta']) or after<0 or bool(after==0)!=bool(row['closed']):
+                raise PersistenceUnavailable('exact flow lineage mismatch')
+            closed_accounts[row['account_id']]=bool(row['closed'])
+        for row in c.execute('SELECT exact_residual_json FROM accounting_rounding'):
+            if abs(_ratio(row[0]))>1:raise PersistenceUnavailable('rounding residual out of bounds')
+        for state in c.execute('SELECT * FROM accounting_state'):
+            for key in ('units_json','high_water_json','day_open_json'):_ratio(state[key])
+            # Existing raw Task2 test fixtures have no accounting state. Accounts
+            # initialized through this seam must reconstruct exactly at startup.
+            account_id=state['account_id']
+            flow=c.execute('SELECT units_after_json,closed FROM exact_flows WHERE account_id=? ORDER BY rowid DESC LIMIT 1',(account_id,)).fetchone()
+            if flow:
+                expected_units=_ratio(flow['units_after_json'])
+                expected_closed=flow['closed']
+            else:
+                initial=c.execute("SELECT e.payload_json FROM accounting_operations o JOIN accounting_evidence e USING(evidence_id) WHERE o.account_id=? AND o.kind='initial'",(account_id,)).fetchone()
+                expected_units=Fraction(decimal_value(strict_json(initial[0])['units']))
+                expected_closed=0
+            if _ratio(state['units_json'])!=expected_units or state['closed']!=expected_closed:
+                raise PersistenceUnavailable('unit/closure projection mismatch')
+            last=c.execute('SELECT exact_json FROM exact_marks WHERE account_id=? ORDER BY rowid DESC LIMIT 1',(account_id,)).fetchone()
+            if last:
+                exact=ExactNavEvidence.from_json(last[0])
+                if _ratio(state['high_water_json'])!=exact.high_water_nav.fraction() or _ratio(state['day_open_json'])!=exact.day_open_nav.fraction():
+                    raise PersistenceUnavailable('loss baseline projection mismatch')
+            boundary=None
+            for mark in c.execute("SELECT m.exact_json,e.payload_json,e.event_at_us FROM exact_marks m JOIN accounting_evidence e USING(evidence_id) WHERE m.account_id=? AND e.kind='mark' ORDER BY m.rowid",(account_id,)):
+                payload=strict_json(mark['payload_json'])
+                exact=ExactNavEvidence.from_json(mark['exact_json'])
+                if mark['event_at_us']%86400000000==0 and 'derived_from' not in payload and exact.day_open_nav==exact.nav:
+                    boundary=mark['event_at_us']
+            if state['day_start_us']!=boundary:
+                raise PersistenceUnavailable('UTC boundary projection mismatch')
+            balances,totals,native,_,_,_=self._replay_economics(account_id)
+            actual={r['asset']:(Fraction(decimal_value(r['native_qty'])),r['cost_basis_usd_u']) for r in c.execute('SELECT * FROM balance_positions WHERE account_id=?',(account_id,))}
+            if actual!=balances:raise PersistenceUnavailable('economic balance projection mismatch')
+            posted={r[0]:r[1] for r in c.execute('SELECT ledger_account,sum(usd_delta_u) FROM journal_postings JOIN journal_transactions USING(transaction_id) WHERE account_id=? GROUP BY ledger_account',(account_id,))}
+            if {k:v for k,v in posted.items() if v}!={k:v for k,v in totals.items() if v}:raise PersistenceUnavailable('economic journal projection mismatch')
+            actual_native={}
+            for r in c.execute('SELECT ledger_account,asset,native_delta FROM journal_postings JOIN journal_transactions USING(transaction_id) WHERE account_id=? AND asset IS NOT NULL',(account_id,)):
+                actual_native[r[0],r[1]]=actual_native.get((r[0],r[1]),Fraction(0))+Fraction(decimal_value(r[2]))
+            if {k:v for k,v in actual_native.items() if v}!={k:v for k,v in native.items() if v}:
+                raise PersistenceUnavailable('native journal projection mismatch')

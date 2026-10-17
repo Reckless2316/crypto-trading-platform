@@ -297,3 +297,34 @@ class ContractTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ExactNavTests(unittest.TestCase):
+    def test_ready_fixture_carries_exact_revision_mark_and_equity(self):
+        from tests.autonomous.support import account_view
+        view=account_view()
+        self.assertTrue(view.ready)
+        self.assertEqual(view.exact_nav.revision,view.revision)
+        self.assertEqual(view.exact_nav.account_id,view.account_id)
+        self.assertEqual(view.exact_nav.equity_usd_u,view.liquidation_equity_usd_u)
+        self.assertEqual(view.exact_nav.mark_id,'test-mark')
+
+    def test_decimal_projections_cannot_disagree_with_exact_authority(self):
+        exact=c.ExactNavEvidence('a','mark',c.AccountRevision(),1,1000000,
+            c.ExactRatio('1','1'),c.ExactRatio('1','1'),c.ExactRatio('1','1'),c.ExactRatio('1','1'),'a'*64)
+        with self.assertRaises(c.ContractViolation):
+            c.AccountView('a',liquidation_equity_usd_u=1000000,units=Decimal(2),nav=Decimal(1),
+                high_water_nav=Decimal(1),day_open_nav=Decimal(1),exact_nav=exact)
+
+    def test_canonical_reduced_rational_and_resource_bound(self):
+        self.assertTrue(hasattr(c,'ExactRatio'),'exact rational contract missing')
+        from fractions import Fraction
+        self.assertEqual(c.ExactRatio('1','3').fraction(),Fraction(1,3))
+        for pair in [('2','6'),('01','3'),('1','0'),('1','-2'),('1'*4097,'3')]:
+            with self.assertRaises(c.ContractViolation):c.ExactRatio(*pair)
+
+    def test_ready_view_requires_bound_exact_evidence(self):
+        with self.assertRaises(c.ContractViolation):
+            c.AccountView('a',liquidation_equity_usd_u=1000000,units=Decimal(1),nav=Decimal(1),
+                high_water_nav=Decimal(1),day_open_nav=Decimal(1),reconcile_id='r',
+                reconciled_at_us=1,marked_at_us=1,private_heartbeat_us=1,ready=True)

@@ -1,0 +1,5 @@
+{"case":"deposit_preserves_drawdown","equity":"8500","units":"100","flow":"8500","after_equity":"17000","after_units":"200","nav":"85","high_water":"100","day_open":"100","drawdown":"0.15","daily_loss":"0.15"}
+{"case":"partial_withdrawal_preserves_drawdown","equity":"8500","units":"100","flow":"-4250","after_equity":"4250","after_units":"50","nav":"85","high_water":"100","day_open":"100","drawdown":"0.15","daily_loss":"0.15"}
+{"case":"below_drawdown_threshold","equity":"8500.1","units":"100","flow":"8500.1","after_equity":"17000.2","after_units":"200","nav":"85.001","high_water":"100","day_open":"100","drawdown":"0.14999","daily_loss":"0.14999"}
+{"case":"below_daily_threshold","equity":"9800.1","units":"100","flow":"-4900.05","after_equity":"4900.05","after_units":"50","nav":"98.001","high_water":"100","day_open":"100","drawdown":"0.01999","daily_loss":"0.01999"}
+{"case":"daily_threshold_equality","equity":"9800","units":"100","flow":"9800","after_equity":"19600","after_units":"200","nav":"98","high_water":"100","day_open":"100","drawdown":"0.02","daily_loss":"0.02"}

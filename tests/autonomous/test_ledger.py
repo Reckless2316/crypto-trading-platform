@@ -134,6 +134,12 @@ class LedgerTests(unittest.TestCase):
         c.execute("INSERT INTO balance_positions(account_id,asset,native_qty,cost_basis_usd_u,journal_sequence,version) VALUES ('paper-test','USD','10000',10000000000,0,0)")
         c.execute("UPDATE account_control SET permit='entry',permit_epoch=1,lease_boot_id='test-boot',lease_deadline_mono_ns=?,active_release_hash=?,reconcile_id='reconcile',version=version+1", (time.monotonic_ns() + 100_000_000_000, RELEASE_HASH))
         c.execute("UPDATE account_readiness SET ready=1,private_heartbeat_us=?,version=version+1 WHERE account_id='paper-test'", (now,))
+        from bot.autonomous.contracts import ExactRatio, ExactNavEvidence
+        exact=ExactNavEvidence('paper-test','mark',self.ledger._revision('paper-test'),0,10000000000,
+            ExactRatio('10000','1'),ExactRatio('1','1'),ExactRatio('1','1'),ExactRatio('1','1'),HASH_A)
+        c.execute("INSERT INTO accounting_evidence VALUES ('fixture-mark','paper-test','mark','local-paper','{}',?,?,?,?,?)",
+            (content_hash({}),now,now,now,now))
+        c.execute("INSERT INTO exact_marks VALUES ('mark','paper-test','fixture-mark',?,'[]',0,'reconcile',1,?)",(exact.to_json(),now))
         limits = RiskLimits(armed=True,candidate_eligible=True,tokenizer_config_hash=HASH_A,calibration_config_hash=HASH_A)
         market = MarketRules('paper','AAVE-USD','AAVE','USD',Decimal('0.01'),Decimal('0.01'),Decimal('0.01'),Decimal('1'),Decimal('0.01'),2,HASH_A,now+100_000_000,True,True,now,10_000_000_000)
         self.ledger.configure_risk_checks(limits=limits, market=lambda _: market,
@@ -528,7 +534,7 @@ class LedgerTests(unittest.TestCase):
         intent=self.reserve(p)
         historical=self.ledger.account_view('paper-test').revision
         # Dispatch evidence is written at T; the commit proof is captured at T+1.
-        calls=iter((base+10,base+10,base+11))
+        calls=iter((base+10,base+10,base+10,base+11))
         self.ledger._clock_us=lambda:next(calls)
         self.ledger.mark_dispatching(intent.intent_id,intent.generation)
         self.ledger._clock_us=lambda:base+20
@@ -613,3 +619,505 @@ class LedgerTests(unittest.TestCase):
         with self.assertRaises(ContractViolation):
             self.ledger.export_session(SessionCutoff('different-account',created+1,'missing'))
         self.assertEqual(0,self.ledger.connection.execute('SELECT count(*) FROM review_sessions').fetchone()[0])
+
+
+class AccountingTests(unittest.TestCase):
+    """All observations below are local paper fixtures, not venue attestations."""
+    def setUp(self):
+        self.directory=tempfile.TemporaryDirectory()
+        self.path=Path(self.directory.name)/'accounting.sqlite'
+        self.ledger=load_ledger().open(self.path)
+        self.now=1728000000000  # exact UTC midnight
+        self.ledger._clock_us=lambda:self.now
+        self.ledger.create_paper_account('paper-test')
+
+    def tearDown(self):
+        self.ledger.close()
+        self.directory.cleanup()
+
+    def evidence(self, key, kind, payload):
+        self.assertTrue(hasattr(self.ledger,'import_local_evidence'), 'accounting evidence intake missing')
+        return self.ledger.import_local_evidence('paper-test',key,kind,payload,
+            event_at_us=self.now,received_at_us=self.now,known_at_us=self.now)
+
+    def initialize(self, cash='10000', extra=()):
+        balances=[{'asset':'USD','quantity':cash,'basis_usd_u':int(Decimal(cash)*1000000)}]+list(extra)
+        evidence=self.evidence('initial','initial',{'balances':balances,'units':'100'})
+        self.ledger.initialize_account(evidence)
+        return self.mark('opening')
+
+    def balances(self):
+        return {r['asset']:r['native_qty'] for r in self.ledger.connection.execute('SELECT * FROM balance_positions')}
+
+    def mark(self,key,books=None,**changes):
+        payload={'balances':self.balances(),'books':books or {},'heartbeat_at_us':self.now,
+            'open_intent_ids':[r[0] for r in self.ledger.connection.execute("SELECT intent_id FROM order_intents WHERE state NOT IN ('filled','canceled','rejected') ORDER BY intent_id")],
+            'liabilities_usd_u':0,'exit_cost_usd_u':0}
+        payload.update(changes)
+        return self.ledger.record_mark(self.evidence(key,'mark',payload))
+
+    def flow(self,key,value,fee=0):
+        pre=self.ledger.connection.execute('SELECT mark_id FROM equity_marks ORDER BY rowid DESC LIMIT 1').fetchone()[0]
+        return self.ledger.record_flow(self.evidence(key,'flow',{'transfer_key':key,'asset':'USD',
+            'quantity':str(Decimal(value)/1000000),'usd_value_u':value,'fee_usd_u':fee,'preflow_mark_id':pre}))
+
+    def intent(self,key,side='buy',quantity='10',price='100'):
+        from bot.autonomous.contracts import Side
+        p=dataclasses.replace(order_proposal(),action_id=key,side=Side(side),base_quantity=Decimal(quantity),
+            limit_price=Decimal(price),reducing_only=side=='sell',max_fee_usd_u=1000000)
+        with self.ledger.transaction() as c:
+            c.execute("INSERT OR IGNORE INTO release_bundles VALUES (?,'{}',NULL,?,?)",(RELEASE_HASH,self.now+100000000,self.now))
+            c.execute("INSERT INTO order_intents VALUES (?,?,NULL,1,?,?,?,'AAVE-USD',?,?,?,?,?,'open',NULL,0,0,0,?,?,?)",
+                (key,'paper-test',RELEASE_HASH,self.now,key,side,quantity,price,1000000,key,p.to_json(),AccountRevision().to_json(),self.now))
+            c.execute("INSERT INTO reservations VALUES (?,?,?,1000000000,25000000,?,'open',0,?)",(key,1001000000 if side=='buy' else 0,quantity,quantity,self.now))
+        return key
+
+    def fill(self,key,intent,quantity='1',quote='100',fee_asset='USD',fee='1',**changes):
+        payload={'fill_id':key,'intent_id':intent,'venue':'paper','trade_id':key,'order_id':intent,
+            'instrument':'AAVE-USD','side':'buy','base_quantity':quantity,'quote_quantity':quote,
+            'price':format(Decimal(quote)/Decimal(quantity),'f'),'fee_asset':fee_asset,'fee_quantity':fee,
+            'base_semantics':'gross','fee_final':True}
+        payload.update(changes)
+        self.ledger.record_fill(self.evidence(key,'fill',payload))
+        return payload
+
+    def test_deposit_loss_closure_restart_and_redeposit_preserve_latch(self):
+        self.initialize('8500')
+        # Opening NAV 85; establish genuine preceding high NAV via 10000 opening instead.
+        self.ledger.close()
+        self.directory.cleanup()
+        self.setUp()
+        self.initialize()
+        self.intent('buy',quantity='10')
+        self.fill('buy-fill','buy','10','1500','USD','0')
+        self.mark('loss',books={'AAVE':{'at_us':self.now,'bids':[['0','10']]}})
+        self.assertTrue(self.ledger.connection.execute('SELECT drawdown_latched FROM account_control').fetchone()[0])
+        self.flow('deposit',8500000000)
+        view=self.ledger.account_view('paper-test')
+        self.assertEqual((view.units,view.nav),(Decimal(200),Decimal(85)))
+        self.assertFalse(view.ready)
+        self.ledger.close()
+        self.ledger=load_ledger().open(self.path)
+        self.ledger._clock_us=lambda:self.now
+        self.assertEqual(1,self.ledger.connection.execute('SELECT drawdown_latched FROM account_control').fetchone()[0])
+
+    def test_repeating_units_repeated_flows_and_exact_view(self):
+        from fractions import Fraction
+        self.initialize('3')
+        for i in range(30):
+            self.flow('deposit-'+str(i),7)
+            self.mark('refresh-'+str(i))
+            self.flow('withdraw-'+str(i),-3)
+            self.mark('withdraw-refresh-'+str(i))
+        view=self.ledger.account_view('paper-test')
+        self.assertTrue(view.ready)
+        self.assertEqual(view.exact_nav.nav.fraction(),Fraction(3,100))
+        self.assertEqual(view.exact_nav.units.fraction(),Fraction(25001,250))
+        self.assertEqual(view.exact_nav.revision,view.revision)
+
+    def test_buy_sell_native_fees_basis_and_reservation_conservation(self):
+        self.initialize(extra=({'asset':'FEE','quantity':'2','basis_usd_u':20000000},))
+        self.intent('buy')
+        self.fill('buy1','buy','2','200','AAVE','0.1')
+        row=self.ledger.connection.execute("SELECT * FROM balance_positions WHERE asset='AAVE'").fetchone()
+        self.assertEqual(('1.9',190000000),(row['native_qty'],row['cost_basis_usd_u']))
+        r=self.ledger.connection.execute("SELECT * FROM reservations WHERE intent_id='buy'").fetchone()
+        self.assertEqual('8',r['remaining_qty'])
+        self.assertGreater(r['loss_budget_usd_u'],0)
+        self.intent('sell','sell','1.9')
+        self.fill('sell1','sell','1.9','228','USD','1',side='sell')
+        row=self.ledger.connection.execute("SELECT * FROM balance_positions WHERE asset='AAVE'").fetchone()
+        self.assertEqual(('0',0),(row['native_qty'],row['cost_basis_usd_u']))
+        self.assertEqual(0,self.ledger.connection.execute('SELECT sum(usd_delta_u) FROM journal_postings').fetchone()[0])
+        from fractions import Fraction
+        native={}
+        for asset,qty in self.ledger.connection.execute('SELECT asset,native_delta FROM journal_postings WHERE asset IS NOT NULL'):
+            native[asset]=native.get(asset,Fraction(0))+Fraction(Decimal(qty))
+        self.assertTrue(all(v==0 for v in native.values()))
+
+    def test_missing_or_stale_depth_unknown_holding_and_boundary_are_unready(self):
+        self.initialize()
+        self.intent('buy')
+        self.fill('f','buy')
+        self.mark('missing')
+        self.assertFalse(self.ledger.account_view('paper-test').ready)
+        self.mark('shallow',books={'AAVE':{'at_us':self.now,'bids':[['100','0.5']]}})
+        self.assertFalse(self.ledger.account_view('paper-test').ready)
+        self.mark('good',books={'AAVE':{'at_us':self.now,'bids':[['100','1']]}})
+        self.assertTrue(self.ledger.account_view('paper-test').ready)
+        self.now+=86400000001
+        self.mark('missed-boundary',books={'AAVE':{'at_us':self.now,'bids':[['100','1']]}})
+        self.assertFalse(self.ledger.account_view('paper-test').ready)
+
+    def test_correction_replays_old_buy_basis_after_partial_sell(self):
+        self.initialize()
+        self.intent('buy')
+        original=self.fill('buy-fill','buy','2','200','USD','0')
+        self.intent('sell','sell')
+        self.fill('sell-fill','sell','1','120','USD','0',side='sell')
+        corrected=dict(original,quote_quantity='220',price='110')
+        eid=self.evidence('correction','correction',{'fill_id':'buy-fill','previous_payload_hash':content_hash(original),'replacement':corrected})
+        self.assertTrue(self.ledger.correct_fill(eid))
+        self.assertFalse(self.ledger.correct_fill(eid))
+        row=self.ledger.connection.execute("SELECT * FROM balance_positions WHERE asset='AAVE'").fetchone()
+        self.assertEqual(('1',110000000),(row['native_qty'],row['cost_basis_usd_u']))
+        pnl=self.ledger.connection.execute("SELECT sum(usd_delta_u) FROM journal_postings WHERE ledger_account='realized_profit'").fetchone()[0]
+        self.assertEqual(-10000000,pnl)
+        self.assertEqual(2,self.ledger.connection.execute('SELECT count(*) FROM fills').fetchone()[0])
+
+    def test_economic_failure_rolls_back_and_prefix_excludes_future_mark(self):
+        self.initialize()
+        cutoff=self.now
+        before=self.ledger._revision('paper-test')
+        self.now+=1
+        self.ledger.connection.execute("CREATE TRIGGER fail_flow BEFORE INSERT ON exact_flows BEGIN SELECT RAISE(ABORT,'injected'); END")
+        with self.assertRaises(PersistenceUnavailable):self.flow('failed',10)
+        self.assertEqual(0,self.ledger.connection.execute('SELECT count(*) FROM external_flows').fetchone()[0])
+        self.assertEqual(before,self.ledger._revision('paper-test'))
+
+    def test_local_evidence_cannot_claim_live_provenance_or_changed_identity(self):
+        self.initialize()
+        with self.assertRaises(ContractViolation):self.evidence('initial','initial',{'fake':True})
+        with self.ledger.transaction() as c:c.execute("UPDATE accounts SET mode='live'")
+        with self.assertRaises(ContractViolation):self.evidence('fake-live','mark',{})
+
+    def test_closure_redeposit_and_reopen_keep_halts_and_exact_history(self):
+        self.initialize()
+        with self.ledger.transaction() as c:c.execute('UPDATE account_control SET drawdown_latched=1,crisis_halted=1,hard_killed=1')
+        self.assertTrue(self.flow('close',-10000000000))
+        self.assertFalse(self.ledger.account_view('paper-test').ready)
+        self.assertEqual(0,self.ledger.account_view('paper-test').liquidation_equity_usd_u)
+        self.assertTrue(self.flow('reopen',5000000000))
+        self.mark('after-reopen')
+        self.assertEqual(Decimal(50),self.ledger.account_view('paper-test').units)
+        self.ledger.close();self.ledger=load_ledger().open(self.path)
+        self.assertEqual((1,1,1),tuple(self.ledger.connection.execute('SELECT drawdown_latched,crisis_halted,hard_killed FROM account_control').fetchone()))
+
+    def test_transfer_cost_triggers_daily_halt_atomically_and_utc_rollover(self):
+        self.initialize()
+        self.assertTrue(self.flow('cost',1000000,200020000))
+        self.assertEqual(1,self.ledger.connection.execute('SELECT daily_halted FROM account_control').fetchone()[0])
+        self.now+=86400000000
+        self.mark('next-midnight')
+        self.assertEqual(0,self.ledger.connection.execute('SELECT daily_halted FROM account_control').fetchone()[0])
+        self.assertTrue(self.ledger.account_view('paper-test').ready)
+
+    def test_zero_equity_still_persists_breach_while_unarmed(self):
+        self.initialize()
+        self.mark('zero-equity',liabilities_usd_u=10000000000)
+        self.assertEqual((1,1),tuple(self.ledger.connection.execute('SELECT drawdown_latched,daily_halted FROM account_control').fetchone()))
+        self.assertFalse(self.ledger.account_view('paper-test').ready)
+
+    def test_third_asset_fee_fx_and_pending_unknown_conversion(self):
+        self.initialize(extra=({'asset':'FEE','quantity':'2','basis_usd_u':20000000},))
+        fx=self.evidence('fx','fx',{'legs':[{'from_asset':'FEE','to_asset':'USD','to_units_per_from_unit':'12'}]})
+        self.intent('buy')
+        self.fill('fee1','buy','1','100','FEE','0.5',fee_fx_id=fx)
+        self.assertEqual('1.5',self.balances()['FEE'])
+        self.assertEqual(-1000000,self.ledger.connection.execute("SELECT sum(usd_delta_u) FROM journal_postings WHERE ledger_account='realized_profit'").fetchone()[0])
+        self.fill('fee2','buy','1','100','FEE','0.5')
+        self.assertEqual('2',self.balances()['AAVE'])
+        self.assertEqual('1',self.balances()['FEE'])
+        self.assertFalse(self.ledger.account_view('paper-test').ready)
+        self.assertGreater(self.ledger.connection.execute('SELECT cash_usd_u FROM reservations').fetchone()[0],0)
+
+    def test_fill_known_cash_fee_can_latch_before_another_reconciliation(self):
+        self.initialize()
+        self.intent('buy')
+        self.mark('pre-trade-depth',books={'AAVE':{'at_us':self.now,'bids':[['100','10']]}})
+        self.fill('fee-loss','buy','1','100','USD','1600')
+        self.assertEqual(1,self.ledger.connection.execute('SELECT drawdown_latched FROM account_control').fetchone()[0])
+        self.assertFalse(self.ledger.account_view('paper-test').ready)
+
+    def test_exact_accounting_events_are_cutoff_prefix_bound(self):
+        self.initialize()
+        cutoff=self.now;reconcile=self.ledger.account_view('paper-test').reconcile_id
+        self.now+=10
+        self.flow('later-flow',1000000)
+        archive=self.ledger.export_session(SessionCutoff('paper-test',cutoff,reconcile))
+        from bot.autonomous.contracts import strict_json
+        raw=self.ledger.connection.execute('SELECT export_json FROM review_sessions WHERE session_id=?',(archive.session_id,)).fetchone()[0]
+        payload=strict_json(raw)
+        self.assertEqual([],payload['exact_flows'])
+        self.assertEqual(['opening'],[e['evidence_id'] for e in payload['accounting_evidence'] if e['kind']=='mark'])
+        self.assertEqual(1,len(payload['exact_marks']))
+
+    def test_startup_rejects_mutable_unit_projection_tampering(self):
+        self.initialize()
+        self.ledger.connection.execute("UPDATE accounting_state SET units_json='{\"denominator\":\"1\",\"numerator\":\"999\"}'")
+        self.ledger.close()
+        with self.assertRaises(PersistenceUnavailable):load_ledger().open(self.path)
+
+    def test_startup_rejects_day_boundary_projection_tampering(self):
+        self.initialize()
+        self.ledger.connection.execute('UPDATE accounting_state SET day_start_us=day_start_us+86400000000')
+        self.ledger.close()
+        with self.assertRaises(PersistenceUnavailable):load_ledger().open(self.path)
+
+    def test_submicro_basis_residual_and_duplicate_fill_evidence(self):
+        self.initialize()
+        self.intent('buy')
+        payload=self.fill('tiny-buy','buy','3','0.000001','USD','0',price='0.00000033333333333333333333333333333333')
+        self.assertFalse(self.ledger.record_fill(self.evidence('duplicate','fill',payload)))
+        self.intent('sell','sell','3')
+        self.fill('tiny-sell','sell','1','0.000001','USD','0',side='sell')
+        self.assertEqual(1,self.ledger.connection.execute("SELECT cost_basis_usd_u FROM balance_positions WHERE asset='AAVE'").fetchone()[0])
+        self.fill('tiny-final','sell','2','0.000002','USD','0',side='sell')
+        self.assertEqual(0,self.ledger.connection.execute("SELECT cost_basis_usd_u FROM balance_positions WHERE asset='AAVE'").fetchone()[0])
+        self.assertGreater(self.ledger.connection.execute("SELECT count(*) FROM accounting_rounding WHERE exact_residual_json!='{\"denominator\":\"1\",\"numerator\":\"0\"}'").fetchone()[0],0)
+
+    def test_fill_after_flow_still_latches_loss_in_economic_transaction(self):
+        self.initialize()
+        self.mark('preflow-depth',books={'AAVE':{'at_us':self.now,'bids':[['100','10']]}})
+        self.flow('capital',1000000)
+        self.intent('buy')
+        self.fill('loss-after-flow','buy','1','100','USD','1600')
+        self.assertEqual(1,self.ledger.connection.execute('SELECT drawdown_latched FROM account_control').fetchone()[0])
+
+    def test_unknown_fill_semantics_records_incident_and_invalidates_ready_view(self):
+        self.initialize()
+        self.intent('buy')
+        self.mark('ready-with-order')
+        payload={'fill_id':'unknown','intent_id':'buy','venue':'paper','trade_id':'unknown','order_id':'buy',
+            'instrument':'AAVE-USD','side':'buy','base_quantity':'1','quote_quantity':'100','price':'100',
+            'fee_asset':'USD','fee_quantity':'0','base_semantics':'unknown','fee_final':True}
+        self.assertFalse(self.ledger.record_fill(self.evidence('unknown','fill',payload)))
+        self.assertFalse(self.ledger.account_view('paper-test').ready)
+        self.assertEqual(0,self.ledger.connection.execute('SELECT count(*) FROM fills').fetchone()[0])
+        self.assertGreater(self.ledger.connection.execute('SELECT count(*) FROM accounting_findings').fetchone()[0],0)
+
+    def test_missing_fx_liquidation_invalidates_previous_ready_mark(self):
+        self.initialize(extra=({'asset':'USDC','quantity':'2','basis_usd_u':2000000},))
+        self.mark('usd-book',books={'USDC':{'at_us':self.now,'bids':[['0.99','2']]}})
+        self.assertTrue(self.ledger.account_view('paper-test').ready)
+        self.mark('missing-fx',books={'USDC':{'at_us':self.now,'quote_asset':'EUR','fx_id':'absent','bids':[['1','2']]}})
+        self.assertFalse(self.ledger.account_view('paper-test').ready)
+
+    def test_startup_rejects_highwater_and_native_projection_tampering(self):
+        self.initialize()
+        with self.ledger.transaction() as c:
+            c.execute("UPDATE accounting_state SET high_water_json='{\"denominator\":\"1\",\"numerator\":\"1\"}'")
+        self.ledger.close()
+        with self.assertRaises(PersistenceUnavailable):load_ledger().open(self.path)
+
+    def test_repeated_capital_flow_keeps_depth_for_following_loss_event(self):
+        self.initialize()
+        self.intent('buy')
+        self.fill('first-buy','buy','1','100','USD','0')
+        self.mark('complete-depth',books={'AAVE':{'at_us':self.now,'bids':[['100','10']]}})
+        self.flow('deposit-with-holding',1000000)
+        self.fill('fee-event','buy','1','100','USD','1600')
+        self.assertEqual(1,self.ledger.connection.execute('SELECT drawdown_latched FROM account_control').fetchone()[0])
+
+    def test_non_usd_external_capital_requires_fx_and_preserves_nav(self):
+        self.initialize(extra=({'asset':'USDC','quantity':'2','basis_usd_u':2000000},))
+        self.mark('coin-depth',books={'USDC':{'at_us':self.now,'bids':[['0.99','100']]}})
+        before=self.ledger.account_view('paper-test')
+        fx=self.evidence('transfer-fx','fx',{'legs':[{'from_asset':'USDC','to_asset':'USD','to_units_per_from_unit':'0.99'}]})
+        pre=self.ledger.connection.execute('SELECT mark_id FROM equity_marks ORDER BY rowid DESC LIMIT 1').fetchone()[0]
+        payload={'transfer_key':'usdc-deposit','asset':'USDC','quantity':'10','usd_value_u':9900000,'fee_usd_u':0,
+            'fx_id':fx,'preflow_mark_id':pre}
+        self.assertTrue(self.ledger.record_flow(self.evidence('usdc-deposit','flow',payload)))
+        self.assertEqual('12',self.balances()['USDC'])
+        self.mark('post-capital',books={'USDC':{'at_us':self.now,'bids':[['0.99','100']]}})
+        after=self.ledger.account_view('paper-test')
+        self.assertEqual(before.exact_nav.nav,after.exact_nav.nav)
+        self.assertTrue(after.ready)
+
+    def test_exact_flow_after_units_are_checked_on_restart(self):
+        self.initialize()
+        self.flow('capital',1000000)
+        c=self.ledger.connection
+        trigger=c.execute("SELECT sql FROM sqlite_master WHERE name='exact_flows_no_update'").fetchone()[0]
+        c.execute('DROP TRIGGER exact_flows_no_update')
+        bad='{\"denominator\":\"1\",\"numerator\":\"999\"}'
+        c.execute('UPDATE exact_flows SET units_after_json=?',(bad,))
+        c.execute('UPDATE accounting_state SET units_json=?',(bad,))
+        c.execute(trigger)
+        self.ledger.close()
+        with self.assertRaises(PersistenceUnavailable):load_ledger().open(self.path)
+
+    def test_flow_with_missing_fx_keeps_evidence_and_inhibits_entries(self):
+        self.initialize()
+        pre=self.ledger.account_view('paper-test').exact_nav.mark_id
+        p={'transfer_key':'unvalued','asset':'USDC','quantity':'10','usd_value_u':10000000,
+            'fee_usd_u':0,'preflow_mark_id':pre}
+        self.assertFalse(self.ledger.record_flow(self.evidence('unvalued','flow',p)))
+        self.assertFalse(self.ledger.account_view('paper-test').ready)
+        self.assertEqual(0,self.ledger.connection.execute('SELECT count(*) FROM external_flows').fetchone()[0])
+        self.assertEqual(1,self.ledger.connection.execute("SELECT count(*) FROM accounting_evidence WHERE evidence_id='unvalued'").fetchone()[0])
+
+    def test_submicro_usd_transfer_cannot_silently_round_native_cash(self):
+        self.initialize()
+        p={'transfer_key':'submicro','asset':'USD','quantity':'0.0000011','usd_value_u':1,
+            'fee_usd_u':0,'preflow_mark_id':self.ledger.account_view('paper-test').exact_nav.mark_id}
+        self.assertFalse(self.ledger.record_flow(self.evidence('submicro','flow',p)))
+        self.assertEqual('10000',self.balances()['USD'])
+        self.assertFalse(self.ledger.account_view('paper-test').ready)
+
+    def test_buy_net_base_fee_and_sell_extra_base_fee_apply_once(self):
+        self.initialize()
+        self.intent('buy',quantity='10')
+        self.fill('net-buy','buy','9.9','1000','AAVE','0.1',base_semantics='buy_net',price='100')
+        self.assertEqual('9.9',self.balances()['AAVE'])
+        self.assertEqual('9000',self.balances()['USD'])
+        self.assertEqual('0',self.ledger.connection.execute("SELECT remaining_qty FROM reservations WHERE intent_id='buy'").fetchone()[0])
+        self.intent('sell','sell','9.8')
+        self.fill('base-fee-sell','sell','9.8','1078','AAVE','0.1',side='sell')
+        self.assertEqual('0',self.balances()['AAVE'])
+        self.assertEqual('10078',self.balances()['USD'])
+        self.assertEqual(21000000,self.ledger.connection.execute("SELECT sum(usd_delta_u) FROM journal_postings WHERE ledger_account='fee_expense'").fetchone()[0])
+
+    def test_late_fill_changed_retry_and_stale_correction_preserve_history(self):
+        self.initialize()
+        self.intent('buy')
+        original=self.fill('original','buy','1','100','USD','0')
+        with self.ledger.transaction() as c:c.execute("UPDATE order_intents SET state='canceled',version=version+1 WHERE intent_id='buy'")
+        self.fill('late','buy','1','100','USD','0')
+        self.assertEqual('2',self.balances()['AAVE'])
+        self.assertFalse(self.ledger.account_view('paper-test').ready)
+        self.assertFalse(self.ledger.record_fill(self.evidence('changed-fill','fill',dict(original,fee_quantity='1'))))
+        self.assertEqual(2,self.ledger.connection.execute('SELECT count(*) FROM fills').fetchone()[0])
+        correction={'fill_id':'original','previous_payload_hash':content_hash(original),'replacement':dict(original,fee_quantity='1')}
+        self.assertTrue(self.ledger.correct_fill(self.evidence('correct','correction',correction)))
+        with self.assertRaises(ContractViolation):self.ledger.correct_fill(self.evidence('stale','correction',correction))
+        self.assertEqual(1,self.ledger.connection.execute('SELECT count(*) FROM fill_corrections').fetchone()[0])
+
+    def test_stale_depth_heartbeat_and_unexplained_holdings_do_not_refresh_readiness(self):
+        self.initialize(extra=({'asset':'OTHER','quantity':'1','basis_usd_u':1000000},))
+        self.mark('complete-other',books={'OTHER':{'at_us':self.now,'bids':[['1','1']]}})
+        self.assertTrue(self.ledger.account_view('paper-test').ready)
+        self.mark('stale-other',books={'OTHER':{'at_us':self.now-2000001,'bids':[['1','1']]}})
+        self.assertFalse(self.ledger.account_view('paper-test').ready)
+        self.mark('stale-private',books={'OTHER':{'at_us':self.now,'bids':[['1','1']]}},heartbeat_at_us=self.now-5000001)
+        self.assertFalse(self.ledger.account_view('paper-test').ready)
+        self.mark('unexplained',books={'OTHER':{'at_us':self.now,'bids':[['1','1']]}},balances={'USD':'20000','OTHER':'1'})
+        self.assertFalse(self.ledger.account_view('paper-test').ready)
+        self.assertEqual('10000',self.balances()['USD'])
+
+    def test_rounding_and_compensation_export_cutoff_keeps_original_economics(self):
+        self.initialize()
+        self.intent('buy')
+        original=self.fill('before-correction','buy','1','100','USD','0')
+        self.mark('reconciled-before-correction',books={'AAVE':{'at_us':self.now,'bids':[['100','1']]}})
+        cutoff=self.now;view=self.ledger.account_view('paper-test')
+        self.now+=1
+        corrected={'fill_id':'before-correction','previous_payload_hash':content_hash(original),'replacement':dict(original,quote_quantity='110',price='110')}
+        self.ledger.correct_fill(self.evidence('future-correction','correction',corrected))
+        archive=self.ledger.export_session(SessionCutoff('paper-test',cutoff,view.reconcile_id))
+        from bot.autonomous.contracts import strict_json
+        payload=strict_json(self.ledger.connection.execute('SELECT export_json FROM review_sessions WHERE session_id=?',(archive.session_id,)).fetchone()[0])
+        self.assertEqual([],payload['fill_corrections'])
+        self.assertEqual([], [o for o in payload['accounting_operations'] if o['kind']=='correction'])
+        self.assertEqual('100',payload['fills'][0]['quote_qty'])
+        self.assertTrue(payload['accounting_rounding'])
+
+    def test_projection_failure_retains_factual_transfer_and_inhibits_ready_view(self):
+        initial=self.evidence('huge-units','initial',{'balances':[{'asset':'USD','quantity':'1','basis_usd_u':1000000}],
+            'units':'10000000000000000000000000000000000000'})
+        self.ledger.initialize_account(initial)
+        self.mark('huge-opening')
+        self.assertTrue(self.ledger.account_view('paper-test').ready)
+        # Exact rational units can grow beyond the bounded display range. This is
+        # a supported resource failure, never permission to truncate authority.
+        pre=self.ledger.account_view('paper-test').exact_nav.mark_id
+        p={'transfer_key':'oversized','asset':'USD','quantity':'1000000','usd_value_u':1000000000000,
+            'fee_usd_u':0,'preflow_mark_id':pre}
+        self.assertFalse(self.ledger.record_flow(self.evidence('oversized','flow',p)))
+        self.assertFalse(self.ledger.account_view('paper-test').ready)
+        self.assertEqual(0,self.ledger.connection.execute('SELECT count(*) FROM external_flows').fetchone()[0])
+        self.assertEqual('1',self.balances()['USD'])
+
+    def test_later_depth_cannot_be_relabeled_as_midnight(self):
+        self.initialize(extra=({'asset':'AAVE','quantity':'1','basis_usd_u':100000000},))
+        self.mark('initial-asset',books={'AAVE':{'at_us':self.now,'bids':[['100','1']]}})
+        boundary=self.now+86400000000
+        self.now=boundary+1
+        p={'balances':self.balances(),'books':{'AAVE':{'at_us':self.now,'bids':[['1000','1']]}},
+            'heartbeat_at_us':boundary,'open_intent_ids':[],'liabilities_usd_u':0,'exit_cost_usd_u':0}
+        evidence=self.ledger.import_local_evidence('paper-test','false-boundary','mark',p,
+            event_at_us=boundary,received_at_us=self.now,known_at_us=self.now)
+        self.ledger.record_mark(evidence)
+        self.assertNotEqual(boundary,self.ledger.connection.execute('SELECT day_start_us FROM accounting_state').fetchone()[0])
+        self.assertFalse(self.ledger.account_view('paper-test').ready)
+
+    def test_genuine_boundary_restored_after_outage_requires_current_reconciliation(self):
+        self.initialize()
+        self.flow('known-loss',1000000,300000000)
+        self.assertEqual(1,self.ledger.connection.execute('SELECT daily_halted FROM account_control').fetchone()[0])
+        boundary=self.now+86400000000
+        self.now=boundary+10000000
+        p={'balances':self.balances(),'books':{},'heartbeat_at_us':boundary,'open_intent_ids':[],
+            'liabilities_usd_u':0,'exit_cost_usd_u':0}
+        evidence=self.ledger.import_local_evidence('paper-test','real-boundary','mark',p,
+            event_at_us=boundary,received_at_us=self.now,known_at_us=self.now)
+        self.ledger.record_mark(evidence)
+        self.assertEqual(boundary,self.ledger.connection.execute('SELECT day_start_us FROM accounting_state').fetchone()[0])
+        self.assertFalse(self.ledger.account_view('paper-test').ready)
+        self.assertEqual(1,self.ledger.connection.execute('SELECT daily_halted FROM account_control').fetchone()[0])
+        self.mark('fresh-after-outage')
+        self.assertTrue(self.ledger.account_view('paper-test').ready)
+        self.assertEqual(0,self.ledger.connection.execute('SELECT daily_halted FROM account_control').fetchone()[0])
+
+    def test_additive_accounting_migration_preserves_legacy_committed_export(self):
+        import hashlib
+        from unittest.mock import patch
+        from bot.autonomous import ledger as module
+        path=Path(self.directory.name)/'legacy.sqlite'
+        c=sqlite3.connect(path,isolation_level=None)
+        c.row_factory=sqlite3.Row
+        migration=Path('data/migrations/001_autonomous_ledger.sql')
+        c.executescript(migration.read_text())
+        c.execute('INSERT INTO schema_migrations VALUES (1,?,?)',(hashlib.sha256(migration.read_bytes()).hexdigest(),self.now))
+        legacy=load_ledger()(c)
+        legacy._clock_us=lambda:self.now
+        additions={'accounting_evidence','accounting_operations','exact_marks','exact_flows','accounting_findings','accounting_rounding'}
+        old_policy={k:v for k,v in module._EXPORT_TIMES.items() if k not in additions}
+        with patch.dict(module._EXPORT_TIMES,old_policy,clear=True):
+            legacy.create_paper_account('paper-test')
+            with legacy.transaction():
+                c.execute("INSERT INTO reconciliations VALUES ('legacy-reconcile','paper-test',?,?,NULL,'completed','{}','[]','[]',?)",(self.now,self.now,self.now))
+        legacy.close()
+        upgraded=load_ledger().open(path)
+        try:
+            upgraded._clock_us=lambda:self.now+100
+            archive=upgraded.export_session(SessionCutoff('paper-test',self.now,'legacy-reconcile'))
+            from bot.autonomous.contracts import strict_json
+            payload=strict_json(upgraded.connection.execute('SELECT export_json FROM review_sessions WHERE session_id=?',(archive.session_id,)).fetchone()[0])
+            self.assertTrue(all(payload[table]==[] for table in additions))
+        finally:upgraded.close()
+
+    def test_accounting_write_boundary_failures_roll_back_every_projection(self):
+        self.initialize()
+        self.intent('buy')
+        self.mark('depth-before-faults',books={'AAVE':{'at_us':self.now,'bids':[['100','10']]}})
+        targets={'journal_transactions':'INSERT','journal_postings':'INSERT','balance_positions':'UPDATE',
+            'accounting_operations':'INSERT','external_flows':'INSERT','exact_flows':'INSERT',
+            'equity_marks':'INSERT','exact_marks':'INSERT','account_readiness':'UPDATE',
+            'account_control':'UPDATE','control_events':'INSERT','reservations':'UPDATE'}
+        for table,action in targets.items():
+            with self.subTest(table=table),tempfile.TemporaryDirectory() as directory:
+                path=Path(directory)/'fault.sqlite'
+                copy=sqlite3.connect(path)
+                self.ledger.connection.backup(copy);copy.close()
+                ledger=load_ledger().open(path);ledger._clock_us=lambda:self.now
+                try:
+                    if table=='reservations':
+                        kind='fill'
+                        p={'fill_id':'fault','intent_id':'buy','venue':'paper','trade_id':'fault','order_id':'buy',
+                            'instrument':'AAVE-USD','side':'buy','base_quantity':'1','quote_quantity':'100','price':'100',
+                            'fee_asset':'USD','fee_quantity':'1600','base_semantics':'gross','fee_final':True}
+                    else:
+                        kind='flow'
+                        p={'transfer_key':'fault','asset':'USD','quantity':'1','usd_value_u':1000000,'fee_usd_u':1600000000,
+                            'preflow_mark_id':ledger.account_view('paper-test').exact_nav.mark_id}
+                    evidence=ledger.import_local_evidence('paper-test','fault',kind,p,event_at_us=self.now,received_at_us=self.now,known_at_us=self.now)
+                    tables=[r[0] for r in ledger.connection.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")]
+                    def snapshot():return {name:[tuple(r) for r in ledger.connection.execute('SELECT * FROM '+name+' ORDER BY rowid')] for name in tables}
+                    before=snapshot()
+                    ledger.connection.execute('CREATE TRIGGER injected BEFORE '+action+' ON '+table+" BEGIN SELECT RAISE(ABORT,'accounting fault'); END")
+                    with self.assertRaises(PersistenceUnavailable):
+                        (ledger.record_fill if kind=='fill' else ledger.record_flow)(evidence)
+                    self.assertEqual(before,snapshot())
+                    self.assertFalse(ledger.dispatch_enabled)
+                finally:ledger.close()

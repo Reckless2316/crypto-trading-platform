@@ -6,13 +6,14 @@ strict; from_dict/from_json are the only conversions from untrusted wire data.
 """
 from __future__ import annotations
 
+from fractions import Fraction
 import hashlib
 import json
 import math
 import re
 import types
 from dataclasses import dataclass, fields
-from decimal import Decimal, InvalidOperation, localcontext
+from decimal import Context, Decimal, InvalidOperation, localcontext
 from enum import Enum
 from functools import lru_cache
 from typing import Protocol, Self, Union, get_args, get_origin, get_type_hints, runtime_checkable
@@ -802,6 +803,80 @@ class Reservation(Record):
             raise ContractViolation("negative reservation")
 
 
+# At most 4096 decimal digits per reduced component, ~13.6 kbits. Supports
+# thousands of ordinary flows while bounding GCD/cross-product memory. Chunked
+# conversion never depends on Python's process-wide int/string digit setting.
+def _ratio_integer(text: str) -> int:
+    if type(text) is not str or not 1 <= len(text) <= 4096:
+        raise ContractViolation("exact ratio resource bound")
+    negative=text.startswith('-')
+    digits=text[1:] if negative else text
+    if not digits or not digits.isascii() or not digits.isdigit() or (len(digits)>1 and digits[0]=='0') or text=='-0':
+        raise ContractViolation("noncanonical exact integer")
+    result=0
+    for start in range(0,len(digits),9):
+        part=digits[start:start+9]
+        result=result*10**len(part)+int(part)
+    return -result if negative else result
+
+
+def _ratio_text(value: int) -> str:
+    if value.bit_length()>13607:
+        raise ContractViolation("exact ratio resource bound")
+    sign='-' if value<0 else ''
+    value=abs(value)
+    chunks=[]
+    while value:
+        value,part=divmod(value,10**9)
+        chunks.append(part)
+    text=sign+(str(chunks[-1])+''.join(f'{p:09d}' for p in reversed(chunks[:-1])) if chunks else '0')
+    if len(text)>4096:
+        raise ContractViolation("exact ratio resource bound")
+    return text
+
+
+@dataclass(frozen=True)
+class ExactRatio(Record):
+    numerator: str
+    denominator: str
+    def _validate(self):
+        n,d=_ratio_integer(self.numerator),_ratio_integer(self.denominator)
+        if d<=0 or math.gcd(n,d)!=1:
+            raise ContractViolation("exact ratio must be reduced with positive denominator")
+    def fraction(self) -> Fraction:
+        return Fraction(_ratio_integer(self.numerator),_ratio_integer(self.denominator))
+    def projection(self) -> Decimal:
+        """Bounded floor display, never the unit or loss authority."""
+        value=self.fraction()
+        with localcontext(Context(prec=38,rounding='ROUND_FLOOR')):
+            projected=Decimal(value.numerator)/Decimal(value.denominator)
+            if projected.as_tuple().exponent < -38:
+                projected=projected.quantize(Decimal('1e-38'))
+            decimal_text(projected)
+            return projected
+    @classmethod
+    def of(cls,value: Fraction) -> ExactRatio:
+        return cls(_ratio_text(value.numerator),_ratio_text(value.denominator))
+
+
+@dataclass(frozen=True)
+class ExactNavEvidence(Record):
+    account_id: str
+    mark_id: str
+    revision: AccountRevision
+    valuation_version: int
+    equity_usd_u: int
+    units: ExactRatio
+    nav: ExactRatio
+    high_water_nav: ExactRatio
+    day_open_nav: ExactRatio
+    lineage_hash: str
+    def _validate(self):
+        u,n,h,d=(v.fraction() for v in (self.units,self.nav,self.high_water_nav,self.day_open_nav))
+        if self.valuation_version<0 or min(u,n,h,d)<=0 or h<n or n*u!=Fraction(self.equity_usd_u,1000000):
+            raise ContractViolation("inconsistent exact NAV evidence")
+
+
 @dataclass(frozen=True)
 class AccountView(Record):
     account_id: str
@@ -822,9 +897,16 @@ class AccountView(Record):
     private_heartbeat_us: int | None = None
     marked_at_us: int | None = None
     ready: bool = False
+    exact_nav: ExactNavEvidence | None = None
     def _validate(self):
         if self.ready and (self.liquidation_equity_usd_u <= 0 or min(self.units, self.nav, self.high_water_nav, self.day_open_nav) <= 0 or self.reconcile_id is None or self.reconciled_at_us is None or self.marked_at_us is None or self.private_heartbeat_us is None):
             raise ContractViolation("ready account lacks reconciled positive baselines")
+        if self.ready and self.exact_nav is None:
+            raise ContractViolation("ready account requires exact NAV evidence")
+        if self.exact_nav is not None and (self.exact_nav.account_id != self.account_id or self.exact_nav.revision != self.revision or self.exact_nav.equity_usd_u != self.liquidation_equity_usd_u):
+            raise ContractViolation("exact NAV evidence is not bound to account revision/equity")
+        if self.exact_nav is not None and any(getattr(self,key)!=getattr(self.exact_nav,key).projection() for key in ('units','nav','high_water_nav','day_open_nav')):
+            raise ContractViolation("display projection disagrees with exact NAV evidence")
         if self.high_water_nav < self.nav:
             raise ContractViolation("high water NAV below current NAV")
         if len({b.asset for b in self.balances}) != len(self.balances):

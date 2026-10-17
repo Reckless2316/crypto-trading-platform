@@ -4,6 +4,7 @@ from decimal import Decimal
 from bot.autonomous.contracts import (
     AccountRevision, AccountView, Balance, CausalCutoffs, DecisionReference, EncodedState,
     Mode, NumericSnapshot, OrderProposal, Side, TokenCount, canonical_bytes, content_hash,
+    ExactRatio, ExactNavEvidence,
 )
 
 HASH_A = "a" * 64
@@ -17,7 +18,9 @@ def account_view(account_id: str = "paper-test") -> AccountView:
         units=Decimal("10000"), nav=Decimal("1"), high_water_nav=Decimal("1"),
         day_open_nav=Decimal("1"), balances=(Balance("USD", Decimal("10000"), 10_000_000_000),),
         reconcile_id="test-reconcile", reconciled_at_us=1_000_000,
-        private_heartbeat_us=1_000_000, marked_at_us=1_000_000, ready=True)
+        private_heartbeat_us=1_000_000, marked_at_us=1_000_000, ready=True,
+        exact_nav=ExactNavEvidence(account_id,'test-mark',AccountRevision(),1,10_000_000_000,
+            ExactRatio('10000','1'),ExactRatio('1','1'),ExactRatio('1','1'),ExactRatio('1','1'),HASH_A))
 
 
 def order_proposal(account_id: str = "paper-test") -> OrderProposal:
