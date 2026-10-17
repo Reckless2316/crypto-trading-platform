@@ -434,6 +434,7 @@ class Ledger:
             (mark['marked_at_us'] if mark else None,2000000),
             (runtime['private_heartbeat_us'],5000000),
             (reconcile['finished_at_us'] if reconcile else None,15000000)))
+        ready=ready and self._valuation_sources_current(account_id,exact_row['evidence_id'],holdings,now)
         ready=ready and {b.asset:b.quantity for b in balances if b.asset!='USD' and b.quantity}=={h.base_asset:h.quantity for h in holdings}
         if state:ready=ready and state['day_start_us']==now//86400000000*86400000000
         baseline = tuple(decimal_value(mark[k]) for k in ('units','nav','high_water_nav','day_open_nav')) if mark else (Decimal(0),)*4
@@ -951,6 +952,39 @@ class Ledger:
         if current!='USD':raise ContractViolation('FX does not resolve USD')
         return value*1000000
 
+    def _valuation_sources_current(self, account_id: str, evidence_id: str,
+            holdings: tuple[Holding,...], now: int) -> bool:
+        """Age retained observations at admission, never at mark creation.
+
+        A flow mark carries the preflow valuation forward without observing new
+        depth, FX or private state. Follow that lineage to the actual observation.
+        Historical marks remain valid history after their inputs expire.
+        """
+        seen=set()
+        while evidence_id not in seen:
+            seen.add(evidence_id)
+            row=self.connection.execute('SELECT * FROM accounting_evidence WHERE evidence_id=? AND account_id=?',(evidence_id,account_id)).fetchone()
+            if row is None:return False
+            p=strict_json(row['payload_json'])
+            if row['kind']=='mark':break
+            if row['kind']!='flow':return False
+            prior=self.connection.execute('SELECT evidence_id FROM exact_marks WHERE mark_id=? AND account_id=?',(p.get('preflow_mark_id'),account_id)).fetchone()
+            if prior is None:return False
+            evidence_id=prior['evidence_id']
+        else:return False
+        heartbeat=p.get('heartbeat_at_us')
+        if not 0<=now-row['event_at_us']<=2_000_000 or type(heartbeat) is not int or not 0<=now-heartbeat<=5_000_000:
+            return False
+        for holding in holdings:
+            if not 0<=now-holding.valuation_at_us<=2_000_000:return False
+            book=p.get('books',{}).get(holding.base_asset)
+            if book is None:return False
+            quote=book.get('quote_asset','USD')
+            if quote!='USD':
+                try:self._fx(account_id,book.get('fx_id','missing-fx'),quote,Fraction(1),now)
+                except ContractViolation:return False
+        return True
+
     def _replay_economics(self, account_id: str, extra: tuple[str,dict,sqlite3.Row] | None = None):
         """Replay all acquisitions and disposals, including corrected old basis.
 
@@ -1262,7 +1296,7 @@ class Ledger:
                 # Incomplete liquidation must not invent zero values or authoritative
                 # loss marks. Preserve prior immutable mark and expose unready state.
                 return mark_id
-            ready=not _derived and current_fresh and not boundary_missing and not state['unresolved'] and equity>0
+            ready=not _derived and current_fresh and not boundary_missing and not state['unresolved'] and equity>0 and self._valuation_sources_current(account_id,evidence_id,tuple(holdings),now)
             if boundary_missing:
                 c.execute('INSERT OR IGNORE INTO accounting_findings VALUES (?,?,?,?,?)',('boundary-'+content_hash(evidence_id),account_id,evidence_id,'missing genuine UTC boundary valuation',now))
             reconcile=None
@@ -1310,13 +1344,22 @@ class Ledger:
             mark=c.execute('SELECT * FROM equity_marks WHERE mark_id=? AND account_id=?',(p['preflow_mark_id'],account_id)).fetchone()
             exact=c.execute('SELECT * FROM exact_marks WHERE mark_id=?',(p['preflow_mark_id'],)).fetchone()
             value=checked_money(p['usd_value_u']);fee=checked_money(p['fee_usd_u'])
-            if mark is None or exact is None or state['last_mark_id']!=mark['mark_id'] or not 0<=self._clock_us()-mark['marked_at_us']<=2_000_000 or (not state['closed'] and exact['journal_sequence']!=self._revision(account_id).journal_sequence):
+            if mark is None or exact is None or state['last_mark_id']!=mark['mark_id']:
                 self._finding(e,'transfer lacks current complete preflow valuation');return False
             authority=ExactNavEvidence.from_json(exact['exact_json']);old_units=authority.units.fraction()
             if state['closed']:
                 if value<=0:self._finding(e,'closed account requires positive redeposit');return False
+                # Closure retains its exact last positive NAV as the issuance
+                # baseline, not as current valuation/reconciliation proof. It
+                # cannot be refreshed while units are zero. Recovery instead
+                # requires a current verified transfer and stays unready.
+                if not 0<=self._clock_us()-e['event_at_us']<=2_000_000:
+                    self._finding(e,'closed account requires fresh redeposit evidence');return False
                 units=Fraction(value,1000000)/authority.nav.fraction();equity=value-fee;delta=units
             else:
+                holdings=tuple(Holding.from_dict(h) for h in strict_json(exact['holdings_json']))
+                if not 0<=self._clock_us()-mark['marked_at_us']<=2_000_000 or exact['journal_sequence']!=self._revision(account_id).journal_sequence or not self._valuation_sources_current(account_id,exact['evidence_id'],holdings,self._clock_us()):
+                    self._finding(e,'transfer lacks current complete preflow valuation');return False
                 before=mark['equity_usd_u'];equity=checked_money(before+value-fee)
                 if before+value<0 or equity<0:self._finding(e,'transfer exceeds liquidation equity');return False
                 delta=old_units*Fraction(value,before);units=old_units+delta

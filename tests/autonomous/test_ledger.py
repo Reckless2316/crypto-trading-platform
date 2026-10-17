@@ -137,8 +137,9 @@ class LedgerTests(unittest.TestCase):
         from bot.autonomous.contracts import ExactRatio, ExactNavEvidence
         exact=ExactNavEvidence('paper-test','mark',self.ledger._revision('paper-test'),0,10000000000,
             ExactRatio('10000','1'),ExactRatio('1','1'),ExactRatio('1','1'),ExactRatio('1','1'),HASH_A)
-        c.execute("INSERT INTO accounting_evidence VALUES ('fixture-mark','paper-test','mark','local-paper','{}',?,?,?,?,?)",
-            (content_hash({}),now,now,now,now))
+        fixture_observation={'heartbeat_at_us':now}
+        c.execute("INSERT INTO accounting_evidence VALUES ('fixture-mark','paper-test','mark','local-paper',?,?,?,?,?,?)",
+            (canonical_bytes(fixture_observation).decode(),content_hash(fixture_observation),now,now,now,now))
         c.execute("INSERT INTO exact_marks VALUES ('mark','paper-test','fixture-mark',?,'[]',0,'reconcile',1,?)",(exact.to_json(),now))
         limits = RiskLimits(armed=True,candidate_eligible=True,tokenizer_config_hash=HASH_A,calibration_config_hash=HASH_A)
         market = MarketRules('paper','AAVE-USD','AAVE','USD',Decimal('0.01'),Decimal('0.01'),Decimal('0.01'),Decimal('1'),Decimal('0.01'),2,HASH_A,now+100_000_000,True,True,now,10_000_000_000)
@@ -660,6 +661,150 @@ class AccountingTests(unittest.TestCase):
         pre=self.ledger.connection.execute('SELECT mark_id FROM equity_marks ORDER BY rowid DESC LIMIT 1').fetchone()[0]
         return self.ledger.record_flow(self.evidence(key,'flow',{'transfer_key':key,'asset':'USD',
             'quantity':str(Decimal(value)/1000000),'usd_value_u':value,'fee_usd_u':fee,'preflow_mark_id':pre}))
+
+    def wire_accounting_admission(self):
+        """Wire current paper risk inputs without replacing accounting evidence."""
+        from unittest.mock import patch
+        from bot.autonomous.contracts import MarketRules
+        with patch('tests.autonomous.test_ledger.time.time_ns',return_value=self.now*1000):
+            LedgerTests.seed(self,valid=True)
+        with self.ledger.transaction() as c:
+            c.execute("INSERT INTO candidate_results(decision_id,candidate_id,status,veto_codes_json,recorded_at_us) VALUES ('decision-test',1,'eligible','[]',?)",(self.now,))
+            c.execute("UPDATE account_control SET permit='entry',permit_epoch=1,lease_boot_id='test-boot',lease_deadline_mono_ns=100000000000,active_release_hash=?,version=version+1",(RELEASE_HASH,))
+        limits=RiskLimits(armed=True,candidate_eligible=True,tokenizer_config_hash=HASH_A,calibration_config_hash=HASH_A)
+        def market(_):
+            return MarketRules('paper','AAVE-USD','AAVE','USD',Decimal('.01'),Decimal('.01'),Decimal('.01'),Decimal('1'),Decimal('.01'),2,HASH_A,self.now+100000000,True,True,self.now,10000000000)
+        self.ledger.configure_risk_checks(limits=limits,market=market,
+            assess=lambda p,a,c,l,m,n:RiskVerdict(True,(),a.revision,content_hash(p)),
+            boot_id='test-boot',monotonic_ns=lambda:1)
+        p=order_proposal()
+        return dataclasses.replace(p,release_hash=RELEASE_HASH,
+            decision=dataclasses.replace(p.decision,release_hash=RELEASE_HASH),
+            control_epoch=1,deadline_mono_ns=100000000000)
+
+    def near_expiry_held_mark(self, source):
+        self.initialize(extra=({'asset':'OTHER','quantity':'1','basis_usd_u':1000000},))
+        observed=self.now
+        book={'at_us':observed,'bids':[['1','1']]}
+        if source=='fx':
+            book.update(quote_asset='USDC',fx_id=self.evidence('held-fx','fx',
+                {'legs':[{'from_asset':'USDC','to_asset':'USD','to_units_per_from_unit':'1'}]}))
+        self.mark('held-opening',books={'OTHER':book})
+        self.now+=1900000
+        if source=='fx':book['at_us']=self.now
+        self.mark('held-near-expiry',books={'OTHER':book})
+        return self.wire_accounting_admission()
+
+    def test_held_book_and_fx_expire_independently_of_mark_for_readiness(self):
+        for source in ('book','fx'):
+            with self.subTest(source=source):
+                if source=='fx':self.tearDown();self.setUp()
+                self.near_expiry_held_mark(source)
+                self.assertTrue(self.ledger.account_view('paper-test').ready)
+                self.now+=200000
+                view=self.ledger.account_view('paper-test')
+                self.assertEqual(200000,self.now-view.marked_at_us)
+                self.assertFalse(view.ready,'retained held '+source+' is older than two seconds')
+
+    def test_held_book_and_fx_expiry_refuses_new_reservation(self):
+        for source in ('book','fx'):
+            with self.subTest(source=source):
+                if source=='fx':self.tearDown();self.setUp()
+                p=self.near_expiry_held_mark(source)
+                self.now+=200000
+                view=self.ledger.account_view('paper-test')
+                with self.assertRaises(ContractViolation):
+                    self.ledger.reserve_intent(p,view.revision,0,p.decision)
+                self.assertEqual(0,self.ledger.connection.execute('SELECT count(*) FROM order_intents').fetchone()[0])
+
+    def test_committed_reservation_rechecks_held_book_and_fx_at_dispatch(self):
+        for source in ('book','fx'):
+            with self.subTest(source=source):
+                if source=='fx':self.tearDown();self.setUp()
+                p=self.near_expiry_held_mark(source)
+                view=self.ledger.account_view('paper-test')
+                prepared=self.ledger.reserve_intent(p,view.revision,0,p.decision)
+                self.assertFalse(self.ledger.connection.in_transaction)
+                self.now+=200000
+                with self.assertRaises(ContractViolation):
+                    self.ledger.mark_dispatching(prepared.intent_id,0)
+                self.assertEqual('reserved',self.ledger.connection.execute('SELECT state FROM order_intents').fetchone()[0])
+
+    def test_current_accounting_mark_rebinds_only_non_economic_revisions(self):
+        self.initialize()
+        p=self.wire_accounting_admission()
+        before=self.ledger.account_view('paper-test')
+        prepared=self.ledger.reserve_intent(p,before.revision,0,p.decision)
+        reserved=self.ledger.account_view('paper-test')
+        self.assertTrue(reserved.ready)
+        self.assertNotEqual(before.revision,reserved.revision)
+        self.assertEqual(before.exact_nav.mark_id,reserved.exact_nav.mark_id)
+        self.assertEqual(reserved.revision,reserved.exact_nav.revision)
+        self.assertEqual(IntentState.DISPATCHING,self.ledger.mark_dispatching(prepared.intent_id,0).state)
+        self.assertTrue(self.flow('economic-change',1000000))
+        self.assertFalse(self.ledger.account_view('paper-test').ready)
+
+    def test_open_flow_cannot_refresh_expired_held_valuation_sources(self):
+        for source in ('book','fx'):
+            with self.subTest(source=source):
+                if source=='fx':self.tearDown();self.setUp()
+                self.near_expiry_held_mark(source)
+                self.now+=200000
+                self.assertFalse(self.flow('stale-held-flow',1000000))
+                self.assertEqual(0,self.ledger.connection.execute('SELECT count(*) FROM external_flows').fetchone()[0])
+
+    def test_delayed_mark_application_cannot_refresh_held_book_or_fx(self):
+        for source in ('book','fx'):
+            with self.subTest(source=source):
+                if source=='fx':self.tearDown();self.setUp()
+                self.near_expiry_held_mark(source)
+                row=self.ledger.connection.execute("SELECT payload_json FROM accounting_evidence WHERE evidence_id='held-near-expiry'").fetchone()
+                from bot.autonomous.contracts import strict_json
+                evidence=self.evidence('delayed-mark','mark',strict_json(row[0]))
+                self.now+=200000
+                mark=self.ledger.record_mark(evidence)
+                self.assertEqual(0,self.ledger.connection.execute('SELECT ready FROM exact_marks WHERE mark_id=?',(mark,)).fetchone()[0])
+
+    def test_delayed_closed_redeposit_preserves_exact_loss_history_and_requires_new_mark(self):
+        from fractions import Fraction
+        self.initialize()
+        self.assertTrue(self.flow('loss',1000000,1500150000))
+        self.mark('preclosure-loss')
+        before=self.ledger.account_view('paper-test').exact_nav
+        self.assertEqual(Fraction(85),before.nav.fraction())
+        with self.ledger.transaction() as c:
+            c.execute('UPDATE account_control SET crisis_halted=1,hard_killed=1')
+        self.assertTrue(self.flow('close',-8500850000))
+        self.now+=2000001
+        self.mark('closed-account-cannot-refresh-zero-units')
+        self.ledger.close();self.ledger=load_ledger().open(self.path)
+        self.ledger._clock_us=lambda:self.now
+        self.assertTrue(self.flow('delayed-redeposit',5000000000))
+        view=self.ledger.account_view('paper-test')
+        self.assertFalse(view.ready)
+        self.assertEqual(Fraction(1000,17),view.exact_nav.units.fraction())
+        self.assertEqual((before.nav,before.high_water_nav,before.day_open_nav),
+            (view.exact_nav.nav,view.exact_nav.high_water_nav,view.exact_nav.day_open_nav))
+        self.mark('current-reopened-reconciliation')
+        self.assertTrue(self.ledger.account_view('paper-test').ready)
+        self.assertEqual((1,1,1,1,'none'),tuple(self.ledger.connection.execute(
+            'SELECT drawdown_latched,daily_halted,crisis_halted,hard_killed,permit FROM account_control').fetchone()))
+        self.ledger.close();self.ledger=load_ledger().open(self.path)
+        self.ledger._clock_us=lambda:self.now
+        self.assertEqual(Fraction(1000,17),self.ledger.account_view('paper-test').exact_nav.units.fraction())
+
+    def test_closed_redeposit_requires_fresh_transfer_not_fresh_preclosure_mark(self):
+        self.initialize()
+        self.assertTrue(self.flow('close',-10000000000))
+        pre=self.ledger.connection.execute('SELECT last_mark_id FROM accounting_state').fetchone()[0]
+        evidence=self.evidence('stale-redeposit','flow',{'transfer_key':'stale-redeposit','asset':'USD',
+            'quantity':'5000','usd_value_u':5000000000,'fee_usd_u':0,'preflow_mark_id':pre})
+        self.now+=2000001
+        self.assertFalse(self.ledger.record_flow(evidence))
+        self.assertEqual((1,1),tuple(self.ledger.connection.execute('SELECT closed,unresolved FROM accounting_state').fetchone()))
+        self.assertTrue(self.flow('fresh-redeposit',5000000000))
+        self.mark('fresh-after-redeposit')
+        self.assertFalse(self.ledger.account_view('paper-test').ready,'existing review incident must survive redeposit')
 
     def intent(self,key,side='buy',quantity='10',price='100'):
         from bot.autonomous.contracts import Side
