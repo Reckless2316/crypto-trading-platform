@@ -1,0 +1,571 @@
+Empty search results
+No results were found for the provided queries--------------------------------------------------------------------------------
+Answers and responses - TypeSafe (https://docs.typesafe.ai/sdk/python/api/types/responses)
+citeturn28view0 [wordlim: 200] Crawled: today; Content type: text/html; Source: find({"ref_id":"https://docs.typesafe.ai/sdk/python/api/types/responses","pattern":"request_id"}); Total lines: 1294
+L305:             },
+L306:             "oneOf": [
+L307:               {
+L308:                 "$ref": "#/$defs/NoulAnswer"
+L309:               },
+L310:               {
+L311:                 "$ref": "#/$defs/ChoiceAnswer"
+L312:               },
+L313:               {
+L314:                 "$ref": "#/$defs/ScoreAnswer"
+L315:               },
+L316:               {
+L317:                 "$ref": "#/$defs/BoxAnswer"
+L318:               }
+L319:             ]
+L320:           },
+L321:           "title": "Answers",
+L322:           "type": "object"
+L323:         }
+L324:       },
+L325:       "required": [
+L326:         "model",
+L327:         "usage"
+L328:       ],
+L329:       "title": "SystemOneResponse",
+L330:       "type": "object"
+L331:     }
+L332:     `
+L333: Config:
+L334: 
+L335:   * `extra`: `ignore`
+L336:   * `frozen`: `True`
+L337:   * `strict`: `True`
+L338: Fields:
+L339: 
+L340:   * `cite6†model ` (`cite7†str†docs.python.org `)
+L341:   * `cite8†usage ` (`cite9†Usage `)
+L342:   * `cite10†answers ` (`cite11†dict†docs.python.org [cite7†str†docs.python.org , cite12†Answer ]`)
+L343: ###
+L344: 
+L345: cite13†​ L346: 
+L347: request_id
+L348: 
+L349: `cached` `property` The `x-typesafe-request-id` response header.
+L350: 
+L351: ###
+L352: 
+L353: cite14†​ L354: 
+L355: raw_http_response
+L356: 
+L357: `property`
+L358: 
+L359:     `raw_http_response: httpx2.Response
+L360:     `
+L361: 
+L362: The underlying `httpx2.Response`, exposing status, headers, and body.
+L363: 
+L364: ###
+L365: 
+L366: cite15†​ L367: 
+L368: model_config
+L369: 
+L370: `class-attribute` `instance-attribute`
+L371: 
+L372:     `model_config = ConfigDict(
+L373:         extra="ignore", frozen=True, strict=True
+L374:     )
+L375:     `
+L376: 
+L377: ###
+L378: 
+L379: cite6†​ L380: 
+L381: model
+L382: 
+L383: `pydantic-field` The model used to answer the request.
+L384: ###
+L385: 
+L386: cite8†​ L387: 
+L388: usage
+L389: 
+L390: `pydantic-field` Token usage for the request.
+L391: 
+L392: ###
+L393: 
+L394: cite10†​ L395: 
+L396: answers
+L397: 
+L398: `pydantic-field` All answer objects keyed by question name.
+L399: 
+L400: ###
+L401: 
+L402: cite16†​ L403: 
+L404: nouls
+L405: 
+L406: `cached` `property` Yes/no answers keyed by question name.
+L407: 
+L408: ###
+L409: 
+L410: cite17†​ L411: 
+L412: choices
+L413: 
+L414: `cached` `property` Choice answers keyed by question name.
+L415: 
+L416: ###
+L417: 
+L418: cite18†​ L419: 
+L420: scores
+L421: 
+L422: `cached` `property` Score answers keyed by question name.
+L423: 
+L424: ###
+L425: 
+L426: cite19†​ L427: 
+L428: boxes
+L429: 
+L430: `cached` `property` Box answers keyed by question name.
+L431: ##
+L432: 
+L433: cite9†​ L434: 
+L435: typesafe_sdk.Usage
+L436: 
+L437: `pydantic-model` Bases: `wire.Usage` Token counts for a request, when reported by the API.
+L438: 
+L439: Show JSON schema:
+L440: Details
+L441: 
+L442:     `{
+L443:       "description": "Token counts for a request, when reported by the API.",
+L444:       "properties": {
+L445:         "input_tokens": {
+L446:           "anyOf": [
+L447:             {
+L448:               "type": "integer"
+L449:             },
+L450:             {
+L451:               "type": "null"
+L452:             }
+L453:           ],
+L454:           "default": null,
+L455:           "title": "Input Tokens"
+L456:         },
+L457:         "output_tokens": {
+L458:           "anyOf": [
+L459:             {
+L460:               "type": "integer"
+L461:             },
+L462:             {
+L463:               "type": "null"
+L464:             }
+L465:           ],
+L466:           "default": null,
+L467:           "title": "Output Tokens"
+L468:         }
+L469:       },
+L470:       "title": "Usage",
+L471:       "type": "object"
+L472:     }
+L473:     `
+L1078: Details
+L1079: 
+L1080:     `{
+L1081:       "$defs": {
+L1082:         "ModelMetadata": {
+L1083:           "description": "Metadata describing a single available model.",
+L1084:           "properties": {
+L1085:             "name": {
+L1086:               "title": "Name",
+L1087:               "type": "string"
+L1088:             },
+L1089:             "description": {
+L1090:               "title": "Description",
+L1091:               "type": "string"
+L1092:             },
+L1093:             "release_date": {
+L1094:               "title": "Release Date",
+L1095:               "type": "string"
+L1096:             }
+L1097:           },
+L1098:           "required": [
+L1099:             "name",
+L1100:             "description",
+L1101:             "release_date"
+L1102:           ],
+L1103:           "title": "ModelMetadata",
+L1104:           "type": "object"
+L1105:         }
+L1106:       },
+L1107:       "description": "The models available to the account.",
+L1108:       "properties": {
+L1109:         "models": {
+L1110:           "items": {
+L1111:             "$ref": "#/$defs/ModelMetadata"
+L1112:           },
+L1113:           "title": "Models",
+L1114:           "type": "array"
+L1115:         }
+L1116:       },
+L1117:       "required": [
+L1118:         "models"
+L1119:       ],
+L1120:       "title": "ListModelsResponse",
+L1121:       "type": "object"
+L1122:     }
+L1123:     `
+L1124: Fields:
+L1125: 
+L1126:   * `cite58†models ` (`cite59†tuple†docs.python.org [cite60†ModelMetadata , …]`)
+L1127: ###
+L1128: 
+L1129: cite61†​ L1130: 
+L1131: request_id
+L1132: 
+L1133: `cached` `property` The `x-typesafe-request-id` response header.
+L1134: 
+L1135: ###
+L1136: 
+L1137: cite62†​ L1138: 
+L1139: raw_http_response
+L1140: 
+L1141: `property`
+L1142: 
+L1143:     `raw_http_response: httpx2.Response
+L1144:     `
+L1145: 
+L1146: The underlying `httpx2.Response`, exposing status, headers, and body.
+L1147: 
+L1148: ###
+L1149: 
+L1150: cite63†​ L1151: 
+L1152: model_config
+L1153: 
+L1154: `class-attribute` `instance-attribute`
+L1155: 
+L1156:     `model_config = ConfigDict(
+L1157:         extra="ignore", frozen=True, strict=True
+L1158:     )
+L1159:     `
+L1160: 
+L1161: ###
+L1162: 
+L1163: cite58†​ L1164: 
+L1165: models
+L1166: 
+L1167: `pydantic-field` The available models.
+L1168: ##
+L1169: 
+L1170: cite60†​ L1171: 
+L1172: typesafe_sdk.ModelMetadata
+L1173: 
+L1174: `pydantic-model` Bases: `Schema` Metadata describing a single available model.
+L1175: 
+L1176: Show JSON schema:
+L1177: Details
+L1178: 
+L1179:     `{
+L1180:       "description": "Metadata describing a single available model.",
+L1181:       "properties": {
+L1182:         "name": {
+L1183:           "title": "Name",
+L1184:           "type": "string"
+L1185:         },
+L1186:         "description": {
+L1187:           "title": "Description",
+L1188:           "type": "string"
+L1189:         },
+L1190:         "release_date": {
+L1191:           "title": "Release Date",
+L1192:           "type": "string"
+L1193:         }
+L1194:       },
+L1195:       "required": [
+L1196:         "name",
+L1197:         "description",
+L1198:         "release_date"
+L1199:       ],
+L1200:       "title": "ModelMetadata",
+L1201:       "type": "object"
+L1202:     }
+L1203:     `
+L1204: Fields:
+L1205: 
+L1206:   * `cite64†name ` (`cite7†str†docs.python.org `)
+L1207:   * `cite65†description ` (`cite7†str†docs.python.org `)
+L1208:   * `cite66†release_date ` (`cite7†str†docs.python.org `)
+L1209: ###
+L1210: 
+L1211: cite64†​ L1212: 
+L1213: name
+L1214: 
+L1215: `pydantic-field` Model name or alias accepted by a request’s model field.
+L1216: 
+L1217: ###
+L1218: 
+L1219: cite65†​ L1220: 
+L1221: description
+L1222: 
+L1223: `pydantic-field` Human-readable description of the model and its capabilities.
+L1224: ###
+L1225: 
+L1226: cite66†​ L1227: 
+L1228: release_date
+L1229: 
+L1230: `pydantic-field` Model release date, formatted as YYYY-MM-DD.
+L1231: 
+L1232: Was this page helpful?
+L1233: 
+L1234: Yes No
+L1235: 
+L1236: cite67†Assets Previous cite68†Retries Next L1237: 
+L1238: cite69†github†github.com cite70†discord†discord.gg cite71†x†x.com L1239: 
+L1240: cite72†Powered byThis documentation is built and hosted on Mintlify, a developer documentation platform†www.mintlify.com L1241: ## [Button: On this page]
+L1242:   * cite3†Response L1243:   * cite4†typesafe_sdk.SystemOneResponse L1244:     * cite13†request_id L1245:     * cite14†raw_http_response L1246:     * cite15†model_config L1247:     * cite6†model L1248:     * cite8†usage L1249:     * cite10†answers L1250:     * cite16†nouls L1251:     * cite17†choices L1252:     * cite18†scores L1253:     * cite19†boxes L1254:   * cite9†typesafe_sdk.Usage L1255:     * cite23†model_config L1256:     * cite20†input_tokens L1257:     * cite22†output_tokens L1258:   * cite24†Answers L1259:   * cite25†typesafe_sdk.NoulAnswer L1260:     * cite27†noul L1261:     * cite30†model_config L1262:   * cite31†typesafe_sdk.ChoiceAnswer L1263:     * cite33†choice L1264:     * cite34†confidence L1265:     * cite35†probabilities L1266:     * cite36†model_config L1267:   * cite37†typesafe_sdk.ScoreAnswer L1268:     * cite39†score L1269:     * cite40†confidence L1270:     * cite45†model_config L1271:     * cite41†legend L1272:     * cite44†probabilities L1273:   * cite46†typesafe_sdk.BoxAnswer L1274:     * cite50†model_config L1275:     * cite47†box L1276:     * cite49†confidence L1277:   * cite48†typesafe_sdk.BoxCoordinates L1278:     * cite51†top L1279:     * cite52†bottom L1280:     * cite53†left L1281:     * cite54†right L1282:     * cite55†model_config L1283:   * cite12†typesafe_sdk.Answer L1284:   * cite56†Available models L1285:   * cite57†typesafe_sdk.ListModelsResponse L1286:     * cite61†request_id L1287:     * cite62†raw_http_response L1288:     * cite63†model_config L1289:     * cite58†models L1290:   * cite60†typesafe_sdk.ModelMetadata L1291:     * cite64†name L1292:     * cite65†description L1293:     * cite66†release_date --------------------------------------------------------------------------------
+ (https://docs.typesafe.ai/llms.txt)
+citeturn28view1 [wordlim: 200] Crawled: today; Content type: text/plain; Source: find({"ref_id":"https://docs.typesafe.ai/llms.txt","pattern":"token"}); Total lines: 133
+L50: - [Legal](https://docs.typesafe.ai/legal.md): Legal documents and policies for TypeSafe.
+L51: - [Jev 1.13 jaggedness](https://docs.typesafe.ai/model-jaggedness/jev-1.13.md): Jev isn't perfect. Here are some jagged edges we are aware of with jev-1.13. Many of these will be fixed in later versions.
+L52: - [Client SDKs](https://docs.typesafe.ai/sdk.md): Install a TypeSafe client SDK and use typed questions and answers in your application.
+L53: - [TypeSafe Python SDK](https://docs.typesafe.ai/sdk/python.md): Install the TypeSafe Python SDK and get started with asynchronous or synchronous API calls.
+L54: - [Basic usage](https://docs.typesafe.ai/sdk/python/usage/basic.md): Guides and patterns for working with the TypeSafe Python SDK.
+L55: - [Advanced usage](https://docs.typesafe.ai/sdk/python/usage/advanced.md): Performance tuning, logging, and forward compatibility for the TypeSafe Python SDK.
+L56: - [Changelog](https://docs.typesafe.ai/sdk/python/changelog.md): Python clients for the TypeSafe AI API
+L57: - [API reference](https://docs.typesafe.ai/sdk/python/api.md): Python clients for the TypeSafe AI API
+L58: - [Asynchronous client](https://docs.typesafe.ai/sdk/python/api/clients/async.md): Use AsyncTypeSafeClient to ask questions, list models, and configure asynchronous TypeSafe API requests.
+L59: - [Synchronous client](https://docs.typesafe.ai/sdk/python/api/clients/sync.md): Use TypeSafeClient to ask questions, list models, and configure synchronous TypeSafe API requests.
+L60: - [Questions](https://docs.typesafe.ai/sdk/python/api/types/questions.md): Provide state and ask yes/no, choice, and score questions using objects or dictionaries.
+L61: - [Assets](https://docs.typesafe.ai/sdk/python/api/types/assets.md): Attach assets to System One requests and reference them from request content.
+L62: - [Answers and responses](https://docs.typesafe.ai/sdk/python/api/types/responses.md): Read answers, confidence scores, token usage, and available models returned by the TypeSafe API.
+L63: - [Retries](https://docs.typesafe.ai/sdk/python/api/retries.md): Configure retries with RetryPolicy — attempt count, retryable statuses, backoff, and retry headers handling.
+L64: - [Common types](https://docs.typesafe.ai/sdk/python/api/types/common.md): Common types for TypeSafe API SDK.
+L65: - [Exceptions](https://docs.typesafe.ai/sdk/python/api/exceptions.md): Handle TypeSafe API errors, rate limits, connection failures, and timeouts.
+L66: - [Constants](https://docs.typesafe.ai/sdk/python/api/constants.md): Default settings and environment variable names for the TypeSafe Python SDK.
+L67: - [JavaScript SDK](https://docs.typesafe.ai/sdk/javascript.md)
+L68: - [Changelog](https://docs.typesafe.ai/sdk/javascript/changelog.md)
+L69: - [API reference](https://docs.typesafe.ai/sdk/javascript/api.md)
+L70: - [Class: APIConnectionError](https://docs.typesafe.ai/sdk/javascript/api/classes/APIConnectionError.md)
+L71: - [Class: APIError](https://docs.typesafe.ai/sdk/javascript/api/classes/APIError.md)
+L72: - [Class: APIPromise<T>](https://docs.typesafe.ai/sdk/javascript/api/classes/APIPromise.md)
+L73: - [Class: APITimeoutError](https://docs.typesafe.ai/sdk/javascript/api/classes/APITimeoutError.md)
+L74: - [Class: APIUserAbortError](https://docs.typesafe.ai/sdk/javascript/api/classes/APIUserAbortError.md)
+L75: - [Class: AuthenticationError](https://docs.typesafe.ai/sdk/javascript/api/classes/AuthenticationError.md)
+L76: - [Class: BadRequestError](https://docs.typesafe.ai/sdk/javascript/api/classes/BadRequestError.md)
+L77: - [Class: Image](https://docs.typesafe.ai/sdk/javascript/api/classes/Image.md)
+L78: - [Class: InternalServerError](https://docs.typesafe.ai/sdk/javascript/api/classes/InternalServerError.md)
+L79: - [Class: NotFoundError](https://docs.typesafe.ai/sdk/javascript/api/classes/NotFoundError.md)
+L80: - [Class: PermissionDeniedError](https://docs.typesafe.ai/sdk/javascript/api/classes/PermissionDeniedError.md)
+L81: - [Class: RateLimitError](https://docs.typesafe.ai/sdk/javascript/api/classes/RateLimitError.md)
+L82: - [Class: TypeSafeClient](https://docs.typesafe.ai/sdk/javascript/api/classes/TypeSafeClient.md)
+L83: - [Class: TypeSafeError](https://docs.typesafe.ai/sdk/javascript/api/classes/TypeSafeError.md)
+L84: - [Class: UnprocessableEntityError](https://docs.typesafe.ai/sdk/javascript/api/classes/UnprocessableEntityError.md)
+L85: - [Interface: BoxCoordinates](https://docs.typesafe.ai/sdk/javascript/api/interfaces/BoxCoordinates.md)
+L86: - [Interface: BoxQuestion](https://docs.typesafe.ai/sdk/javascript/api/interfaces/BoxQuestion.md)
+L87: - [Interface: BoxResponse](https://docs.typesafe.ai/sdk/javascript/api/interfaces/BoxResponse.md)
+L88: - [Interface: ChoiceQuestion<T>](https://docs.typesafe.ai/sdk/javascript/api/interfaces/ChoiceQuestion.md)
+L89: - [Interface: ChoiceResponse<T>](https://docs.typesafe.ai/sdk/javascript/api/interfaces/ChoiceResponse.md)
+L90: - [Interface: Logger](https://docs.typesafe.ai/sdk/javascript/api/interfaces/Logger.md)
+L91: - [Interface: ModelCard](https://docs.typesafe.ai/sdk/javascript/api/interfaces/ModelCard.md)
+L92: - [Interface: Models](https://docs.typesafe.ai/sdk/javascript/api/interfaces/Models.md)
+L93: - [Interface: NoulQuestion](https://docs.typesafe.ai/sdk/javascript/api/interfaces/NoulQuestion.md)
+L94: - [Interface: NoulResponse](https://docs.typesafe.ai/sdk/javascript/api/interfaces/NoulResponse.md)
+L95: - [Interface: Questions](https://docs.typesafe.ai/sdk/javascript/api/interfaces/Questions.md)
+L96: - [Interface: RequestOptions](https://docs.typesafe.ai/sdk/javascript/api/interfaces/RequestOptions.md)
+L97: - [Interface: RetryPolicy](https://docs.typesafe.ai/sdk/javascript/api/interfaces/RetryPolicy.md)
+L98: - [Interface: ScoreQuestion<T>](https://docs.typesafe.ai/sdk/javascript/api/interfaces/ScoreQuestion.md)
+L99: - [Interface: ScoreResponse<T>](https://docs.typesafe.ai/sdk/javascript/api/interfaces/ScoreResponse.md)
+L100: - [Interface: SystemOneRequest<Q>](https://docs.typesafe.ai/sdk/javascript/api/interfaces/SystemOneRequest.md)
+L101: - [Interface: SystemOneResult<Q>](https://docs.typesafe.ai/sdk/javascript/api/interfaces/SystemOneResult.md)
+L102: - [Interface: TextWithAssets](https://docs.typesafe.ai/sdk/javascript/api/interfaces/TextWithAssets.md)
+L103: - [Interface: TypeSafeClientConfig](https://docs.typesafe.ai/sdk/javascript/api/interfaces/TypeSafeClientConfig.md)
+--------------------------------------------------------------------------------
+Asynchronous client - TypeSafe (https://docs.typesafe.ai/sdk/python/api/clients/async)
+citeturn28view2 [wordlim: 200] Crawled: today; Content type: text/html; Source: find({"ref_id":"https://docs.typesafe.ai/sdk/python/api/clients/async","pattern":"system_one"}); Total lines: 243
+L38:   * `retry` (`cite6†RetryPolicy | None`, default: `None` ) – A `RetryPolicy` controlling retry behavior; see `RetryPolicy` for the available options and their defaults. Pass `RetryPolicy(max_retries=0)` to disable retries.
+L39:   * `timeout` (`cite7†float†docs.python.org | httpx2.Timeout | None`, default: `None` ) – Timeout for HTTP operations. Inherits `http_client.timeout` when supplied, otherwise the SDK default.
+L40:   * `headers` (`cite8†Mapping†docs.python.org [cite5†str†docs.python.org , cite5†str†docs.python.org ] | None`, default: `None` ) – Additional request headers to set.
+L41:   * `transport` (`httpx2.AsyncBaseTransport | None`, default: `None` ) – Optional custom HTTP transport, closed when this SDK client closes.
+L42:   * `http_client` (`httpx2.cite9†AsyncClient†pydantic.dev | None`, default: `None` ) – Optional `httpx2.AsyncClient`; mutually exclusive with `transport`. Closed when this SDK client closes.
+L43:   * `base_url` (`cite5†str†docs.python.org | None`, default: `None` ) – API root; may be set via the `TYPESAFE_BASE_URL` environment variable.
+L44:   * `compression` (`cite10†Literal†docs.python.org [‘zstd’, False] | None`, default: `None` ) – Request body compression: `"zstd"`, or `False` to send bodies uncompressed. Defaults to zstd cite11†when available .
+L45: Raises:
+L46:   * `cite12†TypeSafeError ` – The API key is missing or invalid, the timeout is invalid, or zstd compression is unavailable.
+L47:   * `cite13†ValueError†docs.python.org ` – Both `transport` and `http_client` are supplied.
+L48: Examples:
+L49: 
+L50:     `import asyncio
+L51: 
+L52:     from typesafe_sdk import AsyncTypeSafeClient, Choice, Noul
+L53: 
+L54: 
+L55:     async def main() -> None:
+L56:         async with AsyncTypeSafeClient() as client:
+L57:             result = await client.system_one(
+L58:                 state="I was charged twice. Please help.",
+L59:                 questions={
+L60:                     "billing": Noul(instructions="Is this about billing?"),
+L61:                     "tone": Choice(
+L62:                         instructions="What is the tone?",
+L63:                         criteria={"calm": None, "angry": None},
+L64:                     ),
+L65:                 },
+L66:             )
+L67:             assert 0 <= result.nouls["billing"].noul <= 1
+L68:             assert result.choices["tone"].choice in {"calm", "angry"}
+L69: 
+L70: 
+L71:     asyncio.run(main())
+L72:     `
+L73: ###
+L74: 
+L75: cite14†​ L76: 
+L77: models
+L78: 
+L79: `cached` `property` An accessor for the Models API resource. Examples:
+L80: 
+L81:     `async def main() -> None:
+L82:         async with AsyncTypeSafeClient() as client:
+L83:             models = await client.models.list()
+L84:     `
+L85: ###
+L86: 
+L87: cite15†​ L88: 
+L89: attach_assets
+L90: 
+L91: Attach assets to calls made within a `with` block, for referencing them inside strings. Until the block exits, calls on this client send each attached asset whose reference, `str(asset)`, appears in the request.
+L92: 
+L93: Warning The SDK only recognizes references to assets that are attached, passed in `assets`, or placed directly in the content. A reference to any other asset is sent as plain text, without the asset.
+L94: 
+L95: Parameters:
+L96:   * `assets` (`cite16†Asset | cite17†Sequence†docs.python.org [cite16†Asset ]`) – An asset, or a sequence of them.
+L97: Raises:
+L98:   * `cite12†TypeSafeError ` – An attached value is not an asset.
+L99: Examples:
+L100: 
+L101:     `from pathlib import Path
+L102: 
+L103:     from typesafe_sdk import AsyncTypeSafeClient, Image, Noul, SystemOneResponse
+L104: 
+L105: 
+L106:     async def inspect(client: AsyncTypeSafeClient, path: Path) -> SystemOneResponse:
+L107:         photo = Image(path)
+L108:         with client.attach_assets(photo):
+L109:             return await client.system_one(
+L110:                 state=f"Product: {photo}",
+L111:                 questions={"damaged": Noul(instructions="Is the product damaged?")},
+L112:             )
+L113:     `
+L114: ###
+L115: 
+L116: cite18†​ L117: 
+L118: system_one
+L119: 
+L120: `async`
+L121: 
+L122:   * Implementation
+L123: 
+L124:   * Overload 1
+L125: 
+L126:   * Overload 2
+L127: 
+L128: Answer named questions about text, structured state, or assets. See cite19†System One for details. Parameters:
+L129:   * `state` (`cite20†Content `) – Text, an asset, a JSON object, or an array to evaluate. See cite21†state for details.
+L130:   * `questions` (`cite8†Mapping†docs.python.org [cite5†str†docs.python.org , cite22†Question ]`) – Nonempty mapping of names to question objects or raw dictionaries.
+L131:   * `model` (`cite5†str†docs.python.org | None`, default: `None` ) – Model override; `None` inherits the client default.
+L132:   * `assets` (`cite8†Mapping†docs.python.org [cite5†str†docs.python.org , cite16†Asset ] | None`, default: `None` ) – Assets keyed by the reference used for them in `state` or questions; see cite23†Attaching media assets .
+L133:   * `retry` (`cite6†RetryPolicy | None`, default: `None` ) – An optional retry policy to override the client-level value for this call only.
+L134:   * `timeout` (`cite7†float†docs.python.org | httpx2.Timeout | None`, default: `None` ) – An optional timeout for http operations to override the client-level value for this call only, in seconds.
+L135:   * `extra_headers` (`cite8†Mapping†docs.python.org [cite5†str†docs.python.org , cite5†str†docs.python.org ] | None`, default: `None` ) – Additional request headers to set.
+L136:   * `extra_body` (`cite8†Mapping†docs.python.org [cite5†str†docs.python.org , cite24†JSONValue | None] | None`, default: `None` ) – Additional top-level request-body fields, shallow-merged over the body after `state`, `model`, `questions`, and `assets` are set. Merging is last-write-wins: a key that collides with those fields overrides it, and object values are replaced rather than deep-merged.
+L137:   * `response_model` (`cite25†type†docs.python.org [ResponseT] | None`, default: `None` ) – Optional Pydantic `BaseModel` type describing the JSON response body, including any nested answer models.
+L138: Returns:
+L139:   * `cite26†SystemOneResponse | ResponseT` – An instance of `response_model`, or `SystemOneResponse` with answers keyed by question
+L140:   * `cite26†SystemOneResponse | ResponseT` – name and model and token usage details when no custom model is supplied.
+L141: Raises:
+L142:   * `cite12†TypeSafeError ` – The request is invalid before it’s sent, such as empty questions or an unreadable asset.
+L143:   * `cite27†TypeSafeAPIError ` – The server returns an unsuccessful HTTP response after any retries.
+L144:   * `cite28†TypeSafeAPIConnectionError ` – The request cannot connect or times out after any retries.
+L145:   * `cite29†TypeSafeAPIResponseValidationError ` – The response body does not match the response model.
+L146: Examples: Create questions with named arguments:
+L147: 
+L148:     `async def main() -> None:
+L149:         async with AsyncTypeSafeClient() as client:
+L150:             result = await client.system_one(
+L151:                 state="I was charged twice. Please help.",
+L152:                 questions={
+L153:                     "billing": Noul(instructions="Is this about billing?"),
+L154:                     "tone": Choice(
+L155:                         instructions="What is the tone?",
+L156:                         criteria={"calm": None, "angry": None},
+L157:                     ),
+L158:                 },
+L159:             )
+L160:             assert 0 <= result.nouls["billing"].noul <= 1
+L161:             assert result.choices["tone"].choice in {"calm", "angry"}
+L162:     `
+L163: Pass questions as dictionaries:
+L164: 
+L165:     `async def main() -> None:
+L166:         async with AsyncTypeSafeClient() as client:
+L167:             result = await client.system_one(
+L168:                 state={"message": "I was charged twice. Please help."},
+L169:                 questions={
+L170:                     "billing": {"type": "noul", "instructions": "Is this about billing?"},
+L171:                     "tone": {
+L172:                         "type": "choice",
+L173:                         "instructions": "What is the tone?",
+L174:                         "criteria": {"calm": None, "angry": None},
+L175:                     },
+L176:                 },
+L177:             )
+L178:             assert 0 <= result.nouls["billing"].noul <= 1
+L179:             assert result.choices["tone"].choice in {"calm", "angry"}
+L180:     `
+L181: ###
+L182: 
+L183: cite30†​ L184: 
+L185: aclose
+L186: 
+L187: `async`
+L188: 
+L189:     `aclose() -> None
+L190:     `
+L191: 
+L192: Release network resources and close the underlying HTTP client, including a supplied one.
+L193: 
+L194: ##
+L195: 
+L196: cite31†​ L197: 
+L198: Models resource
+L199: 
+L200: Reached through cite14†`AsyncTypeSafeClient.models` .
+L201: 
+L202: ###
+L203: 
+L204: cite32†​ L205: 
+L206: typesafe_sdk.AsyncModels
+L207: 
+L208: Access to the models available to the account, reached through `AsyncTypeSafeClient.models`.
+L209: ####
+L210: 
+L211: cite33†​ L212: 
+L213: list
+L214: 
+L215: `async` List the models available to the account. Parameters:
+L216:   * `retry` (`cite6†RetryPolicy | None`, default: `None` ) – An optional retry policy to override the client-level value for this call only.
+L217:   * `timeout` (`cite7†float†docs.python.org | httpx2.Timeout | None`, default: `None` ) – Per-operation timeout override; `None` inherits the client setting.
+L218:   * `extra_headers` (`cite8†Mapping†docs.python.org [cite5†str†docs.python.org , cite5†str†docs.python.org ] | None`, default: `None` ) – Overrides for additional request headers; authentication, SDK identification, and `Accept` remain protected.
+L219: Returns:
+L220:   * `cite34†ListModelsResponse ` – A `ListModelsResponse` whose `models` holds each model’s name, description,
+L221:   * `cite34†ListModelsResponse ` – and release date.
+L222: Raises:
+L223:   * `cite27†TypeSafeAPIError ` – The server returns an unsuccessful HTTP response after any retries.
+L224:   * `cite28†TypeSafeAPIConnectionError ` – The request cannot connect or times out after any retries.
+L225: Examples:
+L226: 
+L227:     `from typesafe_sdk import AsyncTypeSafeClient
+L228: 
+L229: 
+L230:     async def main() -> None:
+L231:         async with AsyncTypeSafeClient() as client:
+L232:             models = await client.models.list()
+L233:     `
+L234: 
+L235: Was this page helpful?
+L236: 
+L237: Yes No
+L238: 
+L239: cite35†API reference Previous cite36†Synchronous client Next L240: cite37†github†github.com cite38†discord†discord.gg cite39†x†x.com L241: 
+L242: cite40†Powered byThis documentation is built and hosted on Mintlify, a developer documentation platform†www.mintlify.com 

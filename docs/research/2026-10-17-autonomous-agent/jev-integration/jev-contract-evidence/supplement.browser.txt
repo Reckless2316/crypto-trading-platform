@@ -1,0 +1,609 @@
+Primitives (Questions) - TypeSafe (https://docs.typesafe.ai/primitives)
+citeturn26view0 [wordlim: 200] Crawled: today; Content type: text/html; Source: open({"ref_id":"https://docs.typesafe.ai/primitives","lineno":null}); Total lines: 237
+L0: > ## Documentation Index
+L1: >
+L2: > Fetch the complete documentation index at: cite0†/llms.txt L3: >
+L4: > Use this file to discover all available pages before exploring further.
+L5: 
+L6: cite1†Skip to main content L7: 
+L8: cite2†TypeSafe home page L9: 
+L10: Search...
+L11: 
+L12: Navigation
+L13: 
+L14: Primitives (Questions)
+L15: 
+L16: Primitives (Questions)
+L17: 
+L18: Primitives (Questions)
+L19: # Primitives (Questions)
+L20: 
+L21: The TypeSafe question types, the typed answers they return, how to choose between them, and how to ask several at once.
+L22: 
+L23: Copy page Copy page
+L24: TypeSafe’s primitives are the small, typed building blocks you compose in code. They come in pairs: a question defines one judgment for a cite3†System One model to make about a cite4†state , and its answer is the typed value that comes back. You compose the answers in your code to make decisions. Each question type returns a different shape of answer.
+L25: Type  | What it answers  | Returns
+L26: --- | --- | ---
+L27: cite5†Choice | Which of these options?  | `choice`, `probabilities`, `confidence`
+L28: cite6†Score | Which level?  | `score`, `legend`, `probabilities`, `confidence`
+L29: cite7†Noul | Is this true?  | `noul` (0 to 1)
+L30: 
+L31: You can ask one question or send several together. Every question in a request sees the same state, is evaluated independently, and returns a typed answer under the ID you chose.
+L32: ##
+L33: 
+L34: cite8†​ L35: 
+L36: Ask for one snap judgment per question
+L37: System One models are built for fast, focused judgments. Ask for a judgment a knowledgeable person makes in a second given the right context. “Does this message convey urgency?” is a good question. “Analyze this message and determine the best course of action” is not. That needs slow reasoning, and it is a signal to break the task into small questions and compose the answers in code.
+L38: If the judgment you want depends on several independent factors, ask about each factor separately and combine the answers with your own logic. Instead of “rate this startup pitch”, ask about market size, technical feasibility, and differentiation, then weight them in code based on their relative importance. When priorities shift, change the value of weights rather than rewriting a prompt. cite9†Ask multiple questions together shows how to do this.
+L39: ##
+L40: 
+L41: cite10†​ L42: 
+L43: Define a question
+L44: 
+L45: Every question has an ID, a `type`, and `instructions`. Choice and Score questions also take `criteria`, which define the options for a Choice question or the levels for a Score. Noul questions accept `criteria` as an optional clarification of what yes and no mean.
+L46:   * ID. The key you pick, such as `refund_requested`. It identifies the answer in the response.
+L47:   * `type`. One of `choice`, `score`, or `noul`.
+L48:   * `instructions`. The question you are asking about the state. This is where your evaluation logic goes. Write it as a clear, specific question, or as a statement for the model to judge. A string is enough for most questions. It can also be an object or an array, which puts the question in one field and the data it refers to in others; see cite11†Use structure in the questions .
+L49:   * `criteria`. The possible answers: a map of options for a Choice question, an ordered list of levels for a Score, and an optional description of yes and no for a Noul. Each question type’s page covers its shape.
+L50: This question asks whether a customer requested a refund:
+L51: 
+L52:     `from typesafe_sdk import Noul
+L53: 
+L54:     questions = {
+L55:         "refund_requested": Noul(
+L56:             instructions="Does the customer request a refund?",
+L57:         ),
+L58:     }
+L59:     `
+L60: Question IDs are for your code. They are not sent to the model. Write the complete question in `instructions`, even when the ID seems self-explanatory.
+L61: ##
+L62: 
+L63: cite12†​ L64: 
+L65: Choose a question type
+L66: 
+L67: Pick the type that matches the shape of the answer you need.
+L68:   * Choice fits when the answer is one of a known set of options with no order between them: routing a ticket to a department, classifying a document type, detecting a programming language. Give the full list of options, and add an `other` or `none of the above` option when the list might not cover every input.
+L69:   * Score fits when the answer falls on a spectrum and you can describe what each point on that spectrum means: bug severity, customer frustration, skill level. The levels are yours to define, and the model returns a position along them.
+L70:   * Noul fits a clean yes/no question where the probability itself is the useful signal: does this message contain personally identifiable information, is the customer requesting a refund, does the resume mention distributed systems.
+L71: Use Noul for a yes/no judgment and Score to measure a position on a spectrum. “Is this candidate strong in Python?” needs a clear definition of “strong”. A Noul value of 0.5 means the model gives yes and no equal probability. It does not mean the candidate has a medium skill level. An unclear definition makes that probability hard to interpret.If you want to measure skill level, use a Score with defined levels, such as no experience, some familiarity, daily use, and deep expertise.
+L72: If you need a yes/no decision, define the condition clearly, such as “Does the resume state that the candidate has used Python at work?”
+L73: If two types both seem to fit, prefer the one whose answer your code can act on directly. A Choice between `refund`, `rebook`, and `information` maps straight onto three code paths. A Score of customer frustration maps onto a threshold. A Noul maps onto an `if`.
+L74: ##
+L75: 
+L76: cite13†​ L77: 
+L78: What comes back
+L79: 
+L80: Answers are primitives too. Each question type returns a typed value that your code can compare, threshold, sort, pass into further logic, or put into the state of a follow-up request (see cite14†When one question depends on another ).
+L81: Type  | Answer fields  | How to read it
+L82: --- | --- | ---
+L83: Choice  | `choice`, `probabilities`, `confidence`  | `choice` is the selected option. `probabilities` is the distribution across every option. `confidence` summarizes how peaked that distribution is.
+L84: Score  | `score`, `legend`, `probabilities`, `confidence`  | `score` is a position along your levels, and can fall between two of them. `legend` repeats the levels by number. `probabilities` is the distribution across levels.
+L85: Noul  | `noul`  | The probability that the answer is yes. Near 1 is a strong yes, near 0 a strong no, near 0.5 uncertain. Noul has no separate `confidence`.
+L86: Two properties of these answers make them composable:
+L87:   * Every answer is constrained to the options you supplied. The model returns a probability distribution over your options or levels, never a value outside them. Your code never has to recover a value from generated prose.
+L88:   * Every answer is independent. One question’s answer is not hidden context for another. You can add or remove questions without changing the others’ results.
+L89: Some question types also return `confidence`; each type’s page says whether its answers include it. cite15†Confidence explains how to use it to decide when to act automatically and when to escalate to a person.
+L90: ##
+L91: 
+L92: cite16†​ L93: 
+L94: Reference specific fields
+L95: The content being evaluated, the cite4†state , is often a JSON object with several parts: a conversation, a record, a policy. When a question is about one of those parts, name it in the `instructions` with a dot-and-index path to its key, including the backticks. The model then knows which part of the state to judge. Take the support conversation from the State page:
+L96: 
+L97:     `{
+L98:       "ticket": {
+L99:         "subject": "Duplicate charge",
+L100:         "messages": [
+L101:           {"from": "customer", "text": "I was charged twice for order A-104. Please refund the duplicate."},
+L102:           {"from": "support", "text": "We are checking the charges."}
+L103:         ]
+L104:       },
+L105:       "order": {
+L106:         "id": "A-104",
+L107:         "charges": [
+L108:           {"amount_usd": 49, "status": "captured"},
+L109:           {"amount_usd": 49, "status": "captured"}
+L110:         ]
+L111:       },
+L112:       "refund_policy": "Duplicate charges are eligible for a refund."
+L113:     }
+L114:     `
+L115: These two questions point at the customer’s message, the policy, and the charges by path:
+L116: 
+L117:     `questions = {
+L118:         "refund_requested": {
+L119:             "type": "noul",
+L120:             "instructions": "Does `ticket.messages[0].text` request a refund?",
+L121:         },
+L122:         "policy_supports_refund": {
+L123:             "type": "noul",
+L124:             "instructions": (
+L125:                 "Does `refund_policy` support the refund requested "
+L126:                 "in `ticket.messages[0].text`, given `order.charges`?"
+L127:             ),
+L128:         },
+L129:     }
+L130:     `
+L131: Explicit paths make it clear which parts of a structured state should inform each judgment. See cite4†State for how to structure the input.
+L132: ##
+L133: 
+L134: cite9†​ L135: 
+L136: Ask multiple questions together
+L137: Send every question that uses the same state in one request. You can mix question types freely. System One models evaluate every question in a request in parallel. Adding questions barely changes the response time and costs only the tokens for the extra questions, which are cheap. Asking a question you might not need is close to free. This request classifies a customer message, checks for urgency, and scores frustration all at once: Our cite17†client SDKs provide typed questions and answers.
+L138: In Python, pass a `questions` dictionary of `Choice`, `Noul`, and `Score` objects to `client.system_one(...)`. This request sends a ticket and a refund policy once and gets a typed answer for each question:
+L139: 
+L140:     `from typesafe_sdk import Choice, Noul, Score, TypeSafeClient
+L141: 
+L142:     state = {
+L143:         "ticket_message": "My flight was cancelled. Can I get a refund?",
+L144:         "refund_policy": "Cancelled flights are eligible for a full refund.",
+L145:     }
+L146: 
+L147:     with TypeSafeClient() as client:
+L148:         response = client.system_one(
+L149:             state=state,
+L150:             questions={
+L151:                 "refund_requested": Noul(
+L152:                     instructions="Does `ticket_message` request a refund?",
+L153:                 ),
+L154:                 "request_type": Choice(
+L155:                     instructions="What is the main request in `ticket_message`?",
+L156:                     criteria={
+L157:                         "refund": "The customer wants money returned.",
+L158:                         "rebooking": "The customer wants a replacement flight.",
+L159:                         "information": "The customer is asking for information only.",
+L160:                     },
+L161:                 ),
+L162:                 "frustration": Score(
+L163:                     instructions="How frustrated does the customer appear in `ticket_message`?",
+L164:                     criteria=[
+L165:                         "Calm and neutral.",
+L166:                         "Concerned but civil.",
+L167:                         "Very angry or using strong language.",
+L168:                     ],
+L169:                 ),
+L170:             },
+L171:         )
+L172: 
+L173:     print(response.answers["refund_requested"].noul)
+L174:     print(response.answers["request_type"].choice)
+L175:     print(response.answers["frustration"].score)
+L176:     `
+L177: See cite17†client SDKs for installation and usage in your language.
+L178: ###
+L179: 
+L180: cite18†​ L181: 
+L182: Ask speculative questions
+L183: 
+L184: Ask every question your code might need, including ones whose answer only matters for some inputs, and let the code decide which answers to use. If a ticket turns out not to be a bug report, ignore the severity answer. We call this the cite19†Speculative fan-out pattern. The cite20†Parallel questions cookbook shows how batching 13 questions into one call is 11.5x cheaper and 9.6x faster than 13 separate calls, with no change in the answers.
+L185: Coding agents fall into the one question per call habit more than people do. The cite21†TypeSafe agent skill tells your agent to put many questions in each call, including ones that only matter for some inputs.
+L186: ###
+L187: 
+L188: cite22†​ L189: 
+L190: How many questions you can ask
+L191: 
+L192: There is no limit on the number of questions in a request. What limits a request is its size: it has to fit the model’s cite23†per-request context and per-question context . Questions are often short compared with the `state`, in which case the `state` takes up most of both. If your questions don’t all fit in one request, one option is to spread them across several requests with the same `state`.
+L193: ###
+L194: 
+L195: cite24†​ L196: 
+L197: Split a complex judgment into several questions
+L198: A judgment that depends on several things is best split into one question per thing. Combine the answers in your code, giving each a weight for its relative importance. The weights are yours. When the combined result doesn’t match what your team would decide, change them in code and run again. Adding questions barely changes the response time because they run in parallel within one request. The split costs a few extra question tokens.
+L199: For example, ticket priority might be built from three Score questions: how severe the bug is, how frustrated the customer is, and how much the report gives an engineer to work with. The Score page walks through this request and the code that normalizes and weights the answers in cite25†Splitting a complex judgment into several Scores . This technique is called the cite26†Composite scoring pattern.
+L200: ###
+L201: 
+L202: cite14†​ L203: 
+L204: When one question depends on another
+L205: Questions in the same request are independent: one answer does not become context for another question. If a later judgment depends on an earlier answer, make a second request in code. The dependency is real only when your code cannot build the second request until it has the first answer: it needs the answer to fetch more data for the state, to decide what the state is made of, or to pick the next question’s options. Otherwise, ask the questions together and combine their answers in code.
+L206: Two requests are the exception, not the rule. If the second request’s questions could have been asked against the original state, ask them in the first request and let the code ignore the ones it doesn’t need. Three cookbooks make a second request for a real reason. cite27†Skill suggestion ranks 182 skills in one request, then fetches the full text of the top three and judges them again against that better evidence.
+L207: cite28†Structure recovery asks whether each line break split a sentence, merges lines into blocks from those answers, then classifies the blocks, which did not exist until the first request had answered. cite29†Hierarchical classification uses each Choice answer to decide which options the next request offers. See cite30†How to build with TypeSafe for guidance on breaking a workflow into focused judgments.
+L208: ##
+L209: 
+L210: cite31†​ L211: 
+L212: Next steps
+L213: 
+L214: ## Choice
+L215: 
+L216: Pick one option from a fixed list.
+L217: 
+L218: ## Score
+L219: 
+L220: Rate the state along ordered levels.
+L221: 
+L222: ## Noul
+L223: 
+L224: Get the probability that a statement is true.
+L225: 
+L226: To see how these compose into system architectures, head to cite32†Patterns .
+L227: 
+L228: Was this page helpful?
+L229: 
+L230: Yes No
+L231: 
+L232: cite4†State Previous cite5†Choice Next L233: 
+L234: cite33†github†github.com cite34†discord†discord.gg cite35†x†x.com L235: 
+L236: cite36†Powered byThis documentation is built and hosted on Mintlify, a developer documentation platform†www.mintlify.com --------------------------------------------------------------------------------
+Speculative fan-out - TypeSafe (https://docs.typesafe.ai/patterns/fan-out)
+citeturn26view1 [wordlim: 200] Crawled: today; Content type: text/html; Source: open({"ref_id":"https://docs.typesafe.ai/patterns/fan-out","lineno":null}); Total lines: 84
+L0: > ## Documentation Index
+L1: >
+L2: > Fetch the complete documentation index at: cite0†/llms.txt L3: >
+L4: > Use this file to discover all available pages before exploring further.
+L5: 
+L6: cite1†Skip to main content L7: 
+L8: cite2†TypeSafe home page L9: 
+L10: Search...
+L11: 
+L12: Navigation
+L13: 
+L14: Patterns
+L15: 
+L16: Speculative fan-out
+L17: 
+L18: Patterns
+L19: # Speculative fan-out
+L20: 
+L21: Send many questions in a single call, including speculative ones, and let your code decide what’s relevant.
+L22: 
+L23: Copy page Copy page
+L24: 
+L25: Because TypeSafe supports sending many questions in a single API call, we recommend putting all of the questions your system needs in a single request, and then using code to decide what is relevant after the fact. All questions are evaluated in parallel, so adding more questions usually has little effect on response time.
+L26: ##
+L27: 
+L28: cite3†​ L29: 
+L30: Example: support ticket triage
+L31: 
+L32: Let’s imagine you are building a support system that needs to triage support tickets. You need to classify the ticket into a category. If it’s a bug report, you also need to determine the severity of the bug. Instead of asking for the category first and then the severity in a follow-up call, you can ask for both at the same time. If the ticket is not a bug report, you simply ignore the results of the bug severity question.
+L33: ###
+L34: 
+L35: cite4†​ L36: 
+L37: Step 1: speculative fan-out
+L38: 
+L39: Speculative questions: `bug_severity` and `has_reproducible_steps` only matter if the ticket is a bug report. `refund_requested` only matters for billing. We include all upfront because additional questions usually have little effect on response time. If the ticket turns out to be a feature request, the bug severity result will be irrelevant, in which case your code path simply ignores it.
+L40: ###
+L41: 
+L42: cite5†​ L43: 
+L44: Step 2: route with code
+L45: 
+L46: Your code decides what is relevant based on the classification result:
+L47: triage.py
+L48: 
+L49:     `category = response.answers["category"]
+L50:     bug_severity = response.answers["bug_severity"]
+L51:     bug_repro = response.answers["has_reproducible_steps"]
+L52:     refund = response.answers["refund_requested"]
+L53:     frustration = response.answers["frustration"]
+L54: 
+L55:     if category.choice == "bug_report":
+L56:         if bug_severity.score > 1.5 and bug_repro.noul > 0.6:
+L57:             escalate_to_engineering(ticket_id, severity="high")
+L58:         else:
+L59:             add_to_bug_backlog(ticket_id)
+L60:     elif category.choice == "billing":
+L61:         if refund.noul > 0.7:
+L62:             route_to_billing_with_flag(ticket_id, refund_likely=True)
+L63:         else:
+L64:             route_to_billing(ticket_id)
+L65: 
+L66:     elif category.choice == "feature_request":
+L67:         log_feature_request(ticket_id)
+L68: 
+L69:     # Frustration is useful regardless of category
+L70:     if frustration.score > 1.5:
+L71:         flag_for_priority_response(ticket_id)
+L72:     `
+L73: Everything needed for the full decision tree comes from one call. Speculative questions are ignored when irrelevant and save a round trip when they are not.
+L74: 
+L75: Was this page helpful?
+L76: 
+L77: Yes No
+L78: 
+L79: cite6†Patterns Previous cite7†Confidence-gated routing Next L80: 
+L81: cite8†github†github.com cite9†discord†discord.gg cite10†x†x.com L82: 
+L83: cite11†Powered byThis documentation is built and hosted on Mintlify, a developer documentation platform†www.mintlify.com --------------------------------------------------------------------------------
+Answers and responses - TypeSafe (https://docs.typesafe.ai/sdk/python/api/types/responses)
+citeturn26view2 [wordlim: 200] Crawled: today; Content type: text/html; Source: open({"ref_id":"https://docs.typesafe.ai/sdk/python/api/types/responses","lineno":null}); Total lines: 1294
+L0: > ## Documentation Index
+L1: >
+L2: > Fetch the complete documentation index at: cite0†/llms.txt L3: >
+L4: > Use this file to discover all available pages before exploring further.
+L5: 
+L6: cite1†Skip to main content L7: 
+L8: cite2†TypeSafe home page L9: 
+L10: Search...
+L11: 
+L12: Navigation
+L13: 
+L14: Types
+L15: 
+L16: Answers and responses
+L17: 
+L18: Types
+L19: 
+L20: # Answers and responses
+L21: 
+L22: Read answers, confidence scores, token usage, and available models returned by the TypeSafe API.
+L23: 
+L24: Copy page Copy page
+L25: 
+L26: ##
+L27: 
+L28: cite3†​ L29: 
+L30: Response
+L31: ##
+L32: 
+L33: cite4†​ L34: 
+L35: typesafe_sdk.SystemOneResponse
+L36: 
+L37: `pydantic-model` Bases: `Response` Answers grouped by question type with model and usage metadata. See cite5†System One for details.
+L38: 
+L39: Show JSON schema:
+L40: Details
+L41: 
+L42:     `{
+L43:       "$defs": {
+L44:         "BoxAnswer": {
+L45:           "description": "A located box with its confidence.",
+L46:           "properties": {
+L47:             "type": {
+L48:               "const": "box",
+L49:               "default": "box",
+L50:               "title": "Type",
+L51:               "type": "string"
+L52:             },
+L53:             "box": {
+L54:               "$ref": "#/$defs/BoxCoordinates"
+L55:             },
+L56:             "confidence": {
+L57:               "anyOf": [
+L58:                 {
+L59:                   "type": "number"
+L60:                 },
+L61:                 {
+L62:                   "type": "null"
+L63:                 }
+L64:               ],
+L65:               "title": "Confidence"
+L66:             }
+L67:           },
+L68:           "required": [
+L69:             "box",
+L70:             "confidence"
+L71:           ],
+L72:           "title": "BoxAnswer",
+L73:           "type": "object"
+L74:         },
+L75:         "BoxCoordinates": {
+L76:           "description": "A box's edges as fractions of the image's height (`top`, `bottom`) and width (`left`, `right`).",
+L77:           "properties": {
+L78:             "top": {
+L79:               "description": "Top edge of the box, as a fraction of image height from the top (0-1).",
+L80:               "examples": [
+L81:                 0.2
+L82:               ],
+L83:               "title": "Top",
+L84:               "type": "number"
+L85:             },
+L86:             "bottom": {
+L87:               "description": "Bottom edge of the box, as a fraction of image height from the top (0-1).",
+L88:               "examples": [
+L89:                 0.66
+L90:               ],
+L91:               "title": "Bottom",
+L92:               "type": "number"
+L93:             },
+L94:             "left": {
+L95:               "description": "Left edge of the box, as a fraction of image width from the left (0-1).",
+L96:               "examples": [
+L97:                 0.19
+L98:               ],
+L99:               "title": "Left",
+L100:               "type": "number"
+L101:             },
+L102:             "right": {
+L103:               "description": "Right edge of the box, as a fraction of image width from the left (0-1).",
+L104:               "examples": [
+L105:                 0.68
+L106:               ],
+L107:               "title": "Right",
+L108:               "type": "number"
+L109:             }
+L110:           },
+L111:           "required": [
+L112:             "top",
+L113:             "bottom",
+L114:             "left",
+L115:             "right"
+L116:           ],
+L117:           "title": "BoxCoordinates",
+L118:           "type": "object"
+L119:         },
+L120:         "ChoiceAnswer": {
+L121:           "description": "A selected label and its probabilities.\n\n See the [choice primitive](https://docs.typesafe.ai/go/choice) for details.",
+L122:           "properties": {
+L123:             "type": {
+L124:               "const": "choice",
+L125:               "default": "choice",
+L126:               "title": "Type",
+L127:               "type": "string"
+L128:             },
+L129:             "choice": {
+L130:               "description": "The name of the choice with the highest probability among the question's criteria.",
+L131:               "examples": [
+L132:                 "angry"
+L133:               ],
+L134:               "title": "Choice",
+L135:               "type": "string"
+L136:             },
+L137:             "confidence": {
+L138:               "description": "Confidence in the selected choice, from 0 to 1. Higher values indicate greater certainty; use lower values to flag uncertain selections for review.",
+L139:               "examples": [
+L140:                 0.9
+L141:               ],
+L142:               "title": "Confidence",
+L143:               "type": "number"
+L144:             },
+L145:             "probabilities": {
+L146:               "additionalProperties": {
+L147:                 "type": "number"
+L148:               },
+L149:               "description": "Probability of each choice in criteria, keyed by choice name, from 0 to 1. Shows how likely the alternatives are; values sum to approximately 1.",
+L150:               "examples": [
+L151:                 {
+L152:                   "angry": 0.8,
+L153:                   "calm": 0.1,
+L154:                   "excited": 0.1
+L155:                 }
+L156:               ],
+L157:               "title": "Probabilities",
+L158:               "type": "object"
+L159:             }
+L160:           },
+L161:           "required": [
+L162:             "choice",
+L163:             "confidence",
+L164:             "probabilities"
+L165:           ],
+L166:           "title": "ChoiceAnswer",
+L167:           "type": "object"
+L168:         },
+L169:         "NoulAnswer": {
+L170:           "description": "A yes/no answer.\n\n See the [noul primitive](https://docs.typesafe.ai/go/noul) for details.",
+L171:           "properties": {
+L172:             "type": {
+L173:               "const": "noul",
+L174:               "default": "noul",
+L175:               "title": "Type",
+L176:               "type": "string"
+L177:             },
+L178:             "noul": {
+L179:               "description": "Probability of a yes answer or a true statement, from 0 to 1. Values near 1 favor yes or true, values near 0 favor no or false, and values near 0.5 indicate uncertainty.",
+L180:               "examples": [
+L181:                 0.98
+L182:               ],
+L183:               "title": "Noul",
+L184:               "type": "number"
+L185:             }
+L186:           },
+L187:           "required": [
+L188:             "noul"
+L189:           ],
+L190:           "title": "NoulAnswer",
+L191:           "type": "object"
+L192:         },
+L193:         "ScoreAnswer": {
+L194:           "description": "An expected score with its rubric and probabilities.\n\n See the [score primitive](https://docs.typesafe.ai/go/score) for details.",
+L195:           "properties": {
+L196:             "type": {
+L197:               "const": "score",
+L198:               "default": "score",
+L199:               "title": "Type",
+L200:               "type": "string"
+L201:             },
+L202:             "score": {
+L203:               "description": "Expected score: the probability-weighted average of the rubric levels. May fall between integer levels.",
+L204:               "examples": [
+L205:                 1.7
+L206:               ],
+L207:               "title": "Score",
+L208:               "type": "number"
+L209:             },
+L210:             "confidence": {
+L211:               "description": "Confidence in the score, from 0 to 1. Higher values indicate greater certainty; use lower values to flag uncertain ratings for review.",
+L212:               "examples": [
+L213:                 0.9
+L214:               ],
+L215:               "title": "Confidence",
+L216:               "type": "number"
+L217:             },
+L218:             "legend": {
+L219:               "additionalProperties": {
+L220:                 "anyOf": [
+L221:                   {
+L222:                     "type": "string"
+L223:                   },
+L224:                   {
+L225:                     "additionalProperties": true,
+L226:                     "type": "object"
+L227:                   },
+L228:                   {
+L229:                     "items": {},
+L230:                     "type": "array"
+L231:                   }
+L232:                 ]
+L233:               },
+L234:               "title": "Legend",
+L235:               "type": "object"
+L236:             },
+L237:             "probabilities": {
+L238:               "additionalProperties": {
+L239:                 "type": "number"
+L240:               },
+L241:               "title": "Probabilities",
+L242:               "type": "object"
+L243:             }
+L244:           },
+L245:           "required": [
+L246:             "score",
+L247:             "confidence",
+L248:             "legend",
+L249:             "probabilities"
+L250:           ],
+L251:           "title": "ScoreAnswer",
+L252:           "type": "object"
+L253:         },
+L254:         "Usage": {
+L255:           "description": "Token counts for a request, when reported by the API.",
+L256:           "properties": {
+L257:             "input_tokens": {
+L258:               "anyOf": [
+L259:                 {
+L260:                   "type": "integer"
+L261:                 },
+L262:                 {
+L263:                   "type": "null"
+L264:                 }
+L265:               ],
+L266:               "default": null,
+L267:               "title": "Input Tokens"
+L268:             },
+L269:             "output_tokens": {
+L270:               "anyOf": [
+L271:                 {
+L272:                   "type": "integer"
+L273:                 },
+L274:                 {
+L275:                   "type": "null"
+L276:                 }
+L277:               ],
+L278:               "default": null,
+L279:               "title": "Output Tokens"
+L280:             }
+L281:           },
+L282:           "title": "Usage",
+L283:           "type": "object"
+L284:         }
+L285:       },
+L286:       "description": "Answers grouped by question type with model and usage metadata.\n\n See [System One](https://docs.typesafe.ai/go/system-one) for details.",
+L287:       "properties": {
+L288:         "model": {
+L289:           "title": "Model",
+L290:           "type": "string"
+L291:         },
+L292:         "usage": {
+L293:           "$ref": "#/$defs/Usage"
+L294:         },
+L295:         "answers": {
+L296:           "additionalProperties": {
+L297:             "discriminator": {
+L298:               "mapping": {
+L299:                 "box": "#/$defs/BoxAnswer",
+L300:                 "choice": "#/$defs/ChoiceAnswer",
+--------------------------------------------------------------------------------
+Asynchronous client - TypeSafe (https://docs.typesafe.ai/sdk/python/api/clients/async)
+citeturn26view3 [wordlim: 200] Crawled: today; Content type: text/html; Source: open({"ref_id":"https://docs.typesafe.ai/sdk/python/api/clients/async","lineno":null}); Total lines: 243
+--------------------------------------------------------------------------------
+Retries - TypeSafe (https://docs.typesafe.ai/sdk/python/api/retries)
+citeturn26view4 [wordlim: 200] Crawled: today; Content type: text/html; Source: open({"ref_id":"https://docs.typesafe.ai/sdk/python/api/retries","lineno":null}); Total lines: 134
+--------------------------------------------------------------------------------
+Noul - TypeSafe (https://docs.typesafe.ai/primitives/noul)
+citeturn26view5 [wordlim: 200] Crawled: today; Content type: text/html; Source: open({"ref_id":"https://docs.typesafe.ai/primitives/noul","lineno":null}); Total lines: 280
+

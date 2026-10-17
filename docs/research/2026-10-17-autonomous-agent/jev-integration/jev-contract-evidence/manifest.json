@@ -1,0 +1,55 @@
+{
+  "checked_date_utc": "2026-10-17",
+  "capture_completed_no_later_than_utc": "2026-10-17T08:21:47Z",
+  "exact_http_received_at_utc": null,
+  "http_status": null,
+  "representation": "Browser tool rendered page excerpts/search results, not raw HTTP responses",
+  "scope": "Unauthenticated public documentation only; no provider evaluation or console access",
+  "files": [
+    {
+      "path": "core.browser.txt",
+      "sha256": "174f6b2fc6251d9e5affef58d1f0241a02ca0d11f17f40c772f62acfe3ca0170",
+      "sources": [
+        "https://docs.typesafe.ai/api",
+        "https://docs.typesafe.ai/models",
+        "https://docs.typesafe.ai/confidence",
+        "https://docs.typesafe.ai/sdk/python/api/clients/async",
+        "https://docs.typesafe.ai/sdk/python/api/retries"
+      ]
+    },
+    {
+      "path": "supplement.browser.txt",
+      "sha256": "f06f3f7b258c7e1f4e511c4c5e7d7e3a18b76bc10dc230a4f94025b729b142b3",
+      "sources": [
+        "https://docs.typesafe.ai/primitives",
+        "https://docs.typesafe.ai/patterns/fan-out",
+        "https://docs.typesafe.ai/sdk/python/api/types/responses",
+        "https://docs.typesafe.ai/sdk/python/api/clients/async",
+        "https://docs.typesafe.ai/sdk/python/api/retries",
+        "https://docs.typesafe.ai/primitives/noul"
+      ]
+    },
+    {
+      "path": "gap-check.browser.txt",
+      "sha256": "f0248c66bd88315c0524f62548707c90360c3aa45b1aebc9bb93a7e12a674e57",
+      "sources": [
+        "https://docs.typesafe.ai/sdk/python/api/types/responses",
+        "https://docs.typesafe.ai/llms.txt",
+        "https://docs.typesafe.ai/sdk/python/api/clients/async"
+      ],
+      "searches": [
+        "site:docs.typesafe.ai tokenizer count tokens state",
+        "site:docs.typesafe.ai \"request_id\" deadline"
+      ]
+    },
+    {
+      "path": "details.browser.txt",
+      "sha256": "e97fa0ac574ff0675952c47e9e7d38aa411b277036bf45c91c9b4e23e45982db",
+      "sources": [
+        "https://docs.typesafe.ai/api",
+        "https://docs.typesafe.ai/models",
+        "https://docs.typesafe.ai/sdk/python/usage/advanced"
+      ]
+    }
+  ]
+}

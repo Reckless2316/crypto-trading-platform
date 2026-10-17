@@ -1,0 +1,780 @@
+API reference - TypeSafe (https://docs.typesafe.ai/api)
+citeturn29view0 [wordlim: 200] Crawled: today; Content type: text/html; Source: open({"ref_id":"https://docs.typesafe.ai/api","lineno":25}); Total lines: 610
+L0: > ## Documentation Index
+L1: >
+L2: > Fetch the complete documentation index at: cite0†/llms.txt L3: >
+L4: > Use this file to discover all available pages before exploring further.
+L5: 
+L6: cite1†Skip to main content L7: 
+L8: cite2†TypeSafe home page L9: 
+L10: Search...
+L11: 
+L12: Navigation
+L13: 
+L14: Reference
+L15: 
+L16: API reference
+L17: 
+L18: Reference
+L19: # API reference
+L20: 
+L21: Full HTTP API reference for the TypeSafe evaluation endpoint.
+L22: 
+L23: Copy page Copy page
+L24: 
+L25: Evaluate a `state` against a map of typed `questions` and get back structured `answers`, one per question. For a guided introduction, start with the cite3†primitives .
+L26: 
+L27: ##
+L28: 
+L29: cite4†​ L30: 
+L31: Evaluation endpoint
+L32: 
+L33:     `POST https://api.typesafe.ai/v1/systemone
+L34:     Authorization: Bearer <API_KEY>
+L35:     Content-Type: application/json
+L36:     `
+L37: ##
+L38: 
+L39: cite5†​ L40: 
+L41: Request body
+L42: 
+L43: The top-level shape of every request. Each entry in the `questions` map is a typed question you name.
+L44: 
+L45: cite6†​ L46: 
+L47: [Button: state]
+L48: 
+L49: string | object | array
+L50: 
+L51: required
+L52: 
+L53: The content to evaluate. A plain string for text, or structured data (object/array) for things like chat logs, records, or the current state of your application. See cite7†State for formats and best practices.
+L54: 
+L55: cite8†​ L56: 
+L57: [Button: model]
+L58: 
+L59: string
+L60: 
+L61: required
+L62: The model that handles the request. Use `"jev-latest"`, TypeSafe’s flagship model. See cite9†Models for the available models and aliases.
+L63: 
+L64: cite10†​ L65: 
+L66: [Button: questions]
+L67: 
+L68: map<string, Question>
+L69: 
+L70: required
+L71: 
+L72: A map of typed cite11†Question objects. You choose each key; answers come back under the same keys.
+L73: 
+L74: Show map entries
+L75: 
+L76: cite12†​ L77: 
+L78: [Button: ‹question id›]
+L79: 
+L80: Question
+L81: 
+L82: A key you choose. The matching cite13†Answer is returned under this same id. The key is not sent to the underlying model and is not used in inference.
+L83: Example request
+L84: 
+L85:     `{
+L86:       "state": "Help! My payouts have been failing for 3 days.",
+L87:       "model": "jev-latest",
+L88:       "questions": {
+L89:         "is_urgent": {
+L90:           "type": "noul",
+L91:           "instructions": "Does this convey urgency?"
+L92:         }
+L93:       }
+L94:     }
+L95:     `
+L96: ##
+L97: 
+L98: cite14†​ L99: 
+L100: Request rules
+L101: 
+L102: These rules apply to every request:
+L103: 
+L104: Rule  | Limit
+L105: --- | ---
+L106: Body size  | At most 32 MiB. Headers don’t count.
+L107: Encoding  | UTF-8 JSON without a byte order mark (BOM).
+L108: Nesting  | At most 64 nested levels of objects and arrays in each of `state`, `instructions`, and `criteria`. Flatten deeper content.
+L109: Numbers  | Finite numbers only. `NaN`, `Infinity`, and numbers too large to represent, such as `1e400`, are rejected. Send identifiers and exact large quantities as strings.
+L110: A body over 32 MiB returns `413`; the other rules return `400`.
+L111: ###
+L112: 
+L113: cite15†​ L114: 
+L115: Compression
+L116: 
+L117: You can compress the body with `Content-Encoding: gzip` (or `x-gzip`) or `zstd`. The SDKs compress request bodies of 1 KiB or more with zstd when the runtime supports it. Use one compression layer, and keep zstd’s window at most 8 MiB. The 32 MiB limit applies to both the compressed and the decompressed body. An unsupported `Content-Encoding` or more than one layer returns `415`; a malformed compressed body returns `400`.
+L118: ##
+L119: 
+L120: cite11†​ L121: 
+L122: Question types
+L123: A `Question`’s type is set by its `type` field. Every question has `type` and `instructions`, and most types also take `criteria`; each type’s page says what it accepts. The `instructions` property can be a string, an object, or an array. You can break up a long question that has extra context, or data it needs to reference, into a structured object.
+L124: Put the question in one field and the data in the others, and refer to the data fields by name in backticks, the same way you point a question at a nested `state` value:
+L125: 
+L126:     `"instructions": {
+L127:       "potential_duplicate": {
+L128:         "name": "John Smith",
+L129:         "location": "Oakland, California",
+L130:         "last_employer": "Google"
+L131:       },
+L132:       "question": "Is the resume for the same person as `potential_duplicate`?"
+L133:     }
+L134:     `
+L135: See cite16†Use structure in the questions to learn more.
+L136: ###
+L137: 
+L138: cite17†​ L139: 
+L140: Noul
+L141: 
+L142: A yes/no question. Returns the probability the answer is yes.
+L143: 
+L144: cite18†​ L145: 
+L146: [Button: type]
+L147: 
+L148: "noul"
+L149: 
+L150: required
+L151: 
+L152: cite19†​ L153: 
+L154: [Button: instructions]
+L155: 
+L156: string | object | array
+L157: 
+L158: required
+L159: 
+L160: The yes/no question to evaluate. An object can hold the question in one field and data it refers to in others; see cite16†Use structure in the questions .
+L161: 
+L162: cite20†​ L163: 
+L164: [Button: criteria]
+L165: 
+L166: object
+L167: 
+L168: Optional descriptions of what a yes and a no mean.
+L169: 
+L170: Show properties
+L171: 
+L172: cite21†​ L173: 
+L174: [Button: true]
+L175: 
+L176: string | object | array
+L177: What a yes (value near 1) means.
+L178: 
+L179: cite22†​ L180: 
+L181: [Button: false]
+L182: 
+L183: string | object | array
+L184: 
+L185: What a no (value near 0) means.
+L186: Example request
+L187: 
+L188:     `{
+L189:       "state": "Help! My payouts have been failing for 3 days.",
+L190:       "model": "jev-latest",
+L191:       "questions": {
+L192:         "is_urgent": {
+L193:           "type": "noul",
+L194:           "instructions": "Does this convey urgency?",
+L195:           "criteria": {
+L196:             "true": "Explicitly time-sensitive",
+L197:             "false": "No urgency expressed"
+L198:           }
+L199:         }
+L200:       }
+L201:     }
+L202:     `
+L203: ###
+L204: 
+L205: cite23†​ L206: 
+L207: Choice
+L208: 
+L209: Picks one option from a set you define. Returns the chosen option and the full probability distribution.
+L210: 
+L211: cite24†​ L212: 
+L213: [Button: type]
+L214: 
+L215: "choice"
+L216: 
+L217: required
+L218: 
+L219: cite25†​ L220: 
+L221: [Button: instructions]
+L222: 
+L223: string | object | array
+L224: 
+L225: required
+L226: 
+L227: What the model should decide. An object can hold the question in one field and data it refers to in others; see cite26†Structured instructions and criteria .
+L228: 
+L229: cite27†​ L230: 
+L231: [Button: criteria]
+L232: 
+L233: map<string, string | object | array | null>
+L234: 
+L235: required
+L236: A map of option to rubric description; use null when an option needs no extra detail. You can have a maximum of 255 options per Choice.
+L237: 
+L238: Show map entries
+L239: 
+L240: cite28†​ L241: 
+L242: [Button: ‹option›]
+L243: 
+L244: string | object | array | null
+L245: 
+L246: A key you choose. A description of this option.
+L247: Example request
+L248: 
+L249:     `{
+L250:       "state": "Help! My payouts have been failing for 3 days.",
+L251:       "model": "jev-latest",
+L252:       "questions": {
+L253:         "department": {
+L254:           "type": "choice",
+L255:           "instructions": "Which team should handle this?",
+L256:           "criteria": {
+L257:             "billing": "Payments, invoicing, refunds",
+L258:             "technical": "Bugs, outages, integrations",
+L259:             "sales": "Pricing, upgrades, new accounts"
+L260:           }
+L261:         }
+L262:       }
+L263:     }
+L264:     `
+L265: ###
+L266: 
+L267: cite29†​ L268: 
+L269: Score
+L270: 
+L271: Rates the state along a rubric you define. Returns a probability-weighted value across your levels.
+L272: 
+L273: cite30†​ L274: 
+L275: [Button: type]
+L276: 
+L277: "score"
+L278: 
+L279: required
+L280: 
+L281: cite31†​ L282: 
+L283: [Button: instructions]
+L284: 
+L285: string | object | array
+L286: 
+L287: required
+L288: 
+L289: What the model should rate. An object can hold the question in one field and data it refers to in others; see cite16†Use structure in the questions .
+L290: 
+L291: cite32†​ L292: 
+L293: [Button: criteria]
+L294: 
+L295: array<string | object | array>
+L296: 
+L297: required
+L298: An ordered array of level descriptions. A Score should have at least two levels; the API accepts up to 10.
+L299: 
+L300: Example request
+L301: 
+L302:     `{
+L303:       "state": "Help! My payouts have been failing for 3 days.",
+L304:       "model": "jev-latest",
+L305:       "questions": {
+L306:         "frustration": {
+L307:           "type": "score",
+L308:           "instructions": "How frustrated is the customer?",
+L309:           "criteria": ["Calm", "Frustrated", "Very angry"]
+L310:         }
+L311:       }
+L312:     }
+L313:     `
+L314: ##
+L315: 
+L316: cite33†​ L317: 
+L318: Response body
+L319: 
+L320: One answer per question, returned under the same ids you provided.
+L321: 
+L322: cite34†​ L323: 
+L324: [Button: model]
+L325: 
+L326: string
+L327: 
+L328: required
+L329: 
+L330: The model that performed the evaluation.
+L331: 
+L332: cite35†​ L333: 
+L334: [Button: answers]
+L335: 
+L336: map<string, Answer>
+L337: 
+L338: required
+L339: 
+L340: One cite13†Answer per question, keyed by the same ids you used in questions.
+L341: 
+L342: Show map entries
+L343: 
+L344: cite36†​ L345: 
+L346: [Button: ‹question id›]
+L347: 
+L348: Answer
+L349: 
+L350: The same id you chose in questions.
+L351: 
+L352: cite37†​ L353: 
+L354: [Button: usage]
+L355: 
+L356: object
+L357: 
+L358: required
+L359: 
+L360: Token usage for the request.
+L361: 
+L362: Show properties
+L363: 
+L364: cite38†​ L365: [Button: input_tokens]
+L366: 
+L367: integer
+L368: 
+L369: cite39†​ L370: 
+L371: [Button: output_tokens]
+L372: 
+L373: integer
+L374: 
+L375: Example response
+L376: 
+L377:     `{
+L378:       "model": "jev-1.13.0",
+L379:       "answers": {
+L380:         "is_urgent": {
+L381:           "type": "noul",
+L382:           "noul": 0.95
+L383:         }
+L384:       },
+L385:       "usage": { "input_tokens": 296, "output_tokens": 20 }
+L386:     }
+L387:     `
+L388: ##
+L389: 
+L390: cite13†​ L391: 
+L392: Answer types
+L393: 
+L394: Every answer carries a `type` matching its question. Some answer types also carry a `confidence` between 0 and 1; each type’s page lists the fields its answers include. See cite40†Confidence .
+L395: ###
+L396: 
+L397: cite41†​ L398: 
+L399: Noul answer
+L400: 
+L401: cite42†​ L402: 
+L403: [Button: type]
+L404: 
+L405: "noul"
+L406: 
+L407: required
+L408: 
+L409: cite43†​ L410: 
+L411: [Button: noul]
+L412: 
+L413: number
+L414: 
+L415: required
+L416: 
+L417: The yes/no answer on a scale from 0 (no) to 1 (yes).
+L418: 
+L419: Example response
+L420: 
+L421:     `{
+L422:       "model": "jev-1.13.0",
+L423:       "answers": {
+L424:         "is_urgent": {
+L425:           "type": "noul",
+L426:           "noul": 0.95
+L427:         }
+L428:       },
+L429:       "usage": { "input_tokens": 307, "output_tokens": 20 }
+L430:     }
+L431:     `
+L432: ###
+L433: 
+L434: cite44†​ L435: 
+L436: Choice answer
+L437: 
+L438: cite45†​ L439: 
+L440: [Button: type]
+L441: 
+L442: "choice"
+L443: 
+L444: required
+L445: 
+L446: cite46†​ L447: 
+L448: [Button: choice]
+L449: 
+L450: string
+L451: 
+L452: required
+L453: 
+L454: The highest-probability option.
+L455: 
+L456: cite47†​ L457: 
+L458: [Button: probabilities]
+L459: 
+L460: map<string, number>
+L461: 
+L462: required
+L463: 
+L464: Every option mapped to its probability (floats that sum to 1).
+L465: 
+L466: Show map entries
+L467: 
+L468: cite48†​ L469: 
+L470: [Button: ‹option›]
+L471: 
+L472: number
+L473: 
+L474: An option you defined in criteria.
+L475: 
+L476: cite49†​ L477: 
+L478: [Button: confidence]
+L479: 
+L480: number
+L481: 
+L482: required
+L483: 
+L484: How certain the model is, derived from probabilities.
+L485: Example response
+L486: 
+L487:     `{
+L488:       "model": "jev-1.13.0",
+L489:       "answers": {
+L490:         "department": {
+L491:           "type": "choice",
+L492:           "choice": "billing",
+L493:           "probabilities": { "billing": 0.88, "technical": 0.12, "sales": 0.0 },
+L494:           "confidence": 0.81
+L495:         }
+L496:       },
+L497:       "usage": { "input_tokens": 318, "output_tokens": 34 }
+L498:     }
+L499:     `
+L500: ###
+L501: 
+L502: cite50†​ L503: 
+L504: Score answer
+L505: 
+L506: cite51†​ L507: 
+L508: [Button: type]
+L509: 
+L510: "score"
+L511: 
+L512: required
+L513: 
+L514: cite52†​ L515: 
+L516: [Button: score]
+L517: 
+L518: number
+L519: 
+L520: required
+L521: 
+L522: The probability-weighted answer across the levels; can land between levels.
+L523: 
+L524: cite53†​ L525: 
+L526: [Button: legend]
+L527: 
+L528: map<string, string>
+L529: 
+L530: required
+L531: 
+L532: Each level number mapped back to its description.
+L533: 
+L534: cite54†​ L535: 
+L536: [Button: probabilities]
+L537: 
+L538: map<string, number>
+L539: 
+L540: required
+L541: 
+L542: Each level (string key) mapped to its probability (floats that sum to 1).
+L543: 
+L544: Show map entries
+L545: 
+L546: cite55†​ L547: 
+L548: [Button: ‹level›]
+L549: 
+L550: number
+L551: A level index, as a string key matching legend.
+L552: 
+L553: cite56†​ L554: 
+L555: [Button: confidence]
+L556: 
+L557: number
+L558: 
+L559: required
+L560: 
+L561: How certain the model is, derived from probabilities.
+L562: Example response
+L563: 
+L564:     `{
+L565:       "model": "jev-1.13.0",
+L566:       "answers": {
+L567:         "frustration": {
+L568:           "type": "score",
+L569:           "score": 1.05,
+L570:           "legend": { "0": "Calm", "1": "Frustrated", "2": "Very angry" },
+L571:           "probabilities": { "0": 0.0, "1": 0.95, "2": 0.05 },
+L572:           "confidence": 0.92
+L573:         }
+L574:       },
+L575:       "usage": { "input_tokens": 304, "output_tokens": 18 }
+L576:     }
+L577:     `
+L578: ##
+L579: 
+L580: cite57†​ L581: 
+L582: Errors
+L583: 
+L584: Errors use standard HTTP status codes with a JSON body describing what went wrong.
+L585: Status  | Meaning
+L586: --- | ---
+L587: `400 Bad Request`  | The body breaks a cite14†request rule , such as invalid UTF-8, too much nesting, a number that isn’t finite, or a malformed compressed body. With `max_tokens_exceeded`, the request is longer than the model’s cite9†context length .
+L588: `401 Unauthorized`  | Missing or invalid API key. Check the `Authorization` header.
+L589: `413 Payload Too Large`  | The body is over 32 MiB. See cite14†Request rules .
+L590: `415 Unsupported Media Type`  | The body uses an unsupported `Content-Encoding` or more than one compression layer. See cite15†Compression .
+L591: `422 Unprocessable Entity`  | The request body failed validation, for example a missing required field or a malformed question. The body details the offending field.
+L592: `429 Too Many Requests`  | You have exceeded your rate limit. Back off and retry after a short delay.
+L593: `529 Overloaded`  | TypeSafe is temporarily overloaded. Retry after a short delay.
+L594: ###
+L595: 
+L596: cite58†​ L597: 
+L598: Handling rate limits
+L599: 
+L600: When you receive a `429 Too Many Requests` or `529 Overloaded` response, retry the request with exponential backoff instead of retrying immediately. Our client SDKs handle this automatically, so no extra handling is needed if you use one of our SDKs with its default retry policy.
+L601: 
+L602: Was this page helpful?
+L603: 
+L604: Yes No
+L605: 
+L606: cite9†Models Previous cite59†Agent skill Next L607: 
+L608: cite60†github†github.com cite61†discord†discord.gg cite62†x†x.com L609: cite63†Powered byThis documentation is built and hosted on Mintlify, a developer documentation platform†www.mintlify.com --------------------------------------------------------------------------------
+Models - TypeSafe (https://docs.typesafe.ai/models)
+citeturn29view1 [wordlim: 200] Crawled: today; Content type: text/html; Source: open({"ref_id":"https://docs.typesafe.ai/models","lineno":85}); Total lines: 202
+L0: > ## Documentation Index
+L1: >
+L2: > Fetch the complete documentation index at: cite0†/llms.txt L3: >
+L4: > Use this file to discover all available pages before exploring further.
+L5: 
+L6: cite1†Skip to main content L7: 
+L8: cite2†TypeSafe home page L9: 
+L10: Search...
+L11: 
+L12: Navigation
+L13: 
+L14: Reference
+L15: 
+L16: Models
+L17: 
+L18: Reference
+L19: # Models
+L20: 
+L21: Copy page Copy page
+L22: 
+L23: Jev is TypeSafe’s flagship model and the first cite3†System One model . Every model on this page is served by the same endpoint, `POST /v1/systemone`. The request’s `model` field selects which one handles the call; see the cite4†API reference for the full request shape.
+L24: ##
+L25: 
+L26: cite5†​ L27: 
+L28: Current models
+L29: 
+L30:  | Jev 1.14  | Jev 1.13
+L31: --- | --- | ---
+L32: Model ID  | `jev-1.14.0`  | `jev-1.13.0`
+L33: Price (per Btok / per Mtok)  | $42 / $0.042  | $42 / $0.042
+L34: Context length  | 64k per-request / 32k per-question  | 64k per-request / 32k per-question
+L35: Input  | Text  | Text
+L36: 
+L37: Jev 1.14 is the newest Jev release, available from October 14, 2026.
+L38:   * Price: You pay per input token. Output tokens are free. A Btok is a billion tokens and an Mtok is a million tokens.
+L39:   * Context length: Two limits, the per-request context and the per-question context. See cite6†Context length . To raise both, see cite7†Long context .
+L40:   * Input: Jev reads natural-language text, sent as a string, a JSON object, or an array of text values. It does not accept audio or video. Convert those into text or structured fields before you send them as `state`. See cite8†State for the shapes `state` accepts.
+L41: ##
+L42: 
+L43: cite6†​ L44: 
+L45: Context length
+L46: 
+L47: Jev ingests the `state` once and evaluates every question against it in parallel. A request has to fit two context limits:
+L48:   * Per-request context (`per_request_context`): the `state` plus all questions combined.
+L49:   * Per-question context (`per_question_context`): the `state` plus any one question.
+L50: There is no separate limit on the number of questions in a request. Any number of questions is allowed as long as the request fits both limits. See cite9†Speculative fan-out for packing many questions into one request, and cite10†Jev 1.13 jaggedness for how accuracy shifts as the state grows. To raise both limits, see cite7†Long context .
+L51: ###
+L52: 
+L53: cite7†​ L54: 
+L55: Long context
+L56: Long context is off by default and works on both Jev 1.14 and Jev 1.13. To turn it on, send the `TypeSafe-Danger-Zone-Long-Context: true` header with each request that needs it. With the header, the per-request context and the per-question context are both 262k tokens. Requests without the header keep the default limits in the table above.
+L57: 
+L58:     `curl https://api.typesafe.ai/v1/systemone \
+L59:       -H "Authorization: Bearer $TYPESAFE_API_KEY" \
+L60:       -H "Content-Type: application/json" \
+L61:       -H "TypeSafe-Danger-Zone-Long-Context: true" \
+L62:       -d '{
+L63:         "model": "jev-latest",
+L64:         "state": "<a long contract, transcript, or record>",
+L65:         "questions": {
+L66:           "has_termination_clause": {
+L67:             "type": "noul",
+L68:             "instructions": "Does the `state` include a clause that lets either party end the agreement early?"
+L69:           }
+L70:         }
+L71:       }'
+L72:     `
+L73: Long context costs the same per token as any other request. It is slower and less accurate than staying within the default limits, so turn it on only for requests that need it.
+L74: ##
+L75: 
+L76: cite11†​ L77: 
+L78: Rate limits
+L79: Rate limits are set per organization. Your organization’s current limits are in the cite12†developer console†console.typesafe.ai . Limits are measured in tokens per second and requests per second. A request over either limit returns `429 Too Many Requests`. Our cite13†client SDKs retry these requests by default, waiting longer between each attempt, and follow the `retry-after` header when the response includes one. If you call the HTTP API directly, see cite14†Handling rate limits .
+L80: Higher limits are available on custom and enterprise plans. Contact sales@typesafe.ai.
+L81: ##
+L82: 
+L83: cite15†​ L84: 
+L85: Aliases
+L86: 
+L87: An alias is a model name that points to a versioned model ID. Send it in the `model` field the same way you send a model ID.
+L88: 
+L89: Alias  | Points to  | Meaning
+L90: --- | --- | ---
+L91: `jev-latest`  | `jev-1.13.0`  | The most recent stable, official release. The default in our client SDKs, and the name the examples in these docs use.
+L92: `jev-preview`  | `jev-1.14.0`  | The most recent release, official or not. Moves ahead of `jev-latest` when a preview build is available.
+L93: An alias moves when a new release ships, so its answers can change without any change to your code. Each response’s `model` field gives the versioned ID that answered, so you can log which model produced each result. If you have tuned confidence thresholds against one version, send that version’s ID instead of the alias, and switch to the new version when you are ready.
+L94: ##
+L95: 
+L96: cite16†​ L97: 
+L98: Customizing Jev
+L99: 
+L100: Jev is not fine-tuned or LoRA-adapted with customer data. It is trained with cite17†RLCD to return calibrated decisions, and the same weights serve every account. You shape its answers to your domain through the request rather than through per-account weights:
+L101:   * Put your proprietary content, records, and reference material in the `state` field. See cite8†State .
+L102:   * Encode your domain rules and boundary cases in the `instructions` and `criteria` of each question. See cite18†How to build with TypeSafe and cite19†Advanced: structure .
+L103:   * Decompose broad judgments into atomic questions and combine the outputs in code. See cite20†Composite scoring and the cite21†AutoResearch cookbook for training a downstream classical model on Jev’s probabilities.
+L104: ##
+L105: 
+L106: cite22†​ L107: 
+L108: Language support
+L109: 
+L110: Jev accepts natural-language text. English is the primary training language and where accuracy is currently best. Other languages, including CJK scripts, are handled but not equally well; test on your own content before relying on Jev for a non-English workload, and pay close attention to cite23†Confidence when routing.
+L111: ##
+L112: 
+L113: cite24†​ L114: 
+L115: Data handling
+L116: 
+L117: Jev is not trained on customer requests or responses. See cite25†Legal for the Data Processing Agreement, the Privacy Policy, and details on zero data retention (ZDR) for enterprise customers.
+L118: ##
+L119: 
+L120: cite26†​ L121: 
+L122: Listing models
+L123: 
+L124: `GET /v1/models` returns the names your account can send in the `model` field, each with a description and a release date. It currently lists the aliases. Versioned IDs such as `jev-1.14.0` are accepted by the `model` field whether or not they appear in the list.
+L125: 
+L126: cURL
+L127: 
+L128: Python
+L129: JavaScript
+L130: 
+L131:     `curl https://api.typesafe.ai/v1/models \
+L132:       -H "Authorization: Bearer $TYPESAFE_API_KEY"
+L133:     `
+L134: 
+L135:     `from typesafe_sdk import TypeSafeClient
+L136: 
+L137:     with TypeSafeClient() as client:
+L138:         for model in client.models.list().models:
+L139:             print(model.name, model.release_date, model.description)
+L140:     `
+L141: 
+L142:     `import { TypeSafeClient } from "@typesafe-ai/sdk";
+L143: 
+L144:     const client = new TypeSafeClient();
+L145:     const models = await client.models.list();
+L146:     for (const model of models) {
+L147:       console.log(model.name, model.release_date, model.description);
+L148:     }
+L149:     `
+L150: cite27†​ L151: 
+L152: [Button: models]
+L153: 
+L154: array
+L155: 
+L156: required
+L157: 
+L158: One entry per model or alias.
+L159: 
+L160: Show properties
+L161: 
+L162: cite28†​ L163: 
+L164: [Button: name]
+L165: 
+L166: string
+L167: 
+L168: required
+L169: 
+L170: The model ID or alias, as accepted by the `model` field.
+L171: 
+L172: cite29†​ L173: 
+L174: [Button: description]
+L175: 
+L176: string
+L177: 
+L178: required
+L179: 
+L180: What the model is for.
+L181: 
+L182: cite30†​ L183: 
+L184: [Button: release_date]
+L185: 
+L186: string
+L187: 
+L188: required
+L189: 
+L190: When the model or alias was released.
+L191: 
+L192: See the cite31†Python and cite32†JavaScript SDK references for the full method signatures.
+L193: 
+L194: Was this page helpful?
+L195: 
+L196: Yes No
+L197: 
+L198: cite4†API reference Next L199: cite33†github†github.com cite34†discord†discord.gg cite35†x†x.com L200: 
+L201: cite36†Powered byThis documentation is built and hosted on Mintlify, a developer documentation platform†www.mintlify.com --------------------------------------------------------------------------------
+Advanced usage - TypeSafe (https://docs.typesafe.ai/sdk/python/usage/advanced)
+citeturn29view2 [wordlim: 200] Crawled: today; Content type: text/html; Source: open({"ref_id":"https://docs.typesafe.ai/sdk/python/usage/advanced","lineno":null}); Total lines: 297
+L0: > ## Documentation Index
+L1: >
+L2: > Fetch the complete documentation index at: cite0†/llms.txt L3: >
+L4: > Use this file to discover all available pages before exploring further.
+L5: 
+L6: cite1†Skip to main content L7: 
+L8: cite2†TypeSafe home page L9: 
+L10: Search...
+L11: 
+L12: Navigation
+L13: 
+L14: Usage
+L15: 
+L16: Advanced usage
+L17: 
+L18: Usage
+L19: 
+L20: # Advanced usage
+L21: 
+L22: Performance tuning, logging, and forward compatibility for the TypeSafe Python SDK.
+L23: 
+L24: Copy page Copy page
+L25: 
+L26: ##
+L27: 
+L28: cite3†​ L29: 
+L30: Performance
+L31: 
+L32: If your application sends hundreds of requests per second, follow these recommendations.
+L33: ###
+L34: 
+L35: cite4†​ L36: 
+L37: Reuse clients
+L38: 
+
