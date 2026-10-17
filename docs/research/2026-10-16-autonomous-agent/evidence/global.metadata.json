@@ -1,0 +1,22 @@
+{
+  "url": "https://api.coingecko.com/api/v3/global",
+  "retrieved_at_utc": "2026-10-17T05:41:32.446406+00:00",
+  "http_status": 200,
+  "bytes": 3774,
+  "summary": {
+    "market_cap_percentage": {
+      "btc": 59.31057002725767,
+      "eth": 10.724867333386728,
+      "usdt": 6.642110418975373,
+      "bnb": 3.478987116553675,
+      "xrp": 2.989377877560511,
+      "usdc": 2.627541880847425,
+      "sol": 2.2336668491480025,
+      "trx": 1.1524519585294013,
+      "figr_heloc": 0.8994877546204723,
+      "steth": 0.8526239108231833
+    },
+    "market_cap_change_percentage_24h_usd": -3.4686951515908517,
+    "updated_at": 1792215272
+  }
+}

@@ -1,0 +1,5 @@
+{
+  "url": "https://api.bybit.com/v5/market/tickers?category=linear&symbol=BTCUSDT",
+  "retrieved_at_utc": "2026-10-17T05:41:32.442492+00:00",
+  "error": "HTTP Error 403: Forbidden"
+}

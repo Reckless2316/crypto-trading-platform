@@ -1,0 +1,29 @@
+{
+  "url": "https://www.deribit.com/api/v2/public/get_book_summary_by_currency?currency=BTC&kind=future",
+  "retrieved_at_utc": "2026-10-17T05:41:32.443419+00:00",
+  "http_status": 200,
+  "bytes": 5277,
+  "summary": [
+    {
+      "high": 82859.5,
+      "low": 80725.5,
+      "last": 81512.5,
+      "instrument_name": "BTC-PERPETUAL",
+      "bid_price": 81512.0,
+      "ask_price": 81512.5,
+      "open_interest": 841649160,
+      "mark_price": 81510.5,
+      "creation_timestamp": 1792215688479,
+      "current_funding": 3.471e-05,
+      "estimated_delivery_price": 81487.3,
+      "funding_8h": 7.04e-06,
+      "price_change": -0.6611,
+      "volume": 15736.36303136,
+      "base_currency": "BTC",
+      "quote_currency": "USD",
+      "volume_usd": 1286625880.0,
+      "volume_notional": 1286625880.0,
+      "mid_price": 81512.25
+    }
+  ]
+}

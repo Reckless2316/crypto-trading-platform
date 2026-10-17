@@ -1,0 +1,459 @@
+AgenKit: AI Engineering Team for Claude, Cursor, Codex
+AgenKit
+kits
+What's inside
+Kit
+Guides
+Agents
+Docs
+Pricing
+FAQ
+Activate
+Get AgenKit
+↗
+≡
+New update:
+Local Memory. Fewer tokens, faster sessions.
+Read the docs →
+New update:
+Local Memory. Fewer tokens, faster sessions.
+Read the docs →
+Engineering Kit
+· driven by /agenkit
+New
+Local memory
+Ship
+production software
+, solo.
+Run
+/agenkit
+, describe what you're building, and a full team of specialist agents takes it from brainstorm to architecture, test-first build, review, and ship, pausing for your approval at each step. Production-quality thinking, without hiring the team.
+Subscribe · $
+3.49
+/mo
+↗
+See how it works
+Trusted by Industry AI Leaders
+Mario Nawfal
+Posted to 267K · the AgenKit workflow
+View tweet
+↗
+Miles Deutscher
+Posted to 681K · install the kit
+View tweet
+↗
+One kit · seven harnesses · one license key
+Your $20 AI plan dies in two projects.
+AgenKit makes it last.
+Build any software, at any scale - solo.
+In Claude Code · Cursor · Codex · +4 more →
+/agenkit
+build a production-grade Polymarket bot with a Markov-chain signal
+/agenkit
+Orient
+Context Engineer
+no memory yet, indexing your codebase
+Brainstorm
+Conductor
+turns your idea into a clear spec
+Architecture
+Backend Architect
+services · data model · idempotency
+Build · test-first
+Test Engineer
+failing test → green → refactor
+Review
+Code Reviewer
+spec ✓ then code quality ✓
+Ship
+Infra / DevOps
+CI/CD · deploy · verify
+Running the pipeline…
+◆
+Built by FAANG & frontier-AI engineers
+Eleven focused agents and process skills encode production concerns: tests, security, architecture, and observability, coordinated by /agenkit.
+⟳
+Updated continuously
+The workflows keep improving. Pull the latest anytime with one command,
+agenkit update
+, included while you're subscribed.
+◷
+One simple yearly plan
+A single yearly subscription covers every update. Cancel anytime; your installed kit keeps working locally.
+One kit, seven harnesses, the same team everywhere
+Claude Code
+Cursor
+Codex
+OpenCode
+Antigravity
+GitHub Copilot
+Kimi Code
+$
+/agenkit
+◆
+conductor
+◆
+backend-architect
+▸
+architecture-design
+◆
+test-engineer
+▸
+test-driven-development
+◆
+code-reviewer
+▸
+requesting-code-review
+◆
+debugger
+▸
+systematic-debugging
+◆
+data-engineer
+◆
+frontend-engineer
+◆
+infra-devops-engineer
+▸
+finishing-a-development-branch
+◆
+security-engineer
+◆
+perf-observability-engineer
+▸
+writing-plans
+$
+/agenkit
+◆
+conductor
+◆
+backend-architect
+▸
+architecture-design
+◆
+test-engineer
+▸
+test-driven-development
+◆
+code-reviewer
+▸
+requesting-code-review
+◆
+debugger
+▸
+systematic-debugging
+◆
+data-engineer
+◆
+frontend-engineer
+◆
+infra-devops-engineer
+▸
+finishing-a-development-branch
+◆
+security-engineer
+◆
+perf-observability-engineer
+▸
+writing-plans
+The solo-builder tax
+You're doing the job of an entire team, alone.
+The gap isn't effort. It's expertise. A generalist writes the code; a specialist knows the production concerns you didn't think to ask about.
+What a specialist actually considers
+Watch one agent reason through a routine task - the idempotency, reconciliation, indexes, and async calls a solo generalist quietly skips. That gap is what AgenKit closes, automatically.
+Backend Architect
+thinking about:
+accept Stripe webhooks
+✓
+Make it idempotent: retries deliver the same event twice; dedupe by event id.
+✓
+Verify the signature before trusting a single byte of the payload.
+✓
+This is I/O-bound → run it async, with a timeout, retry, and backoff.
+✓
+Store the raw event first, ack fast, process out of band.
+✓
+Reconcile daily against Stripe; webhooks do get dropped.
+Data Engineer
+thinking about:
+list a user's recent orders
+✓
+This query full-scans; add a composite index on (user_id, created_at).
+✓
+Page with a keyset cursor, not OFFSET, or page 900 crawls.
+✓
+That migration locks the table; run it online and backfill in batches.
+✓
+Don't SELECT * across a join you never read; it bloats the plan.
+Security Engineer
+thinking about:
+add a file upload
+✓
+Validate the type by magic bytes, not the filename extension.
+✓
+Store outside the web root; serve via a signed, expiring URL.
+✓
+Cap the size and rate-limit; an unbounded upload is a DoS.
+✓
+Strip metadata and re-encode; uploads smuggle EXIF and payloads.
+Decisions a generalist skips, applied automatically.
+The /agenkit workflow
+One command runs the whole engineering lifecycle.
+You describe the task once. The Conductor hands each phase to the right specialist and pauses for your approval, the way a senior team ships software.
+Founding price
+First
+150
+subscribers pay
+$
+3.49
+/mo
+.
+After the 150 founding seats, AgenKit is $15/mo. Claim one and your renewal never goes up.
+145
+of
+150
+founding seats left
+$
+3.49
+/mo
+then $
+15
+/mo
+Claim a founding seat
+↗
+14-day refund · cancel any time
+See what's inside the kit
+→
+The full workflow, every specialist, and exactly how to use it.
+Meet the eleven agents →
+·
+Workflow guides →
+·
+Install docs →
+How it works
+Install, activate, go.
+Live in under two minutes, from checkout to a working AI team.
+01
+Get the CLI
+Nothing to install. The commands below run with
+npx
+; Node.js 18+ required.
+optional · install globally
+copy
+$
+npm install -g agenkit
+02
+Activate
+Paste the license key from your receipt. The CLI stores it locally.
+activate
+copy
+$
+npx agenkit activate <license-key>
+03
+Install the kit
+Run it in your project folder. It auto-detects your harness and installs the right files.
+install the kit
+copy
+$
+npx agenkit install engineering-kit
+Any stack
+Works in any language, any architecture.
+Install it into any project, in any language. The agents read your existing code and follow your conventions, from a single service to a modular monolith to microservices.
+Python
+TypeScript
+JavaScript
+Go
+Rust
+Java
+Ruby
+PHP
+C#
+C++
+Swift
+Kotlin
+Elixir
+Scala
+Python
+TypeScript
+JavaScript
+Go
+Rust
+Java
+Ruby
+PHP
+C#
+C++
+Swift
+Kotlin
+Elixir
+Scala
+Why builders keep it installed
+⌘
+Seven harnesses, one kit
+Claude Code, Cursor, Codex, OpenCode, Antigravity, GitHub Copilot, and Kimi Code - the same team everywhere.
+↓
+One command install
+agenkit install auto-detects your harness and drops files where each tool expects them.
+✓
+Checksum-verified
+Every artifact is SHA-256 verified before it touches your project. No silent corruption.
+⌥
+Driven by /agenkit
+One slash command runs the whole pipeline - brainstorm, architecture, plan, test-first build, review, ship.
+⟳
+Update in place
+agenkit update pulls the latest versions. Your own files are never overwritten.
+≈
+Any stack
+Agents adapt to your codebase and conventions instead of imposing an architecture.
+Learn
+Docs, guides, and specialist agents.
+Install with the docs, sharpen your workflow with guides, and see who runs each /agenkit phase.
+Documentation
+Install, /agenkit workflow, local memory, and the CLI.
+Guides
+Token limits and workflow playbooks for Claude Code, Cursor, and Codex.
+Agents
+Eleven specialists: Conductor, architects, test, security, and more.
+Comparison
+Why builders choose AgenKit.
+Other kits
+AgenKit
+Harness support
+Many kits target one tool
+✓
+All seven harnesses, one license
+Install
+Manual copy or per-tool scripts
+✓
+npx agenkit install, auto-detects harness
+What you get
+A small agent pack
+✓
+Eleven specialists plus /agenkit workflow
+Pricing model
+Often one-time or per-seat SaaS
+✓
+One yearly subscription, all harnesses
+Checksum-verified installs
+Uncommon
+✓
+SHA-256 on every download
+Updates over time
+Varies by project
+✓
+agenkit update while subscribed
+Social proof
+Builders are already shipping with AgenKit.
+Trusted by professional and senior developers across all seven harnesses.
+Pricing
+One kit. One yearly subscription.
+The subscription pays for the updates: the kit keeps evolving, and every new release is included, across all seven harnesses. No seats, no account to manage.
+AgenKit subscription
+$
+3.49
+/mo
+Founding price for early subscribers, then $
+15
+/mo.
+You're subscribing to the updates. Install once; the team keeps getting sharper.
+A full AI engineering team of specialists
+The
+/agenkit
+brainstorm-to-ship pipeline
+Every update and new release while subscribed
+One invoice a year · cancel any time
+Subscribe · $
+3.49
+/mo
+↗
+Full pricing & FAQ →
+FAQ
+Questions, answered.
+Still curious? Everything installs locally and keeps working offline once installed.
+01
+Which tools does it work with?
++
+All seven: Claude Code, Cursor, Codex CLI, OpenCode, Antigravity CLI, GitHub Copilot, and Kimi Code. The kit is compiled to the exact file layout each tool expects.
+02
+How do I start it in my tool?
++
+Trigger AgenKit with /agenkit in most tools (Claude Code, Cursor, OpenCode, Antigravity, and Kimi Code). In GitHub Copilot it's @agenkit, and in Codex you invoke the AgenKit skill by name. The install step prints the exact trigger for your harness.
+03
+What exactly do I get?
++
+The Engineering Kit - a full team of specialist agents, the process skills that guide them, and the /agenkit command - delivered as versioned archives installed by the agenkit CLI. Your license key is the only credential; there is no account to manage.
+04
+Do I need to create an account?
++
+No. Checkout issues a license key via Polar; the CLI stores it locally and the API validates it on install.
+05
+Is it one-time or a subscription?
++
+A simple subscription that works out to just $3.49/mo (billed yearly). Early subscribers keep that founding rate while subscribed; after that it's $15/mo. It covers every update while active, across all seven harnesses. Cancel any time; the installed kit keeps working locally.
+06
+How do updates work?
++
+Run agenkit update. It compares your lockfile to the latest versions and refreshes everything your subscription unlocks.
+07
+Is there a refund policy?
++
+Yes - a 14-day money-back window, handled through Polar's customer portal.
+08
+Is AgenKit related to OpenAI's AgentKit?
++
+No. AgenKit (agenkit.xyz) is an independent product: a guided engineering team you install into Claude Code, Cursor, Codex, and other harnesses. It is not affiliated with OpenAI AgentKit.
+Stop being the bottleneck. Ship like a team.
+A full engineering team in every harness you use, driven by one command:
+/agenkit
+.
+Subscribe · $
+3.49
+/mo
+↗
+AgenKit
+The AI engineering team for solo builders. Describe the task once; a specialist workflow takes it from idea to shipped, in every harness you use.
+✓
+Revenue verified
+by TrustMRR
+Product
+What's inside
+Engineering Kit
+Pricing
+Changelog
+Tools
+Claude Code
+Cursor
+Codex CLI
+OpenCode
+Antigravity CLI
+GitHub Copilot
+Kimi Code
+Learn
+Agents
+Guides
+Docs
+Teams
+Guides
+Reduce Claude Code token usage
+Claude Code usage limit reached: what to do
+Cursor credits running out
+Codex usage limits
+Claude Code subagents explained
+Test-driven development with Claude Code
+Claude Code code review workflow
+Claude Code memory: CLAUDE.md vs codebase index
+Legal
+Terms
+Privacy
+Refunds
+Disclaimer
+Activate
+Contact
+Telegram @
+agenkit
+©
+2026
+AgenKit
+·
+agenkit.xyz

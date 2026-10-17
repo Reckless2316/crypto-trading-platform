@@ -1,0 +1,15 @@
+{
+  "url": "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=86400",
+  "retrieved_at_utc": "2026-10-17T05:41:32.441369+00:00",
+  "http_status": 200,
+  "bytes": 21458,
+  "summary": {
+    "last_completed_bar_start_utc": "2026-10-16T00:00:00+00:00",
+    "close": 81500.04,
+    "sma20": 83557.452,
+    "sma50": 81249.696,
+    "return7d": -0.012655807985757161,
+    "return30d": 0.07032701691864407,
+    "bars": 349
+  }
+}
