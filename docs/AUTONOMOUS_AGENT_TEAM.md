@@ -7,6 +7,7 @@ Created October 17, 2026 under the operator's explicit request for agents/subage
 | Agent | Responsibility | Current evidence |
 |---|---|---|
 | Conductor (`/root`) | Coordinate the approved plan, resolve interfaces, preserve progress and enforce review gates | [Build checkpoint](checkpoints/2026-10-17-autonomous-agent.md) |
+| Delegated orchestrator (`orchestrator`) | Dispatch scoped recovery/build workers and independent diff reviewers; report accepted milestones to root | Active; recovering unfinished accounting work, then continuing approved Build tasks |
 | Core implementer (`build_task_02`) | Own the ledger schema, persistence code and focused tests for the current task; fix review findings | Ledger accepted through `57509ea`; 49 focused tests passing; next task is accounting |
 | Accounting implementer (`build_task_03`) | Build native fill/basis/fee accounting, exact capital-flow NAV, evidence-backed readiness and persistent loss latches | In progress from base `67ad62e`; independent review follows |
 | Independent reviewer (`review_task_02`) | Check specification compliance, then quality, durability and correctness; reject incomplete work | All five initial ledger findings closed; specification and quality review pass |
