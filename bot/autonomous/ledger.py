@@ -1222,8 +1222,19 @@ class Ledger:
             replacement=p['replacement']
             if any(replacement[k]!=original[column] for k,column in (('fill_id','fill_id'),('intent_id','intent_id'),('venue','venue'),('trade_id','venue_trade_id'),('order_id','venue_order_id'),('instrument','instrument'),('side','side'))):
                 raise ContractViolation('correction changes immutable trade identity')
-            c.execute('INSERT INTO fill_corrections VALUES (?,?,?,?,?,NULL,?,?,?)',(evidence_id,p['fill_id'],p['previous_payload_hash'],canonical_bytes(replacement).decode(),content_hash(replacement),e['received_at_us'],'verified local paper correction',self._clock_us()))
-            self._apply_economics(e,p,'correction')
+            # Unsupported factual corrections must inhibit, while all attempted
+            # compensation is discarded. Keep the incident outside this savepoint
+            # so unknown basis or serialization bounds cannot leave stale readiness.
+            c.execute('SAVEPOINT correction_economics')
+            try:
+                c.execute('INSERT INTO fill_corrections VALUES (?,?,?,?,?,NULL,?,?,?)',(evidence_id,p['fill_id'],p['previous_payload_hash'],canonical_bytes(replacement).decode(),content_hash(replacement),e['received_at_us'],'verified local paper correction',self._clock_us()))
+                self._apply_economics(e,p,'correction')
+            except (ContractViolation,KeyError,TypeError) as exc:
+                c.execute('ROLLBACK TO correction_economics')
+                c.execute('RELEASE correction_economics')
+                self._finding(e,'unaccounted correction: '+str(exc))
+                return False
+            c.execute('RELEASE correction_economics')
             self._finding(e,'fill correction requires fresh economic review')
             self._mark_after_economics(e)
             return True

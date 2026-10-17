@@ -1211,6 +1211,56 @@ class AccountingTests(unittest.TestCase):
         self.assertEqual(before,self.balances())
         self.assertFalse(self.ledger.account_view('paper-test').ready)
 
+    def test_unknown_correction_fee_retains_evidence_and_inhibits_without_economics(self):
+        self.initialize()
+        self.intent('buy',quantity='1')
+        original=self.fill('original','buy','1','100','USD','0')
+        books={'AAVE':{'at_us':self.now,'bids':[['100','1']]}}
+        self.mark('current',books=books)
+        self.assertTrue(self.ledger.account_view('paper-test').ready)
+        evidence=self.evidence('unknown-correction','correction',{'fill_id':'original',
+            'previous_payload_hash':content_hash(original),
+            'replacement':dict(original,fee_asset='MISSING',fee_quantity='1')})
+        before=self.balances()
+        count=self.ledger.connection.execute('SELECT count(*) FROM journal_transactions').fetchone()[0]
+        try:admitted=self.ledger.correct_fill(evidence)
+        except ContractViolation as exc:self.fail('unsupported correction must retain an inhibition: '+str(exc))
+        self.assertFalse(admitted)
+        self.assertFalse(self.ledger.correct_fill(evidence))
+        self.assertEqual(before,self.balances())
+        self.assertEqual(count,self.ledger.connection.execute('SELECT count(*) FROM journal_transactions').fetchone()[0])
+        self.assertEqual(0,self.ledger.connection.execute('SELECT count(*) FROM fill_corrections').fetchone()[0])
+        self.assertEqual(1,self.ledger.connection.execute('SELECT count(*) FROM accounting_evidence WHERE evidence_id=?',(evidence,)).fetchone()[0])
+        self.assertEqual(1,self.ledger.connection.execute('SELECT count(*) FROM accounting_findings WHERE evidence_id=?',(evidence,)).fetchone()[0])
+        self.mark('after-rejected-correction',books=books)
+        self.assertFalse(self.ledger.account_view('paper-test').ready)
+        self.ledger.close();self.ledger=load_ledger().open(self.path)
+        self.ledger._clock_us=lambda:self.now
+        self.assertEqual(before,self.balances())
+        self.assertFalse(self.ledger.account_view('paper-test').ready)
+
+    def test_correction_serialization_failure_rolls_back_before_retaining_incident(self):
+        from unittest.mock import patch
+        self.initialize()
+        self.intent('buy',quantity='1')
+        original=self.fill('original','buy','1','100','USD','0')
+        self.mark('current',books={'AAVE':{'at_us':self.now,'bids':[['100','1']]}})
+        self.assertTrue(self.ledger.account_view('paper-test').ready)
+        evidence=self.evidence('unsupported-correction','correction',{'fill_id':'original',
+            'previous_payload_hash':content_hash(original),
+            'replacement':dict(original,fee_quantity='1')})
+        tables=('journal_transactions','journal_postings','fill_corrections','accounting_operations','balance_positions')
+        before={table:[tuple(row) for row in self.ledger.connection.execute('SELECT * FROM '+table)] for table in tables}
+        with patch('bot.autonomous.ledger._native_posting_quantities',side_effect=ContractViolation('native posting scale exceeded')):
+            try:admitted=self.ledger.correct_fill(evidence)
+            except ContractViolation as exc:self.fail('unsupported serialization must retain an inhibition: '+str(exc))
+            self.assertFalse(admitted)
+        after={table:[tuple(row) for row in self.ledger.connection.execute('SELECT * FROM '+table)] for table in tables}
+        self.assertEqual(before,after)
+        self.assertEqual(1,self.ledger.connection.execute('SELECT count(*) FROM accounting_evidence WHERE evidence_id=?',(evidence,)).fetchone()[0])
+        self.assertEqual(1,self.ledger.connection.execute('SELECT unresolved FROM accounting_state').fetchone()[0])
+        self.assertFalse(self.ledger.account_view('paper-test').ready)
+
     def test_trailing_zero_flow_is_canonical_idempotent_and_restartable(self):
         from bot.autonomous.contracts import strict_json
         self.initialize()
