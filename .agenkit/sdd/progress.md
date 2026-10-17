@@ -1,5 +1,9 @@
 # Autonomous agent implementation
 
+## PAUSED — explicit operator instruction
+
+Operator explicitly requested `pause` during Task 5. Root immediately interrupted `/root/build_task05`; all other current child agents are completed. No further build/review/research is authorized until operator resumes. Tasks 3/4 are accepted and committed; Task 5 remains incomplete/unreviewed. Preserve all partial working files. Last worker handoff: requested Task 5 base `9bd127c439b01921998a4bfcf6d420ef03a50489`, actual starting HEAD `d9226c17a98cd65233d82f9540f7c8850aca33bc`; isolated feature-math TDD started. Unresolved integration seam: existing `Ledger.account_view` is current-only; historical inventory must derive from committed causal journal/valuation evidence or an explicitly frozen evidence-bound historical view, never silently from current mutable holdings. No Task 5 passing result or acceptance claimed. Latest observed five-hour metadata `2026-10-17T09:42:34.905Z`: 86% used / 14% remaining. Immediate explicit pause supersedes waiting for the 10%-remaining threshold.
+
 ## Usage stop rule — operator instruction
 
 Operator requests all work pause when the five-hour allowance reaches 10% remaining: primary `window_minutes=300`, `used_percent >= 90`. Monitor current-thread rollout `event_msg/token_count` rate-limit metadata before dispatch and regularly while working; do not substitute weekly usage, token context or elapsed wall time. At threshold interrupt all active agents, preserve edits, record exact usage timestamp/remaining work and stop until operator resumes. Latest observed metadata `2026-10-17T09:32:04.075Z`: primary 60% used / 40% remaining, weekly 9% used. This rule supersedes continuous execution once its condition is met.
