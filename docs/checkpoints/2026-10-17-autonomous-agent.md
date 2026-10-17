@@ -35,7 +35,7 @@ The installed `.venv` uses Python 3.14.4; the deployment image specifies Python 
 |---|---|
 | 1 Domain contracts/defaults | complete; commits a77407a + 76e0527; 26 tests Python 3.12; independent spec/quality review passes |
 | 2 Durable journal/reservations | complete through 57509ea; 49 focused tests pass; independent spec/quality review passes |
-| 3 Equity/flows/latches | pending |
+| 3 Equity/flows/latches | in progress; fresh accounting implementer; base 67ad62e |
 | 4 Causal source/archive | pending |
 | 5 Numeric state/token proof | pending |
 | 6 Research/six schema definitions | pending |
@@ -75,3 +75,7 @@ An additional accounting specialist produced `docs/reviews/2026-10-17-accounting
 ### Task 2 acceptance
 
 Accepted through `57509ea` after independent review and three fix rounds. All R1–R5 closed;49 focused Python3.12 tests pass. Dispatch returns only after its own durable commit. Historical exports bind account revision and all required anchors to a cutoff-visible committed evidence prefix; complete causal policies and durable event order prevent mixed historical states. All collaborators/imports must use `ledger.transaction()`. Evidence identities must survive any future storage compaction. Full report/review remain `.agenkit/sdd/task-02-report.md` and `task-02-review.md`. Task3 is next; no live readiness is claimed.
+
+### Active accounting build and advisory handoffs
+
+Task3 is assigned to a fresh accounting implementer from base `67ad62e`, with the exact rational representation guidance and final ledger transaction/export contracts. Focused test-first accounting work is in progress; no passing result or acceptance is claimed yet. The independent integration advisory is saved at `docs/reviews/2026-10-17-integration-entrypoints.md` and referenced by Task16/17/20 briefs. It maps source reachability, not active runtime state. The focused research supplement is saved under `docs/research/2026-10-17-autonomous-agent/research-deep/`; twelve manifest hashes verified after copying. Rejected RPC responses remain rejected, with all candidates ineligible.
