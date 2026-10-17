@@ -10,6 +10,8 @@ Task 3 is accepted through source `a4fbd8daf554e39372f429aa12954d4924073a3a` and
 
 Task 4 accepted at `26dfa8dc56da3f91ad41f7472889c2ae1b0816cb` from full base `4e57061a10fa16a3a9131a9954e831d225a20c1c`. Independent spec PASS and quality PASS with no open findings (`task-04-review.md`); 164 covering tests pass (133 prior + 31 causal), root independently reran in 2.469s. Four review blockers and follow-up reserved-reason/orphan recovery gaps closed test-first. Immutable observations, causal revision selection, sequence-aware books, durable bounded archives/recovery, source-health and pending-lineage guards implemented. Task 5 is next. AgenKit CLI unavailable; saved MEMORY.md fallback and prepared exact integration source map in use.
 
+Task 5 dispatched fresh `/root/build_task05` from `9bd127c`, owning only `state.py`, `test_state.py` and `task-05-report.md`. Latest observed five-hour metadata `2026-10-17T09:41:50Z`: 84% used / 16% remaining. Worker explicitly instructed to preserve partial work and pause when root interrupts at the 90%-used threshold. Task 5 is not accepted; no passing Task 5 result claimed.
+
 ## Previous checkpoint — superseded by resumed acceptance above
 
 Operator resumed the build with AgenKit as the engineering workflow and root as its direct lead. The separate orchestrator agent is retired from this project; it and its unfinished reviewer remain interrupted. Notion work is canceled; only local draft payloads exist and no pages were created. Preserve those historical files without further work on them.
