@@ -253,6 +253,7 @@ class Ledger:
                 raise PersistenceUnavailable('release content identity mismatch')
         for row in self.connection.execute('SELECT archive_json,manifest_hash,export_json FROM review_sessions'):
             archive = SessionArchive.from_json(row[0])
+            self._validate_session_anchors(strict_json(row[2]),archive.cutoff,archive.account_revision)
             expected_manifest = content_hash((archive.cutoff,archive.account_revision,
                 archive.database_export_hash,archive.event_manifest,archive.forecast_manifest,
                 archive.outcome_manifest,archive.artifact_manifest))
@@ -690,20 +691,51 @@ class Ledger:
             raise ContractViolation('cross-account review references')
         return self._revision(next(iter(accounts))) if accounts else AccountRevision()
 
+    @staticmethod
+    def _validate_session_anchors(export: object, cutoff: SessionCutoff,
+            revision: AccountRevision) -> None:
+        """The archive's own references must resolve inside its replay payload.
+
+        A live-table FK cannot prove membership in the selected historical
+        prefix. Apply this to new exports, cached archives and startup scans.
+        """
+        if type(export) is not dict:
+            raise ContractViolation('invalid session replay payload')
+        def rows(table: str) -> list[dict]:
+            values=export.get(table,[])
+            if type(values) is not list or any(type(row) is not dict for row in values):
+                raise ContractViolation('invalid session replay table')
+            return values
+        accounts=[row for row in rows('accounts') if row.get('account_id')==cutoff.account_id]
+        if len(accounts)!=1 or accounts[0]['created_at_us']>cutoff.cutoff_us:
+            raise ContractViolation('session account anchor outside committed prefix')
+        reconciliations=[row for row in rows('reconciliations')
+            if row.get('reconcile_id')==cutoff.reconcile_id and row.get('account_id')==cutoff.account_id]
+        if len(reconciliations)!=1:
+            raise ContractViolation('session reconciliation anchor outside committed prefix')
+        reconciliation=reconciliations[0]
+        if reconciliation['status']!='completed' or reconciliation['finished_at_us'] is None or any(reconciliation[field]>cutoff.cutoff_us for field in _EXPORT_TIMES['reconciliations']):
+            raise ContractViolation('session reconciliation anchor is not cutoff-complete')
+        histories=[row for row in rows('account_revision_history')
+            if row.get('account_id')==cutoff.account_id and row['known_at_us']<=cutoff.cutoff_us and row['recorded_at_us']<=cutoff.cutoff_us]
+        if not histories:
+            raise ContractViolation('session revision anchor outside committed prefix')
+        historical=max(histories,key=lambda row:row['append_sequence'])
+        if revision!=AccountRevision(historical['journal_sequence'],historical['version']) or accounts[0]['generation']!=historical['generation']:
+            raise ContractViolation('session revision/generation anchor mismatch')
+
     def export_session(self, cutoff: SessionCutoff) -> SessionArchive:
         if type(cutoff) is not SessionCutoff:
             raise ContractViolation('typed session cutoff required')
         with self.transaction() as c:
             self._require_account(cutoff.account_id)
-            previous = c.execute('SELECT archive_json FROM review_sessions WHERE account_id=? AND cutoff_us=?',(cutoff.account_id,cutoff.cutoff_us)).fetchone()
+            previous = c.execute('SELECT archive_json,export_json FROM review_sessions WHERE account_id=? AND cutoff_us=?',(cutoff.account_id,cutoff.cutoff_us)).fetchone()
             if previous:
                 archive = SessionArchive.from_json(previous[0])
                 if archive.cutoff!=cutoff:
                     raise ContractViolation('session cutoff identity reused with different reconciliation')
+                self._validate_session_anchors(strict_json(previous['export_json']),cutoff,archive.account_revision)
                 return archive
-            reconcile = c.execute('SELECT * FROM reconciliations WHERE reconcile_id=? AND account_id=?',(cutoff.reconcile_id,cutoff.account_id)).fetchone()
-            if reconcile is None or reconcile['status']!='completed' or reconcile['finished_at_us'] is None or reconcile['finished_at_us']>cutoff.cutoff_us or reconcile['recorded_at_us']>cutoff.cutoff_us:
-                raise ContractViolation('session lacks cutoff-consistent reconciliation')
             historical=c.execute('SELECT * FROM account_revision_history WHERE account_id=? AND recorded_at_us<=? AND known_at_us<=? ORDER BY append_sequence DESC LIMIT 1',
                 (cutoff.account_id,cutoff.cutoff_us,cutoff.cutoff_us)).fetchone()
             if historical is None:
@@ -785,6 +817,7 @@ class Ledger:
                         targets=export.get(foreign_key['table'],[])
                         if not any(target.get(foreign_key['to'])==row[source_column] for target in targets):
                             raise ContractViolation('session cutoff lacks referenced '+foreign_key['table'])
+            self._validate_session_anchors(export,cutoff,revision)
             event_manifest = self._manifest_entries(export,('source_events','source_invalidations','event_segments'))
             forecast_manifest = self._manifest_entries(export,('forecasts',))
             outcome_manifest = self._manifest_entries(export,('outcome_labels','label_events'))

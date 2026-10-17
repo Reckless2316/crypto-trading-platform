@@ -588,3 +588,28 @@ class LedgerTests(unittest.TestCase):
         with self.ledger.transaction():
             pass
         self.assertEqual(count+1,self.ledger.connection.execute('SELECT count(*) FROM account_revision_history').fetchone()[0])
+
+    def test_review_r2_reconciliation_anchor_requires_selected_committed_prefix(self):
+        self.seed()
+        base=time.time_ns()//1000+1000
+        # The reconciliation row is visible by timestamp T, but its committed
+        # evidence-prefix proof is captured at T+1.
+        self.ledger._clock_us=lambda:base+1
+        with self.ledger.transaction() as c:
+            c.execute("INSERT INTO reconciliations(reconcile_id,account_id,started_at_us,finished_at_us,status,balances_json,open_orders_json,differences_json,recorded_at_us) VALUES ('new-anchor','paper-test',?,?,'completed','[]','[]','[]',?)",(base,base,base))
+        self.ledger._clock_us=lambda:base+2
+        with self.assertRaises(ContractViolation):
+            self.ledger.export_session(SessionCutoff('paper-test',base,'new-anchor'))
+        self.assertEqual(0,self.ledger.connection.execute('SELECT count(*) FROM review_sessions').fetchone()[0])
+        archive,payload=self.export_payload(SessionCutoff('paper-test',base+1,'new-anchor'))
+        self.assertEqual('new-anchor',archive.cutoff.reconcile_id)
+        self.assertIn('new-anchor',[row['reconcile_id'] for row in payload['reconciliations']])
+        self.assertEqual(['paper-test'],[row['account_id'] for row in payload['accounts']])
+
+    def test_review_r2_session_account_anchor_requires_creation_prefix(self):
+        created=self.ledger.connection.execute('SELECT created_at_us FROM accounts').fetchone()[0]
+        with self.assertRaises(ContractViolation):
+            self.ledger.export_session(SessionCutoff('paper-test',created-1,'missing'))
+        with self.assertRaises(ContractViolation):
+            self.ledger.export_session(SessionCutoff('different-account',created+1,'missing'))
+        self.assertEqual(0,self.ledger.connection.execute('SELECT count(*) FROM review_sessions').fetchone()[0])
