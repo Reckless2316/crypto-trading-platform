@@ -24,7 +24,7 @@ from .contracts import (
     Reservation, RiskLimits, RiskVerdict, SessionArchive, SessionCutoff, ReviewJob,
     candidate_wire_id, canonical_bytes, checked_money, content_hash, decimal_text,
     decimal_value, strict_json, ExactRatio, ExactNavEvidence, Holding,
-    MAX_DECIMAL_SCALE,
+    MAX_DECIMAL_SCALE, StateUnavailable,
 )
 
 _MIGRATION = Path(__file__).resolve().parents[2] / 'data/migrations/001_autonomous_ledger.sql'
@@ -174,10 +174,73 @@ class Ledger:
     def __init__(self, connection: sqlite3.Connection):
         self.connection = connection
         self.dispatch_enabled = True
+        self._source_required = False
+        self._source_engine = None
         self._risk_config: tuple | None = None
         self._transaction_failed = False
         self._clock_us: Callable[[], int] = lambda: time.time_ns() // 1000
         self._monotonic_ns: Callable[[], int] = time.monotonic_ns
+
+    @property
+    def source_entries_ready(self) -> bool:
+        # A reopened source-bearing ledger requires archive recovery even before
+        # the authority wires its StateEngine. An empty legacy paper fixture has
+        # no source dependency until one is explicitly attached.
+        if self._source_engine is None:
+            return not self._source_required and not self.connection.execute('SELECT 1 FROM source_events LIMIT 1').fetchone()
+        return self._source_engine.entries_ready
+
+    def _bind_source_engine(self, engine) -> None:
+        from .state import StateEngine
+        if type(engine) is not StateEngine or engine.ledger is not self:
+            raise ContractViolation('invalid source health owner')
+        if self._source_engine is not None and self._source_engine is not engine:
+            previous=self._source_engine
+            if previous.archive.root!=engine.archive.root or previous.policies!=engine.policies:
+                raise ContractViolation('source recovery configuration conflict')
+        self._source_engine=engine
+
+    def _check_source_health(self) -> None:
+        if not self.source_entries_ready:
+            raise StateUnavailable('causal source/archive recovery unavailable')
+
+    def _source_lineage_invalid(self, snapshot_id: str) -> bool:
+        # A delta checkpoint depends on the preceding full snapshot and every
+        # intervening delta. Full resets break ancestry for later checkpoints,
+        # while old frozen snapshots keep their original dependency forever.
+        # Segment schema omits stream; resolve its concrete event candidates
+        # conservatively by source/instrument/sequence, then follow each stream.
+        snapshot=self.connection.execute('SELECT knowledge_cutoff_us FROM snapshots WHERE snapshot_id=?',(snapshot_id,)).fetchone()
+        if snapshot is None:return False
+        frozen_cutoff=snapshot[0]
+        targets=self.connection.execute("""SELECT DISTINCT e.* FROM snapshot_inputs si
+            JOIN source_events e ON e.event_id=si.event_id OR EXISTS (
+                SELECT 1 FROM event_segments es WHERE es.segment_hash=si.segment_hash
+                AND es.source=e.source AND es.instrument=e.instrument
+                AND e.sequence BETWEEN es.first_sequence AND es.last_sequence)
+            WHERE si.snapshot_id=?""",(snapshot_id,)).fetchall()
+        for target in targets:
+            if self.connection.execute("SELECT 1 FROM source_invalidations WHERE event_id=? AND (reason!='source_revision_superseded' OR known_at_us>? OR recorded_at_us>?)",
+                    (target['event_id'],frozen_cutoff,frozen_cutoff)).fetchone():
+                return True
+            payload=strict_json(target['payload_json'])
+            if type(payload) is not dict or 'is_snapshot' not in payload or target['sequence'] is None:
+                continue
+            invalid_ancestor=self.connection.execute("""SELECT 1 FROM source_invalidations i
+                JOIN source_events ancestor ON ancestor.event_id=i.event_id
+                WHERE ancestor.source=? AND ancestor.stream=? AND ancestor.instrument=?
+                AND ancestor.sequence<=?
+                AND (i.reason!='source_revision_superseded' OR i.known_at_us>? OR i.recorded_at_us>?)
+                AND json_type(ancestor.payload_json,'$.is_snapshot') IN ('true','false')
+                AND NOT EXISTS (SELECT 1 FROM source_events reset
+                    WHERE reset.source=ancestor.source AND reset.stream=ancestor.stream
+                    AND reset.instrument=ancestor.instrument
+                    AND reset.sequence>ancestor.sequence AND reset.sequence<=?
+                    AND json_extract(reset.payload_json,'$.is_snapshot')=1)
+                LIMIT 1""",(target['source'],target['stream'],target['instrument'],
+                    target['sequence'],frozen_cutoff,frozen_cutoff,target['sequence'])).fetchone()
+            if invalid_ancestor:return True
+        return False
 
     @classmethod
     def open(cls, path: Path) -> Ledger:
@@ -580,6 +643,7 @@ class Ledger:
         return account, cash, notional
 
     def _check_decision(self, proposal: OrderProposal, decision: DecisionReference | None) -> None:
+        if not proposal.reducing_only:self._check_source_health()
         if decision != proposal.decision:
             raise ContractViolation('decision reference mismatch')
         if decision is None:
@@ -589,6 +653,8 @@ class Ledger:
         row = self.connection.execute('SELECT d.*,s.account_id,s.release_hash,s.snapshot_id,s.lineage_hash,s.valid,s.candle_close_us FROM decisions d JOIN snapshots s USING(snapshot_id) WHERE d.decision_id=?',(decision.decision_id,)).fetchone()
         if row is None or row['account_id']!=proposal.account_id or row['request_id']!=decision.request_id or row['release_hash']!=decision.release_hash or row['snapshot_id']!=decision.snapshot_hash or row['candle_close_us']!=proposal.candle_close_us or not row['valid'] or row['status']!='completed':
             raise ContractViolation('unproven decision reference')
+        if self._source_lineage_invalid(row['snapshot_id']):
+            raise StateUnavailable('decision source lineage invalidated')
         candidate = self.connection.execute('SELECT status FROM candidate_results WHERE decision_id=? AND candidate_id=?',(decision.decision_id,candidate_wire_id(proposal.candidate_id))).fetchone()
         if not proposal.reducing_only and (candidate is None or candidate[0]!='eligible'):
             raise ContractViolation('decision candidate not eligible')
@@ -597,6 +663,7 @@ class Ledger:
             generation: int, decision: DecisionReference | None) -> PreparedIntent:
         if type(proposal) is not OrderProposal or type(expected) is not AccountRevision:
             raise ContractViolation('typed proposal/revision required')
+        if not proposal.reducing_only:self._check_source_health()
         with self.transaction() as c:
             wire_id = candidate_wire_id(proposal.candidate_id)
             existing = c.execute('SELECT intent_id,proposal_json,generation FROM order_intents WHERE account_id=? AND candle_close_us=? AND candidate_id=? AND action_slot=?',(proposal.account_id,proposal.candle_close_us,wire_id,proposal.action_slot)).fetchone()
