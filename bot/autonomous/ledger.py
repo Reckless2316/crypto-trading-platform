@@ -11,7 +11,8 @@ import sqlite3
 import time
 from contextlib import contextmanager
 from dataclasses import replace
-from decimal import Decimal, ROUND_CEILING, localcontext
+from decimal import Context, Decimal, DecimalException, ROUND_CEILING, localcontext
+from functools import wraps
 from pathlib import Path
 from typing import Callable, Iterator
 
@@ -33,6 +34,60 @@ _TRANSITIONS = {
     IntentState.PARTIAL: {IntentState.PARTIAL, IntentState.FILLED, IntentState.CANCELED, IntentState.UNKNOWN},
     IntentState.UNKNOWN: {IntentState.OPEN, IntentState.PARTIAL, IntentState.FILLED, IntentState.CANCELED, IntentState.REJECTED},
 }
+
+
+# Visibility policies describe observation/receipt/knowledge time, not future
+# deadlines, expiry windows, forecast maturity, or other declared metadata.
+_EXPORT_TIMES = {
+    'accounts': ('created_at_us',),
+    'account_revision_history': ('recorded_at_us','known_at_us'),
+    'control_events': ('recorded_at_us',),
+    'source_events': ('recorded_at_us','event_at_us','received_at_us','known_at_us'),
+    'source_invalidations': ('recorded_at_us','known_at_us'),
+    'event_segments': ('recorded_at_us','committed_at_us','event_from_us','event_to_us','received_from_us','received_to_us'),
+    'snapshots': ('recorded_at_us','candle_close_us','knowledge_cutoff_us'),
+    'snapshot_inputs': ('recorded_at_us',),
+    'decisions': ('recorded_at_us','received_at_us'),
+    'candidate_results': ('recorded_at_us',),
+    'order_intents': ('recorded_at_us','candle_close_us'),
+    'order_events': ('recorded_at_us','event_at_us','received_at_us'),
+    'fills': ('recorded_at_us','event_at_us','received_at_us'),
+    'fill_corrections': ('recorded_at_us','received_at_us'),
+    'journal_transactions': ('recorded_at_us','event_at_us'),
+    'journal_postings': ('recorded_at_us',),
+    'equity_marks': ('recorded_at_us','marked_at_us'),
+    'external_flows': ('recorded_at_us','event_at_us'),
+    'reconciliations': ('recorded_at_us','started_at_us','finished_at_us'),
+    'forecasts': ('recorded_at_us',),
+    'outcome_labels': (),  # stable identity requires a visible label event below
+    'label_events': ('recorded_at_us',),
+    'evidence_manifests': ('recorded_at_us','cutoff_us'),
+    'release_bundles': ('recorded_at_us',),
+    'release_events': ('recorded_at_us',),
+    'evaluation_runs': ('recorded_at_us',),
+}
+_EXPORT_OMIT = {'schema_migrations','review_sessions','review_jobs','account_control',
+    'account_readiness','balance_positions','candidate_control','reservations'}
+_MANIFEST_KEYS = {
+    'source_events': ('event_id',), 'source_invalidations': ('invalidation_id',),
+    'event_segments': ('segment_hash',), 'forecasts': ('forecast_id',),
+    'outcome_labels': ('label_id',), 'label_events': ('label_event_id',),
+    'release_bundles': ('release_hash',), 'evidence_manifests': ('manifest_hash',),
+    'evaluation_runs': ('run_id',), 'snapshots': ('snapshot_id',),
+    'snapshot_inputs': ('snapshot_id','line_no'),
+}
+
+
+def _decimal_boundary(function):
+    """Supported contract arithmetic must not inherit a caller's precision/traps."""
+    @wraps(function)
+    def wrapped(*args, **kwargs):
+        try:
+            with localcontext(Context(prec=100)):
+                return function(*args, **kwargs)
+        except DecimalException as exc:
+            raise ContractViolation('invalid decimal boundary arithmetic') from exc
+    return wrapped
 
 
 def validate_postings(postings: tuple[tuple[str, int], ...]) -> None:
@@ -121,6 +176,7 @@ class Ledger:
             if outer:
                 if self._transaction_failed or not self.dispatch_enabled:
                     raise PersistenceUnavailable('nested operation failed; outer transaction rolled back')
+                self._record_revisions()
                 committing = True
                 self.connection.execute('COMMIT')
         except BaseException as exc:
@@ -234,7 +290,7 @@ class Ledger:
                 c.execute('UPDATE account_readiness SET ready=0,private_heartbeat_us=NULL,version=version+1 WHERE account_id=?',(account_id,))
                 for intent in c.execute("SELECT intent_id,generation FROM order_intents WHERE account_id=? AND state='dispatching'",(account_id,)).fetchall():
                     payload = canonical_bytes({'reason':'crash_after_dispatch','generation':intent['generation']}).decode()
-                    c.execute("INSERT INTO order_events(event_id,intent_id,kind,payload_json,received_at_us,recorded_at_us) VALUES (?,?,'unknown',?,?,?)",('recovery-'+content_hash((intent['intent_id'],row['generation'])),intent['intent_id'],payload,now,now))
+                    self._append_order_evidence('recovery-'+content_hash((intent['intent_id'],row['generation'])),intent['intent_id'],'unknown',payload,now,now)
                     c.execute("UPDATE order_intents SET state='unknown',version=version+1 WHERE intent_id=?",(intent['intent_id'],))
                     c.execute("UPDATE reservations SET state='unknown',version=version+1,updated_at_us=? WHERE intent_id=?",(now,intent['intent_id']))
                 control = c.execute('SELECT permit_epoch FROM account_control WHERE account_id=?',(account_id,)).fetchone()
@@ -374,6 +430,7 @@ class Ledger:
         if monotonic_ns is not None:
             self._monotonic_ns = monotonic_ns
 
+    @_decimal_boundary
     def _risk_check(self, proposal: OrderProposal, expected: AccountRevision | None,
             generation: int, *, exclude_intent_id: str | None = None) -> tuple[AccountView,int,int]:
         if self._risk_config is None:
@@ -486,11 +543,14 @@ class Ledger:
             c.execute('INSERT INTO order_intents(intent_id,account_id,decision_id,candidate_id,release_hash,candle_close_us,action_slot,instrument,side,qty,limit_price,max_fee_usd_u,client_order_id,state,permit_epoch,generation,version,proposal_json,prepared_revision_json,recorded_at_us) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,\'reserved\',?,?,0,?,?,?)',
                 (intent_id,proposal.account_id,decision.decision_id if decision else None,wire_id,proposal.release_hash,proposal.candle_close_us,proposal.action_slot,proposal.instrument,proposal.side.value,decimal_text(proposal.base_quantity),decimal_text(proposal.limit_price),proposal.max_fee_usd_u,client_id,proposal.control_epoch,generation,proposal.to_json(),account.revision.to_json(),now))
             c.execute("INSERT INTO reservations VALUES (?,?,?,?,?,?,'reserved',0,?)",(intent_id,cash,decimal_text(proposal.base_quantity),notional,proposal.loss_budget_usd_u,decimal_text(proposal.base_quantity),now))
-            c.execute("INSERT INTO order_events(event_id,intent_id,kind,payload_json,received_at_us,recorded_at_us) VALUES (?,?,'reserved',?,?,?)",('reserved-'+identity,intent_id,proposal.to_json(),now,now))
+            self._append_order_evidence('reserved-'+identity,intent_id,'reserved',proposal.to_json(),now,now)
             result = self._prepared(intent_id)
         return result
 
     def mark_dispatching(self, intent_id: str, generation: int) -> PreparedIntent:
+        # A returned dispatch capability promises a completed durable commit.
+        if self.connection.in_transaction:
+            raise ContractViolation('dispatch marker requires its own committed transaction')
         with self.transaction() as c:
             intent = self._prepared(intent_id)
             if intent.generation!=generation:
@@ -500,12 +560,13 @@ class Ledger:
             if intent.state is not IntentState.RESERVED:
                 raise ContractViolation('intent has already left reserved; reconcile, never blindly redispatch')
             now = self._clock_us()
-            c.execute("INSERT INTO order_events(event_id,intent_id,kind,payload_json,received_at_us,recorded_at_us) VALUES (?,?,'dispatching',?,?,?)",('dispatch-'+intent_id,intent_id,canonical_bytes({'generation':generation}).decode(),now,now))
+            self._append_order_evidence('dispatch-'+intent_id,intent_id,'dispatching',canonical_bytes({'generation':generation}).decode(),now,now)
             c.execute("UPDATE order_intents SET state='dispatching',version=version+1 WHERE intent_id=?",(intent_id,))
             c.execute("UPDATE reservations SET state='dispatching',version=version+1,updated_at_us=? WHERE intent_id=?",(now,intent_id))
             result = self._prepared(intent_id)
         return result
 
+    @_decimal_boundary
     def append_order_event(self, event: OrderEvent) -> AppendResult:
         if type(event) is not OrderEvent:
             raise ContractViolation('typed order event required')
@@ -527,7 +588,7 @@ class Ledger:
                 raise ContractViolation('filled event retains unfilled quantity')
             if event.kind is IntentState.PARTIAL and (event.result.filled_quantity<=0 or event.result.remaining_quantity<=0):
                 raise ContractViolation('partial event lacks partial quantities')
-            c.execute('INSERT INTO order_events VALUES (?,?,?,?,?,?,?,?)',(event.event_id,event.intent_id,event.kind.value,event.venue_event_key,event.to_json(),event.event_at_us,event.received_at_us,self._clock_us()))
+            self._append_order_evidence(event.event_id,event.intent_id,event.kind.value,event.to_json(),event.received_at_us,self._clock_us(),event.event_at_us,event.venue_event_key)
             c.execute('UPDATE order_intents SET state=?,venue_order_id=?,version=version+1 WHERE intent_id=?',(event.kind.value,event.result.reference.venue_order_id,event.intent_id))
             c.execute('UPDATE reservations SET state=?,version=version+1,updated_at_us=? WHERE intent_id=?',(event.kind.value,self._clock_us(),event.intent_id))
             # Status never journals money or releases capacity. Confirmed fills,
@@ -535,6 +596,60 @@ class Ledger:
             if event.result.filled_quantity>0:
                 self.invalidate_account(account_id)
             return AppendResult(True,event.event_id,self._revision(account_id))
+
+    def _append_order_evidence(self, event_id: str, intent_id: str, kind: str,
+            payload_json: str, received_at_us: int, recorded_at_us: int,
+            event_at_us: int | None = None, venue_event_key: str | None = None) -> None:
+        if not self.connection.in_transaction:
+            raise ContractViolation('order evidence requires an immediate transaction')
+        self.connection.execute('INSERT INTO order_events(event_id,append_sequence,intent_id,kind,venue_event_key,payload_json,event_at_us,received_at_us,recorded_at_us) SELECT ?,coalesce(max(append_sequence),0)+1,?,?,?,?,?,?,? FROM order_events',
+            (event_id,intent_id,kind,venue_event_key,payload_json,event_at_us,received_at_us,recorded_at_us))
+
+    def _record_revisions(self) -> None:
+        """Capture mutable revision/generation before, and atomically with, commit.
+
+        A future observation cannot make this snapshot knowable before its own
+        event/receipt time. Prior knowledge timestamps never regress within an
+        account, even when the process UTC clock moves backward.
+        """
+        for account in self.connection.execute('SELECT account_id,generation FROM accounts').fetchall():
+            account_id=account['account_id']
+            revision=self._revision(account_id)
+            previous=self.connection.execute('SELECT * FROM account_revision_history WHERE account_id=? ORDER BY append_sequence DESC LIMIT 1',(account_id,)).fetchone()
+            if previous and (previous['journal_sequence'],previous['version'],previous['generation'])==(revision.journal_sequence,revision.version,account['generation']):
+                continue
+            recorded=self._clock_us()
+            known=max(recorded,previous['known_at_us'] if previous else 0)
+            for sql in (
+                'SELECT max(max(coalesce(e.event_at_us,0),e.received_at_us,e.recorded_at_us)) FROM order_events e JOIN order_intents i USING(intent_id) WHERE i.account_id=?',
+                'SELECT max(max(event_at_us,recorded_at_us)) FROM journal_transactions WHERE account_id=?',
+                'SELECT max(max(event_at_us,received_at_us,recorded_at_us)) FROM fills WHERE account_id=?',
+                'SELECT max(max(marked_at_us,recorded_at_us)) FROM equity_marks WHERE account_id=?',
+                'SELECT max(max(started_at_us,coalesce(finished_at_us,0),recorded_at_us)) FROM reconciliations WHERE account_id=?',
+                'SELECT updated_at_us FROM account_control WHERE account_id=?',
+                'SELECT private_heartbeat_us FROM account_readiness WHERE account_id=?'):
+                value=self.connection.execute(sql,(account_id,)).fetchone()[0]
+                known=max(known,value or 0)
+            self.connection.execute('INSERT INTO account_revision_history(account_id,journal_sequence,version,generation,known_at_us,recorded_at_us) VALUES (?,?,?,?,?,?)',
+                (account_id,revision.journal_sequence,revision.version,account['generation'],known,recorded))
+
+    @staticmethod
+    def _manifest_entries(export: dict, tables: tuple[str,...]) -> tuple[ManifestEntry,...]:
+        result=[]
+        identities=set()
+        for table in tables:
+            keys=_MANIFEST_KEYS[table]
+            for row in export.get(table,[]):
+                # Composite keys retain all PK components in canonical order.
+                key=row[keys[0]] if len(keys)==1 else canonical_bytes(tuple(row[k] for k in keys)).decode()
+                identity=table+':'+str(key)
+                if len(identity)>256:
+                    identity=table+':sha256:'+content_hash(tuple(row[k] for k in keys))
+                if identity in identities:
+                    raise ContractViolation('duplicate manifest primary-key identity')
+                identities.add(identity)
+                result.append(ManifestEntry(identity,content_hash(row)))
+        return tuple(sorted(result,key=lambda entry:entry.record_id))
 
     def append_review_job(self, job: ReviewJob) -> AppendResult:
         if type(job) is not ReviewJob:
@@ -586,9 +701,10 @@ class Ledger:
             account_id = cutoff.account_id
             tables = [row[0] for row in c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name")]
             for table in tables:
-                if table in {'schema_migrations','review_sessions','review_jobs',
-                        'account_readiness','balance_positions','candidate_control','reservations'}:
+                if table in _EXPORT_OMIT:
                     continue
+                if table not in _EXPORT_TIMES:
+                    raise ContractViolation('missing explicit export visibility policy for '+table)
                 columns = {r['name'] for r in c.execute('PRAGMA table_info('+table+')')}
                 clauses,parameters = [],[]
                 if 'account_id' in columns:
@@ -601,22 +717,29 @@ class Ledger:
                     clauses.append('snapshot_id IN (SELECT snapshot_id FROM snapshots WHERE account_id=?)'); parameters.append(account_id)
                 elif 'transaction_id' in columns:
                     clauses.append('transaction_id IN (SELECT transaction_id FROM journal_transactions WHERE account_id=?)'); parameters.append(account_id)
-                if 'updated_at_us' in columns:
-                    clauses.append('updated_at_us<=?'); parameters.append(cutoff.cutoff_us)
-                if 'recorded_at_us' in columns:
-                    clauses.append('recorded_at_us<=?'); parameters.append(cutoff.cutoff_us)
-                if table=='source_events':
-                    clauses.extend(['event_at_us<=?','received_at_us<=?','known_at_us<=?']); parameters.extend([cutoff.cutoff_us]*3)
-                if table=='event_segments':
-                    clauses.append('committed_at_us<=?'); parameters.append(cutoff.cutoff_us)
+                for timestamp in _EXPORT_TIMES[table]:
+                    clauses.append('('+timestamp+' IS NULL OR '+timestamp+'<=?)')
+                    parameters.append(cutoff.cutoff_us)
+                if table=='order_events':
+                    clauses.append("(json_extract(payload_json,'$.result.received_at_us') IS NULL OR json_extract(payload_json,'$.result.received_at_us')<=?)")
+                    parameters.append(cutoff.cutoff_us)
                 rows = [dict(r) for r in c.execute('SELECT * FROM '+table+(' WHERE '+' AND '.join(clauses) if clauses else ''),parameters)]
                 export[table] = sorted(rows,key=canonical_bytes)
+            history=sorted(export.get('account_revision_history',[]),key=lambda row:row['append_sequence'])
+            if not history:
+                raise ContractViolation('cutoff has no proven account revision')
+            historical=history[-1]
+            revision=AccountRevision(historical['journal_sequence'],historical['version'])
+            if revision.journal_sequence!=max((row['sequence'] for row in export['journal_transactions']),default=0):
+                raise ContractViolation('cutoff journal and revision evidence disagree')
+            for row in export['accounts']:
+                row['generation']=historical['generation']
             # Mutable order status is replayed from evidence at the cutoff;
             # copying today's projection would disclose a future acknowledgment.
             for row in export.get('order_intents',[]):
                 events = sorted((event for event in export.get('order_events',[])
                     if event['intent_id']==row['intent_id']),
-                    key=lambda event:(event['recorded_at_us'],event['event_id']))
+                    key=lambda event:event['append_sequence'])
                 row['state']='reserved'
                 row['venue_order_id']=None
                 row['version']=0
@@ -645,18 +768,10 @@ class Ledger:
                         targets=export.get(foreign_key['table'],[])
                         if not any(target.get(foreign_key['to'])==row[source_column] for target in targets):
                             raise ContractViolation('session cutoff lacks referenced '+foreign_key['table'])
-            def manifest(tables: tuple[str,...]) -> tuple[ManifestEntry,...]:
-                result = []
-                for table in tables:
-                    for row in export.get(table,[]):
-                        identity = next((row[k] for k in ('event_id','segment_hash','forecast_id','label_id','release_hash','manifest_hash','run_id') if k in row),content_hash(row))
-                        result.append(ManifestEntry(table+':'+str(identity),content_hash(row)))
-                return tuple(sorted(result,key=lambda r:r.record_id))
-            event_manifest = manifest(('source_events','source_invalidations','event_segments'))
-            forecast_manifest = manifest(('forecasts',))
-            outcome_manifest = manifest(('outcome_labels','label_events'))
-            artifact_manifest = manifest(('release_bundles','evidence_manifests','evaluation_runs','snapshots','snapshot_inputs'))
-            revision = self._revision(account_id)
+            event_manifest = self._manifest_entries(export,('source_events','source_invalidations','event_segments'))
+            forecast_manifest = self._manifest_entries(export,('forecasts',))
+            outcome_manifest = self._manifest_entries(export,('outcome_labels','label_events'))
+            artifact_manifest = self._manifest_entries(export,('release_bundles','evidence_manifests','evaluation_runs','snapshots','snapshot_inputs'))
             export_hash = content_hash(export)
             manifest_hash = content_hash((cutoff,revision,export_hash,event_manifest,forecast_manifest,outcome_manifest,artifact_manifest))
             session_id = 'session-'+content_hash((account_id,cutoff.cutoff_us))

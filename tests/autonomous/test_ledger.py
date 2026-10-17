@@ -365,3 +365,151 @@ class LedgerTests(unittest.TestCase):
             info = self.ledger.connection.execute('PRAGMA table_info('+table+')').fetchall()
             self.assertTrue(any(row['name']==key and row['pk'] for row in info))
             self.assertIn('recorded_at_us',{row['name'] for row in info})
+
+    # Regression coverage for independent review R1-R5.
+    def export_payload(self, cutoff):
+        from bot.autonomous.contracts import strict_json
+        archive = self.ledger.export_session(cutoff)
+        raw = self.ledger.connection.execute('SELECT export_json FROM review_sessions WHERE session_id=?', (archive.session_id,)).fetchone()[0]
+        return archive, strict_json(raw)
+
+    def status_event(self, intent, event_id, state, received, *, filled='0', remaining='1'):
+        result = VenueOrderResult(OrderReference('paper-test',intent.intent_id,intent.client_order_id,'venue-order'),state,Decimal(filled),Decimal(remaining),received)
+        return OrderEvent(event_id,intent.intent_id,state,result,received,event_at_us=received)
+
+    def test_review_r1_nested_dispatch_rejects_before_mutation(self):
+        intent = self.reserve()
+        c = self.ledger.connection
+        with self.ledger.transaction():
+            with self.assertRaises(ContractViolation):
+                self.ledger.mark_dispatching(intent.intent_id,intent.generation)
+            self.assertEqual('reserved',c.execute('SELECT state FROM order_intents').fetchone()[0])
+            self.assertEqual(0,c.execute("SELECT count(*) FROM order_events WHERE kind='dispatching'").fetchone()[0])
+            self.assertTrue(self.ledger.post('paper-test','nested-safe',(('cash',1),('capital',-1))))
+        self.assertFalse(c.in_transaction)
+        self.assertEqual(1,c.execute("SELECT count(*) FROM journal_transactions WHERE transaction_id='nested-safe'").fetchone()[0])
+
+    def test_review_r1_uncommitted_reservation_cannot_dispatch(self):
+        p = self.ready()
+        with self.assertRaises(ContractViolation):
+            with self.ledger.transaction():
+                intent = self.reserve(p)
+                self.ledger.mark_dispatching(intent.intent_id,intent.generation)
+        self.assertEqual(0,self.ledger.connection.execute('SELECT count(*) FROM order_intents').fetchone()[0])
+
+    def test_review_r2_delayed_first_export_uses_historical_revision_and_generation(self):
+        now = self.seed()
+        self.ledger._clock_us=lambda:now+10
+        self.ledger.post('paper-test','before',(('cash',100),('capital',-100)))
+        historical = self.ledger.account_view('paper-test').revision
+        self.ledger._clock_us=lambda:now+30
+        self.ledger.post('paper-test','after',(('cash',50),('capital',-50)))
+        self.ledger.close()
+        self.ledger=load_ledger().open(self.path)
+        archive, payload = self.export_payload(SessionCutoff('paper-test',now+20,'reconcile'))
+        self.assertEqual(historical,archive.account_revision)
+        self.assertEqual(0,payload['accounts'][0]['generation'])
+        self.assertEqual(['before'],[row['transaction_id'] for row in payload['journal_transactions']])
+        self.assertNotIn('account_control',payload)
+
+    def test_review_r2_all_event_receipt_knowledge_and_segment_endpoints_are_causal(self):
+        p = self.ready()
+        now = time.time_ns()//1000+1000
+        self.ledger._clock_us=lambda:now
+        intent = self.reserve(p)
+        self.ledger.mark_dispatching(intent.intent_id,intent.generation)
+        self.ledger.append_order_event(self.status_event(intent,'future-open',IntentState.OPEN,now+100))
+        c=self.ledger.connection
+        c.execute("INSERT INTO source_events(event_id,source,stream,logical_key,revision,event_at_us,received_at_us,known_at_us,payload_json,payload_hash,recorded_at_us) VALUES ('past','test','metric','past',0,?,?,?,'{}',?,?)",(now,now,now,content_hash({}),now))
+        c.execute("INSERT INTO source_invalidations VALUES ('future-invalidation','past',?,'future',?)",(now+100,now))
+        c.execute("INSERT INTO event_segments VALUES (?,'test','AAVE-USD',0,1,?,?,?,?,?,1,'segment',?,?)",(HASH_A,now,now+100,now,now+100,HASH_B,now,now))
+        c.execute("INSERT INTO fills VALUES ('future-fill','paper-test',?,'paper','future-trade','order','AAVE-USD','buy','1','100','100','USD','1',?,?,?,?)",(intent.intent_id,now+100,now+100,HASH_A,now))
+        archive,payload=self.export_payload(SessionCutoff('paper-test',now+10,'reconcile'))
+        self.assertEqual([],payload['source_invalidations'])
+        self.assertEqual([],payload['event_segments'])
+        self.assertEqual([],payload['fills'])
+        self.assertNotIn('future-open',[row['event_id'] for row in payload['order_events']])
+        self.assertEqual('dispatching',payload['order_intents'][0]['state'])
+
+    def test_review_r3_same_timestamp_order_replay_uses_durable_append_order(self):
+        p=self.ready()
+        now=time.time_ns()//1000+1000
+        self.ledger._clock_us=lambda:now
+        intent=self.reserve(p)
+        self.ledger.mark_dispatching(intent.intent_id,intent.generation)
+        _,payload=self.export_payload(SessionCutoff('paper-test',now,'reconcile'))
+        self.assertEqual('dispatching',payload['order_intents'][0]['state'])
+        sequences=[row['append_sequence'] for row in payload['order_events']]
+        self.assertEqual(len(sequences),len(set(sequences)))
+
+    def test_review_r3_clock_regression_and_reverse_ids_preserve_order(self):
+        p=self.ready()
+        base=time.time_ns()//1000+1000
+        recorded=[base+100]
+        self.ledger._clock_us=lambda:recorded[0]
+        intent=self.reserve(p)
+        recorded[0]=base+90
+        self.ledger.mark_dispatching(intent.intent_id,intent.generation)
+        recorded[0]=base+80
+        self.ledger.append_order_event(self.status_event(intent,'zzz-open',IntentState.OPEN,base+80))
+        recorded[0]=base+70
+        self.ledger.append_order_event(self.status_event(intent,'aaa-partial',IntentState.PARTIAL,base+70,filled='.5',remaining='.5'))
+        _,payload=self.export_payload(SessionCutoff('paper-test',base+200,'reconcile'))
+        self.assertEqual('partial',payload['order_intents'][0]['state'])
+        self.assertEqual(3,payload['order_intents'][0]['version'])
+
+    def test_review_r4_manifest_ids_use_real_primary_keys(self):
+        now=self.seed()
+        c=self.ledger.connection
+        c.execute("INSERT INTO snapshots SELECT 'snapshot-2',account_id,release_hash,candle_close_us,knowledge_cutoff_us,field_hash,state_json,tokenizer_hash,token_count,lineage_hash,account_revision,valid,invalid_reason,recorded_at_us FROM snapshots")
+        for run in ('run-1','run-2'):
+            c.execute("INSERT INTO evaluation_runs VALUES (?,?,?,?,?,'{}','completed',?)",(run,RELEASE_HASH,HASH_A,HASH_B,'holdout',now))
+        c.execute("INSERT INTO forecasts VALUES ('forecast','decision-test',1,'buy',4,'[]',NULL,NULL,0,?,?)",(HASH_A,now))
+        c.execute("INSERT INTO outcome_labels VALUES ('label','forecast',0,?,NULL,'pending',NULL,NULL,NULL,NULL,0)",(now+100,))
+        for revision,event_id,previous in ((0,'label-pending',None),(1,'label-corrected','label-pending')):
+            c.execute("INSERT INTO label_events VALUES (?,'label',?,?,'pending','{}',?,?)",(event_id,revision,previous,content_hash({}),now))
+        c.execute("INSERT INTO source_events(event_id,source,stream,logical_key,revision,event_at_us,received_at_us,known_at_us,payload_json,payload_hash,recorded_at_us) VALUES ('source','test','metric','source',0,?,?,?,'{}',?,?)",(now,now,now,content_hash({}),now))
+        for invalidation in ('invalidation-1','invalidation-2'):
+            c.execute("INSERT INTO source_invalidations VALUES (?,'source',?,'test',?)",(invalidation,now,now))
+        for line in (0,1):
+            c.execute("INSERT INTO snapshot_inputs VALUES (?,?,'source',NULL,NULL,NULL,?)",(HASH_B,line,now))
+        archive,_=self.export_payload(SessionCutoff('paper-test',now+10,'reconcile'))
+        identities=[entry.record_id for entry in archive.event_manifest+archive.outcome_manifest+archive.artifact_manifest]
+        self.assertEqual(len(identities),len(set(identities)))
+        for expected in ('snapshots:'+HASH_B,'snapshots:snapshot-2','evaluation_runs:run-1','evaluation_runs:run-2','label_events:label-pending','label_events:label-corrected','source_invalidations:invalidation-1','source_invalidations:invalidation-2'):
+            self.assertIn(expected,identities)
+        composite=[identity for identity in identities if identity.startswith('snapshot_inputs:')]
+        self.assertEqual(2,len(set(composite)))
+
+    def test_review_r4_duplicate_manifest_record_id_is_rejected(self):
+        make_manifest=getattr(self.ledger,'_manifest_entries',None)
+        self.assertIsNotNone(make_manifest,'manifest construction needs duplicate identity validation')
+        with self.assertRaises(ContractViolation):
+            make_manifest({'snapshots':[{'snapshot_id':'same'},{'snapshot_id':'same'}]},('snapshots',))
+
+    def test_review_r5_high_scale_order_ignores_ambient_decimal_precision(self):
+        from decimal import localcontext
+        p=self.ready()
+        limits,provider,assess,boot=self.ledger._risk_config
+        price=Decimal('1.00000000000000000000000000001')
+        market=dataclasses.replace(provider(p.instrument),tick_size=Decimal('0.00000000000000000000000000001'),minimum_notional=Decimal('0'),minimum_quantity=Decimal('0'),lot_size=Decimal('0.00000000000000000000000000001'))
+        self.ledger.configure_risk_checks(limits=limits,market=lambda _:market,assess=assess,boot_id=boot)
+        p=dataclasses.replace(p,limit_price=price,base_quantity=price)
+        with localcontext() as context:
+            context.prec=6
+            prepared=self.reserve(p)
+        self.assertEqual(price,prepared.proposal.base_quantity)
+
+    def test_review_r5_cumulative_quantity_is_exact_under_low_ambient_precision(self):
+        from decimal import localcontext
+        p=self.ready()
+        total=Decimal('1.00000000000000000000000000001')
+        limits,provider,assess,boot=self.ledger._risk_config
+        market=dataclasses.replace(provider(p.instrument),lot_size=Decimal('0.00000000000000000000000000001'))
+        self.ledger.configure_risk_checks(limits=limits,market=lambda _:market,assess=assess,boot_id=boot)
+        intent=self.reserve(dataclasses.replace(p,base_quantity=total,max_fee_usd_u=1_000_001))
+        self.ledger.mark_dispatching(intent.intent_id,intent.generation)
+        event=self.status_event(intent,'precise-partial',IntentState.PARTIAL,time.time_ns()//1000,filled='0.5',remaining='0.50000000000000000000000000001')
+        with localcontext() as context:
+            context.prec=6
+            self.assertTrue(self.ledger.append_order_event(event).appended)
