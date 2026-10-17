@@ -2,7 +2,8 @@
 from decimal import Decimal
 
 from bot.autonomous.contracts import (
-    AccountRevision, AccountView, Balance, DecisionReference, Mode, OrderProposal, Side,
+    AccountRevision, AccountView, Balance, CausalCutoffs, DecisionReference, EncodedState,
+    Mode, NumericSnapshot, OrderProposal, Side, TokenCount, canonical_bytes, content_hash,
 )
 
 HASH_A = "a" * 64
@@ -27,3 +28,17 @@ def order_proposal(account_id: str = "paper-test") -> OrderProposal:
         decision=DecisionReference("decision-test", "request-test", HASH_B, HASH_A),
         candle_close_us=1_000_000, action_slot="entry", reducing_only=False,
         control_epoch=0, deadline_mono_ns=10_000_000_000, loss_budget_usd_u=2_000_000)
+
+
+def encoded_state(*, candidate_id="aave", wire_id=1, shared=None, row=None, snapshot_mask=0):
+    """All-unknown inert numeric state, with optional malformed wire fixtures."""
+    from bot.autonomous.contracts import Feature, default_field_dictionary
+    row = [wire_id] + [0] * 15 if row is None else row
+    shared = [1] + [0] * 16 if shared is None else shared
+    definitions = default_field_dictionary().candidate_fields
+    features = tuple(Feature(field.name, 0.0, bool(snapshot_mask & (1 << i))) for i, field in enumerate(definitions))
+    snapshot = NumericSnapshot(candidate_id, "TEST-USD", HASH_A, CausalCutoffs(1, 2, 3, "boot"),
+        features, snapshot_mask, HASH_B, AccountRevision())
+    state = [shared, [row]]
+    return EncodedState(canonical_bytes(state).decode("ascii"), content_hash(state), "d" * 64,
+        (candidate_id,), TokenCount(399, "tok", "provider", "pinned_provider_tokenizer", "c" * 64), (snapshot,))

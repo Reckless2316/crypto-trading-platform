@@ -194,11 +194,97 @@ class ContractTests(unittest.TestCase):
             raw = c.canonical_bytes(state).decode("ascii")
             with self.subTest(state=state), self.assertRaises(ValueError):
                 c.EncodedState(raw, c.content_hash(state), "d" * 64, ("aave",), proof, (snapshot,))
-        state = [[1] + [0] * 16, [["aave"] + [0] * 15]]
+        state = [[1] + [0] * 16, [[1] + [0] * 15]]
         encoded = c.EncodedState(c.canonical_bytes(state).decode("ascii"), c.content_hash(state), "d" * 64, ("aave",), proof, (snapshot,))
         self.assertEqual(c.EncodedState.from_json(encoded.to_json()), encoded)
         with self.assertRaises(ValueError):
             dataclasses.replace(encoded, token_count=dataclasses.replace(proof, state_tokens=400))
+
+    def test_numeric_candidate_mapping_is_fixed_and_exact(self):
+        from tests.autonomous.support import encoded_state
+        mapping = (("aave", 1), ("hype", 2), ("pendle", 3), ("aero", 4), ("ldo", 5), ("ondo", 6))
+        for name, wire_id in mapping:
+            with self.subTest(name=name):
+                encoded = encoded_state(candidate_id=name, wire_id=wire_id)
+                self.assertEqual(c.CANDIDATE_WIRE_IDS, mapping)
+                self.assertEqual(c.candidate_wire_id(name), wire_id)
+                self.assertNotIn(name, encoded.canonical_state_json)
+                self.assertEqual(c.EncodedState.from_json(encoded.to_json()), encoded)
+        for wire_id in ("aave", True, 1.0, 0, 2, 7):
+            with self.subTest(wire_id=wire_id), self.assertRaises(ValueError):
+                encoded_state(wire_id=wire_id)
+        with self.assertRaises(ValueError):
+            encoded_state(candidate_id="unknown", wire_id=1)
+
+    def test_discrete_wire_slots_have_exact_integer_domains(self):
+        from tests.autonomous.support import encoded_state
+        for index, invalid_values in ((5, (-1, 0.5, 61, True)), (9, (-1, 0.5, 2, True)),
+                                      (12, (-1, 0.5, 64, True))):
+            for invalid in invalid_values:
+                row = [1] + [0] * 15
+                row[index] = invalid
+                row[15] = 1 << index
+                with self.subTest(index=index, invalid=invalid), self.assertRaises(ValueError):
+                    encoded_state(row=row, snapshot_mask=row[15])
+        for index, invalid_values in ((0, (1.0, True)), (1, (0.5, -1, True)),
+                                      (4, (-2, 0.5, 2, True)), (5, (-2, 0.5, 2, True))):
+            for invalid in invalid_values:
+                shared = [1] + [0] * 16
+                shared[index] = invalid
+                shared[16] = 1 << index
+                with self.subTest(index=index, invalid=invalid), self.assertRaises(ValueError):
+                    encoded_state(shared=shared)
+
+    def test_wire_masks_have_bounded_integer_bit_widths(self):
+        from tests.autonomous.support import encoded_state
+        for index, width in ((15, 16), (16, 17)):
+            for invalid in (-1, 0.5, 1.0, True, 1 << width):
+                row, shared = [1] + [0] * 15, [1] + [0] * 16
+                (row if index == 15 else shared)[index] = invalid
+                with self.subTest(index=index, invalid=invalid), self.assertRaises(ValueError):
+                    encoded_state(row=row, shared=shared)
+        row = [1] + [0] * 14 + [(1 << 16) - 1]
+        shared = [1] + [0] * 15 + [(1 << 17) - 1]
+        encoded_state(row=row, shared=shared, snapshot_mask=(1 << 16) - 1)
+
+    def test_invalid_measurements_are_zero_and_snapshot_masks_match(self):
+        from tests.autonomous.support import encoded_state
+        for index in range(1, 15):
+            row = [1] + [0] * 15
+            row[index] = 1
+            with self.subTest(candidate_slot=index), self.assertRaises(ValueError):
+                encoded_state(row=row)
+        for index in range(1, 16):
+            shared = [1] + [0] * 16
+            shared[index] = 1
+            with self.subTest(shared_slot=index), self.assertRaises(ValueError):
+                encoded_state(shared=shared)
+        with self.assertRaises(ValueError):
+            encoded_state(row=[1] + [0] * 14 + [2], snapshot_mask=0)
+        row = [1] + [0] * 15
+        row[5], row[9], row[12] = 60, 1, 63
+        row[15] = (1 << 5) | (1 << 9) | (1 << 12)
+        encoded_state(row=row, snapshot_mask=row[15])
+
+    def test_continuous_wire_slots_obey_dictionary_ranges(self):
+        from tests.autonomous.support import encoded_state
+        for index, invalid in ((1, -0.1), (2, -0.1), (3, -1.1), (3, 1.1), (4, -0.1), (13, 1.1)):
+            row = [1] + [0] * 15
+            row[index], row[15] = invalid, 1 << index
+            with self.subTest(index=index, invalid=invalid), self.assertRaises(ValueError):
+                encoded_state(row=row, snapshot_mask=row[15])
+        for index in (11, 13, 14, 15):
+            shared = [1] + [0] * 16
+            shared[index], shared[16] = 1.1, 1 << index
+            with self.subTest(index=index), self.assertRaises(ValueError):
+                encoded_state(shared=shared)
+
+    def test_dictionary_documents_wire_metadata_and_thesis_bit_width(self):
+        dictionary = c.default_field_dictionary()
+        for field in (dictionary.shared_fields[0], dictionary.shared_fields[16],
+                      dictionary.candidate_fields[0], dictionary.candidate_fields[15]):
+            self.assertIn("validity_exempt", field.encoding)
+        self.assertEqual(dictionary.candidate_fields[12].maximum, 63.0)
 
     def test_late_batch_requires_rejection_without_decisions(self):
         decision = c.CandidateDecision("aave", c.Regime.TRENDING, c.Direction.LONG, 2, c.AdvisoryRisk.SAFE,

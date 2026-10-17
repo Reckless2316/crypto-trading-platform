@@ -281,6 +281,20 @@ class Direction(str, Enum):
     SHORT = "short"
     NEUTRAL = "neutral"
 
+
+# Approved specification's immutable wire identities; independent of row order.
+CANDIDATE_WIRE_IDS: tuple[tuple[str, int], ...] = (
+    ("aave", 1), ("hype", 2), ("pendle", 3), ("aero", 4), ("ldo", 5), ("ondo", 6),
+)
+
+
+def candidate_wire_id(candidate_id: str) -> int:
+    if type(candidate_id) is str:
+        for internal_id, wire_id in CANDIDATE_WIRE_IDS:
+            if candidate_id == internal_id:
+                return wire_id
+    raise ContractViolation("unknown candidate wire identity")
+
 class AdvisoryRisk(str, Enum):
     SAFE = "safe"
     NEAR_LIMIT = "near_limit"
@@ -468,6 +482,11 @@ class FieldDefinition(Record):
 
 @dataclass(frozen=True)
 class FieldDictionary(Record):
+    """Bit i marks slot i valid, least-significant bit first.
+
+    Identity and mask slots are metadata and exempt from zero placeholders;
+    every other invalid slot must be the fixed numeric zero placeholder.
+    """
     version: int
     shared_fields: tuple[FieldDefinition, ...]
     candidate_fields: tuple[FieldDefinition, ...]
@@ -503,7 +522,7 @@ def default_field_dictionary() -> FieldDictionary:
         ("shared_validity_mask", "bits", "instant", 0., 131071.),
     )
     candidate = (
-        ("candidate_id", "category", "none", 0., None),
+        ("candidate_id", "category", "none", 1., 6.),
         ("mid", "USD_per_base", "instant", 0., None),
         ("spread_bps", "bps", "instant", 0., None),
         ("imbalance", "fraction", "10bps_depth", -1., 1.),
@@ -515,15 +534,27 @@ def default_field_dictionary() -> FieldDictionary:
         ("eligible", "bool", "instant", 0., 1.),
         ("evidence_age_minutes", "minutes", "instant", 0., None),
         ("evidence_expiry_minutes", "minutes", "instant", 0., None),
-        ("thesis_condition_bits", "bits", "instant", 0., None),
+        ("thesis_condition_bits", "bits", "instant", 0., 63.),
         ("position_headroom", "fraction", "instant", 0., 1.),
         ("estimated_roundtrip_cost_bps", "bps", "instant", 0., None),
         ("candidate_validity_mask", "bits", "instant", 0., 65535.),
     )
+    def encoding(name, width):
+        if name == "candidate_id":
+            return "metadata;validity_exempt;1=aave,2=hype,3=pendle,4=aero,5=ldo,6=ondo"
+        if name == "dictionary_version":
+            return "metadata;validity_exempt;version=1"
+        if "validity_mask" in name:
+            return f"metadata;validity_exempt;bit_i=slot_i;lsb=slot0;width={width};invalid_measurement=0"
+        if name == "thesis_condition_bits":
+            return "six_condition_bitset;bits=0..5;lsb=condition0;unknown=0,invalid"
+        if name.endswith("trend"):
+            return "trend:-1=down,0=flat,1=up;unknown=0,invalid"
+        return "numeric;unknown=0,invalid"
     def group(rows):
         return tuple(FieldDefinition(name, unit, Decimal("1"), 8 if unit not in ("bits", "category", "bool", "count", "version", "unix_ms") else 0,
             "signed" if low is None or low < 0 else "nonnegative", window, low, high, i,
-            "trend:-1=down,0=flat,1=up" if name.endswith("trend") else "bit_i=field_i;unknown=0,invalid" if "mask" in name else "numeric")
+            encoding(name, len(rows)))
             for i, (name, unit, window, low, high) in enumerate(rows))
     return FieldDictionary(1, group(shared), group(candidate))
 
@@ -543,6 +574,23 @@ class TokenCount(Record):
 @runtime_checkable
 class ProviderTokenCounter(Protocol):
     def count_state(self, canonical_state_json: str) -> TokenCount: ...
+
+
+def _validate_wire_slots(values: list[int | float], definitions: tuple[FieldDefinition, ...]) -> int:
+    """Validate versioned numeric domains and zero placeholders at the boundary."""
+    mask = values[-1]
+    if type(mask) is not int or not 0 <= mask < (1 << len(definitions)):
+        raise ContractViolation("invalid validity mask type/width")
+    for value, definition in zip(values, definitions):
+        if definition.precision == 0:
+            checked_money(value)
+        if definition.minimum is not None and value < definition.minimum:
+            raise ContractViolation(f"wire slot below minimum: {definition.name}")
+        if definition.maximum is not None and value > definition.maximum:
+            raise ContractViolation(f"wire slot above maximum: {definition.name}")
+        if "validity_exempt" not in definition.encoding and not (mask & (1 << definition.validity_bit)) and value != 0:
+            raise ContractViolation(f"invalid measurement must be zero: {definition.name}")
+    return mask
 
 
 @dataclass(frozen=True)
@@ -569,9 +617,13 @@ class EncodedState(Record):
             raise ContractViolation("invalid complete shared state")
         if type(rows) is not list or len(rows) != len(self.candidate_ids):
             raise ContractViolation("candidate row count mismatch")
-        for candidate_id, row in zip(self.candidate_ids, rows):
-            if type(row) is not list or len(row) != 16 or row[0] != candidate_id or not all(numeric(v) for v in row[1:]):
+        dictionary = default_field_dictionary()
+        _validate_wire_slots(shared, dictionary.shared_fields)
+        for candidate_id, row, snapshot in zip(self.candidate_ids, rows, self.snapshots):
+            if type(row) is not list or len(row) != 16 or type(row[0]) is not int or row[0] != candidate_wire_id(candidate_id) or not all(numeric(v) for v in row[1:]):
                 raise ContractViolation("invalid complete candidate row/order")
+            if _validate_wire_slots(row, dictionary.candidate_fields) != snapshot.validity_mask:
+                raise ContractViolation("candidate wire/snapshot validity mask mismatch")
 
 
 @dataclass(frozen=True)
