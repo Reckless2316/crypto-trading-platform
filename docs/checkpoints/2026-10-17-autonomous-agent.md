@@ -34,7 +34,7 @@ The installed `.venv` uses Python 3.14.4; the deployment image specifies Python 
 | Task | State |
 |---|---|
 | 1 Domain contracts/defaults | complete; commits a77407a + 76e0527; 26 tests Python 3.12; independent spec/quality review passes |
-| 2 Durable journal/reservations | implemented 9977b03; 33 focused tests pass; review found R1–R5; test-first fixes in progress |
+| 2 Durable journal/reservations | complete through 57509ea; 49 focused tests pass; independent spec/quality review passes |
 | 3 Equity/flows/latches | pending |
 | 4 Causal source/archive | pending |
 | 5 Numeric state/token proof | pending |
@@ -71,3 +71,7 @@ Task2 commit9977b03 implements schema/journal/reservation storage;33 focused Pyt
 Independent Task2 review found one Critical dispatch-durability issue, three Important historical export/order/manifest issues, and a Minor Decimal precision issue. The implementer is fixing all five before independent re-review. Task2 is not accepted yet. Review evidence is saved at `.agenkit/sdd/task-02-review.md`. The separate research agent is checking official AAVE/PENDLE evidence; unverified current metrics and catalysts remain unknown.
 
 An additional accounting specialist produced `docs/reviews/2026-10-17-accounting-implementation-guidance.md`. Repeating unit issuance/NAV cannot use rounded Decimal projections as hard-risk authority. Task3 may add a versioned accounting migration, append-only exact rational evidence and the minimal typed AccountView companion plus tests; Task11 must consume the exact evidence. This implements the approved exact comparison requirement. It does not qualify any account for trading. Ownership and acceptance details are recorded in Task3/11 briefs.
+
+### Task 2 acceptance
+
+Accepted through `57509ea` after independent review and three fix rounds. All R1–R5 closed;49 focused Python3.12 tests pass. Dispatch returns only after its own durable commit. Historical exports bind account revision and all required anchors to a cutoff-visible committed evidence prefix; complete causal policies and durable event order prevent mixed historical states. All collaborators/imports must use `ledger.transaction()`. Evidence identities must survive any future storage compaction. Full report/review remain `.agenkit/sdd/task-02-report.md` and `task-02-review.md`. Task3 is next; no live readiness is claimed.

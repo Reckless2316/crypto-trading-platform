@@ -101,7 +101,7 @@ Configuration fixes approved limits, 1,000ms Jev deadline, 2,000ms snapshot/book
 
 **Consumes:** Task 1 types. **Produces:** `Ledger.open(path: Path) -> Ledger`, `Ledger.close() -> None`, `Ledger.create_paper_account(account_id: str) -> None`, `Ledger.reserve_intent(proposal, expected, generation, decision) -> PreparedIntent`, `Ledger.mark_dispatching(intent_id, generation) -> PreparedIntent`, `Ledger.append_order_event(event) -> AppendResult`, `Ledger.account_view(account_id) -> AccountView`, `Ledger.append_review_job(job) -> AppendResult`, `Ledger.export_session(cutoff) -> SessionArchive`, plus `Ledger.post(account_id: str, transaction_id: str, postings: tuple[tuple[str,int], ...]) -> bool` as the internal balanced USD journal primitive. Opening the database performs migrations/integrity checks, not implicit account adoption or arming.
 
-- [ ] RED: test schema atomicity and crash recovery, beginning with:
+- [x] RED: test schema atomicity and crash recovery, beginning with:
 
 ```python
 import tempfile
@@ -123,8 +123,8 @@ class LedgerTests(unittest.TestCase):
                 ledger.close()
 ```
 
-- [ ] Run `.venv/bin/python -m unittest tests.autonomous.test_ledger -v`; expect RED.
-- [ ] Implement every architecture §7 table with typed CHECKs, FKs, indexes, explicit migrations/checksums, append-only protections and bounded database settings. Journal payload comparison must reject a reused transaction ID with different content. Implement the complete transaction boundary around balance validation and postings:
+- [x] Run `.venv/bin/python -m unittest tests.autonomous.test_ledger -v`; expect RED.
+- [x] Implement every architecture §7 table with typed CHECKs, FKs, indexes, explicit migrations/checksums, append-only protections and bounded database settings. Journal payload comparison must reject a reused transaction ID with different content. Implement the complete transaction boundary around balance validation and postings:
 
 ```python
 from bot.autonomous.contracts import checked_money
@@ -139,7 +139,7 @@ def validate_postings(postings: tuple[tuple[str, int], ...]) -> None:
 ```
 
 Schema SQL maps architecture names exactly; `snapshot_inputs` has separate nullable event/segment FKs and an exactly-one CHECK. Economic action uniqueness is `(account_id,candle_close_us,candidate_id,action_slot)`, independent of release. Fill, correction, transfer, label-event and session keys are individually idempotent. Reservations and risk recheck commit in one `BEGIN IMMEDIATE`; `DISPATCHING` commits before network. No await occurs inside database transactions. Set foreign keys ON, journal_mode WAL, synchronous FULL; database busy/commit errors raise `PersistenceUnavailable` and disable dispatch.
-- [ ] GREEN: require rollback on injected posting/reservation failure, duplicate correction/session handling, cross-release action uniqueness, missing-reference rejection, and reopen persistence. Commit task paths: `feat: add durable autonomous journal`.
+- [x] GREEN: require rollback on injected posting/reservation failure, duplicate correction/session handling, cross-release action uniqueness, missing-reference rejection, and reopen persistence. Commit task paths: `feat: add durable autonomous journal`.
 
 ## Task 3: liquidation equity, cash flows and persistent loss latches
 

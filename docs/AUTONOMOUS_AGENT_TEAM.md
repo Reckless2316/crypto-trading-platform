@@ -7,8 +7,8 @@ Created October 17, 2026 under the operator's explicit request for agents/subage
 | Agent | Responsibility | Current evidence |
 |---|---|---|
 | Conductor (`/root`) | Coordinate the approved plan, resolve interfaces, preserve progress and enforce review gates | [Build checkpoint](checkpoints/2026-10-17-autonomous-agent.md) |
-| Core implementer (`build_task_02`) | Own the ledger schema, persistence code and focused tests for the current task; fix review findings | Commits `9977b03`, `98fffac`; 43 focused tests reported passing; re-review pending |
-| Independent reviewer (`review_task_02`) | Check specification compliance, then quality, durability and correctness; reject incomplete work | Review found five issues in the initial implementation; fixes under re-review |
+| Core implementer (`build_task_02`) | Own the ledger schema, persistence code and focused tests for the current task; fix review findings | Ledger accepted through `57509ea`; 49 focused tests passing; next task is accounting |
+| Independent reviewer (`review_task_02`) | Check specification compliance, then quality, durability and correctness; reject incomplete work | All five initial ledger findings closed; specification and quality review pass |
 | Market researcher (`market_research`) | Retrieve public primary evidence; distinguish facts, estimates, speculation and missing data | [Dated research](research/2026-10-17-autonomous-agent/RESEARCH.md); focused AAVE/PENDLE follow-up in progress |
 | Accounting specialist (`accounting_design`) | Define economic invariants and acceptance cases before the accounting build | [Accounting guidance](reviews/2026-10-17-accounting-implementation-guidance.md) |
 | Safety specialist (`safety_audit`) | Audit deterministic controls, recovery and promotion evidence requirements | [Safety acceptance audit](reviews/2026-10-17-autonomous-safety-contracts.md) |
