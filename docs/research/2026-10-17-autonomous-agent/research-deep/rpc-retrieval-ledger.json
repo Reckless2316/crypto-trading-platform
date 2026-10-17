@@ -1,0 +1,113 @@
+[
+  {
+    "name": "eth_finalized_0",
+    "url": "https://ethereum-rpc.publicnode.com",
+    "method": "POST read-only JSON-RPC",
+    "request_started_at": "2026-10-17T07:28:52.955062+00:00",
+    "request": [
+      {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "eth_chainId",
+        "params": []
+      },
+      {
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "eth_getBlockByNumber",
+        "params": [
+          "finalized",
+          false
+        ]
+      }
+    ],
+    "status": 200,
+    "received_at": "2026-10-17T07:28:53.143328+00:00",
+    "sha256": "6ad98aa9272936e443dcf821217ec26a97a879e0428ae1524b665fc74841436f",
+    "bytes": 18885
+  },
+  {
+    "name": "eth_token_calls",
+    "url": "https://ethereum-rpc.publicnode.com",
+    "method": "POST read-only JSON-RPC",
+    "request_started_at": "2026-10-17T07:28:53.143556+00:00",
+    "request": [
+      {
+        "jsonrpc": "2.0",
+        "id": 10,
+        "method": "eth_call",
+        "params": [
+          {
+            "to": "0x7Fc66500c84A76Ad7e9c93437bFc5Ac33E2DDaE9",
+            "data": "0x18160ddd"
+          },
+          "0x18ff18d"
+        ]
+      },
+      {
+        "jsonrpc": "2.0",
+        "id": 10,
+        "method": "eth_call",
+        "params": [
+          {
+            "to": "0x7Fc66500c84A76Ad7e9c93437bFc5Ac33E2DDaE9",
+            "data": "0x313ce567"
+          },
+          "0x18ff18d"
+        ]
+      },
+      {
+        "jsonrpc": "2.0",
+        "id": 10,
+        "method": "eth_call",
+        "params": [
+          {
+            "to": "0x7Fc66500c84A76Ad7e9c93437bFc5Ac33E2DDaE9",
+            "data": "0x95d89b41"
+          },
+          "0x18ff18d"
+        ]
+      },
+      {
+        "jsonrpc": "2.0",
+        "id": 13,
+        "method": "eth_call",
+        "params": [
+          {
+            "to": "0x808507121B80c02388fAd14726482e061B8da827",
+            "data": "0x18160ddd"
+          },
+          "0x18ff18d"
+        ]
+      },
+      {
+        "jsonrpc": "2.0",
+        "id": 13,
+        "method": "eth_call",
+        "params": [
+          {
+            "to": "0x808507121B80c02388fAd14726482e061B8da827",
+            "data": "0x313ce567"
+          },
+          "0x18ff18d"
+        ]
+      },
+      {
+        "jsonrpc": "2.0",
+        "id": 13,
+        "method": "eth_call",
+        "params": [
+          {
+            "to": "0x808507121B80c02388fAd14726482e061B8da827",
+            "data": "0x95d89b41"
+          },
+          "0x18ff18d"
+        ]
+      }
+    ],
+    "status": 200,
+    "received_at": "2026-10-17T07:28:53.272101+00:00",
+    "sha256": "3267174e325ce30f2e6a2289480ea81530eb12d240ed89d5611e87b46f4ea771",
+    "bytes": 881
+  }
+]

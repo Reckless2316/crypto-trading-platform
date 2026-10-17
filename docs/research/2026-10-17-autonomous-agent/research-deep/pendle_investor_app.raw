@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" href="/favicon.ico" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+
+    <!-- Eco page typography: Inter, the face app.pendle.finance sets for UI and figures -->
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      rel="stylesheet"
+      href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=DM+Mono:wght@400;500&family=Source+Serif+4:ital,opsz,wght@1,8..60,600&display=swap"
+    />
+    <title>Pendle Investor Portal</title>
+    <!--
+      Link previews (Discord, X, Telegram, Slack). Crawlers do not run the app,
+      so these are static; nginx replaces https://investor.pendle.finance with the site's own origin
+      as it serves this file, because the image URL must be absolute.
+    -->
+    <meta name="description" content="Revenue, Buybacks, Pendle V2 and Boros: live figures for PENDLE holders and investors." />
+    <meta property="og:type" content="website" />
+    <meta property="og:site_name" content="Pendle Investor Portal" />
+    <meta property="og:title" content="Pendle Investor Portal" />
+    <meta property="og:description" content="Revenue, Buybacks, Pendle V2 and Boros: live figures for PENDLE holders and investors." />
+    <meta property="og:image" content="https://investor.pendle.finance/og-card.png?v=ed9debc2d0" />
+    <meta property="og:image:width" content="1200" />
+    <meta property="og:image:height" content="630" />
+    <meta property="og:image:alt" content="Pendle Investor Portal: Pendle, in numbers. Live figures on revenue, buybacks, Pendle V2 and Boros." />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="Pendle Investor Portal" />
+    <meta name="twitter:description" content="Revenue, Buybacks, Pendle V2 and Boros: live figures for PENDLE holders and investors." />
+    <meta name="twitter:image" content="https://investor.pendle.finance/og-card.png?v=ed9debc2d0" />
+    <style>
+      body { margin: 0; }
+      .boot { display: flex; align-items: center; justify-content: center; height: 100vh; background: #090d18; }
+      .boot__mark { overflow: visible; }
+      .boot__swing { transform-box: view-box; transform-origin: 9.45px 3.94px; animation: boot-swing 1.6s infinite; }
+      /* Starts at rest, as the static logo hangs, so even a half-second glimpse shows the mark as drawn;
+         fast through the centre and slowing at each end, as a pendulum moves. */
+      @keyframes boot-swing {
+        0%, 50%, 100% { transform: rotate(0deg); animation-timing-function: ease-out; }
+        25% { transform: rotate(7deg); animation-timing-function: ease-in; }
+        75% { transform: rotate(-7deg); animation-timing-function: ease-in; }
+      }
+      @media (prefers-reduced-motion: reduce) { .boot__swing { animation: none; } }
+    </style>
+    <script src="/runtime-config.js"></script>
+    <script type="module" crossorigin src="/assets/index-CA-Dch7J.js"></script>
+    <link rel="stylesheet" crossorigin href="/assets/index-B9pfV0lr.css">
+  </head>
+  <body>
+    <div id="app">
+      <!-- Shown until the app mounts: Pendle's full mark in white (disc, rod and
+           bob, as in the header lockup), the bob swinging like the pendulum it is. -->
+      <div class="boot">
+        <svg class="boot__mark" viewBox="-6 0 46 48" width="56" height="58" fill="none" role="img" aria-label="Loading Pendle Investors">
+          <defs><clipPath id="boot-disc"><circle cx="17" cy="19.8" r="16.81" /></clipPath></defs>
+          <circle cx="17" cy="19.8" r="16.81" fill="#fff" fill-opacity="0.5" />
+          <!-- The rod runs up past the disc and is cut off by its edge, as in the logo; the bob hangs free. -->
+          <g clip-path="url(#boot-disc)"><rect class="boot__swing" x="8.42" y="-6" width="2.06" height="34.8" fill="#fff" /></g>
+          <circle class="boot__swing" cx="9.44" cy="35.76" r="9.25" fill="#fff" />
+        </svg>
+      </div>
+    </div>
+  </body>
+</html>

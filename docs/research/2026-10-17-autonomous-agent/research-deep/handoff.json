@@ -1,0 +1,30 @@
+{
+  "created_at": "2026-10-17T07:35:52.909736+00:00",
+  "eligible": {
+    "AAVE": false,
+    "PENDLE": false
+  },
+  "verified_current_total_supply": {
+    "AAVE": null,
+    "PENDLE": null
+  },
+  "verified_current_float": {
+    "AAVE": null,
+    "PENDLE": null
+  },
+  "verified_30d_purchases": {
+    "AAVE": null,
+    "PENDLE": null
+  },
+  "verified_90d_purchases": {
+    "AAVE": null,
+    "PENDLE": null
+  },
+  "aave_pause_disclosure_effective_date": "2026-04-19",
+  "aave_pause_disclosure_published_at": "2026-04-22T18:51:13.688Z",
+  "aave_current_pause_or_resumption_state": null,
+  "pendle_api_reported_epoch_count": 19,
+  "pendle_api_aggregate_units_fully_validated": false,
+  "chain_token_response_rejected_reason": "Duplicate JSON-RPC request IDs; corrective request interrupted without saved capture",
+  "pending_call": "aborted after 324.3 seconds; no corrective files present; no remote outcome inferred"
+}
