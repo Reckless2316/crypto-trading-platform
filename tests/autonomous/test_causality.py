@@ -55,10 +55,12 @@ class CausalityTests(unittest.TestCase):
 
     def test_immutable_revisions_invalidations_and_duplicates(self):
         a=event(seq=None,payload=MetricPayload('rate',D('1'),'ratio'))
+        self.db._clock_us=lambda:100
         self.assertTrue(self.engine.ingest(a).accepted)
         self.assertTrue(self.engine.ingest(a).accepted)
         self.assertFalse(self.engine.ingest(dataclasses.replace(a,received_at_us=99)).accepted)
         b=dataclasses.replace(a,event_id='r',revision=1,known_at_us=120,supersedes_id='s')
+        self.db._clock_us=lambda:120
         self.assertTrue(self.engine.ingest(b).accepted)
         self.assertEqual((a,),self.engine.select(CausalCutoffs(100,110,0,'boot')))
         self.assertEqual((b,),self.engine.select(CausalCutoffs(100,130,0,'boot')))
@@ -204,7 +206,9 @@ class CausalityTests(unittest.TestCase):
     def test_equal_knowledge_revision_order_and_recorded_invalidation_cutoff(self):
         a=event('a',None,payload=MetricPayload('rate',D('1'),'ratio'),logical_key='same')
         b=dataclasses.replace(a,event_id='b',revision=1)
+        self.db._clock_us=lambda:100
         self.engine.ingest(b);self.engine.ingest(a)
+        self.db._clock_us=lambda:200
         cutoff=CausalCutoffs(100,110,0,'boot')
         self.assertEqual((b,),self.engine.select(cutoff))
         self.engine.invalidate('late-record','b',105,'late report')
@@ -363,7 +367,9 @@ class CausalityTests(unittest.TestCase):
     def test_new_revision_invalidates_pending_without_destroying_source_fallback(self):
         a=event('a',None,payload=MetricPayload('rate',D('1'),'ratio'),logical_key='same')
         b=dataclasses.replace(a,event_id='b',revision=1,known_at_us=120,supersedes_id='a')
+        self.db._clock_us=lambda:100
         self.engine.ingest(a)
+        self.db._clock_us=lambda:200
         c=self.db.connection
         self.db.create_paper_account('paper-test')
         h=content_hash({})
@@ -371,7 +377,9 @@ class CausalityTests(unittest.TestCase):
             c.execute("INSERT INTO release_bundles VALUES (?,'{}',NULL,300,200)",(h,))
             c.execute("INSERT INTO snapshots VALUES ('pending','paper-test',?,100,110,?,'{}',?,1,?,'{}',1,NULL,200)",(h,h,h,h))
             c.execute("INSERT INTO snapshot_inputs VALUES ('pending',0,'a',NULL,NULL,NULL,200)")
+        self.db._clock_us=lambda:120
         self.assertTrue(self.engine.ingest(b).accepted)
+        self.db._clock_us=lambda:200
         self.assertTrue(self.db._source_lineage_invalid('pending'))
         self.assertEqual(1,c.execute("SELECT count(*) FROM source_invalidations WHERE reason='source_revision_superseded'").fetchone()[0])
         self.assertEqual((a,),self.engine.select(CausalCutoffs(100,110,0,'boot')))
@@ -390,6 +398,75 @@ class CausalityTests(unittest.TestCase):
         invalid_ids={r[0] for r in self.db.connection.execute("SELECT event_id FROM source_invalidations WHERE reason='source_revision_superseded'")}
         self.assertNotIn('b',invalid_ids)
         self.assertEqual((b,),self.engine.select(CausalCutoffs(100,200,0,'boot')))
+
+    def test_late_recorded_first_event_never_enters_past_selection(self):
+        self.db._clock_us=lambda:100
+        cutoff=CausalCutoffs(100,100,0,'boot')
+        self.assertEqual((),self.engine.select(cutoff))
+        self.db._clock_us=lambda:200
+        late=event('late',None,payload=MetricPayload('rate',D('1'),'ratio'),received_at_us=95,known_at_us=99)
+        self.assertTrue(self.engine.ingest(late).accepted)
+        self.assertEqual((),self.engine.select(cutoff))
+        self.assertEqual((late,),self.engine.select(CausalCutoffs(100,200,0,'boot')))
+
+    def test_late_recorded_revision_never_replaces_past_selection(self):
+        self.db._clock_us=lambda:100
+        a=event('a',None,payload=MetricPayload('rate',D('1'),'ratio'),logical_key='same',received_at_us=95,known_at_us=95)
+        self.assertTrue(self.engine.ingest(a).accepted)
+        cutoff=CausalCutoffs(100,100,0,'boot')
+        self.assertEqual((a,),self.engine.select(cutoff))
+        self.db._clock_us=lambda:200
+        b=event('b',None,payload=MetricPayload('rate',D('2'),'ratio'),logical_key='same',revision=1,
+            received_at_us=95,known_at_us=99,supersedes_id='a')
+        self.assertTrue(self.engine.ingest(b).accepted)
+        self.assertEqual((a,),self.engine.select(cutoff))
+        self.assertEqual((b,),self.engine.select(CausalCutoffs(100,200,0,'boot')))
+
+    def test_windowed_selection_filters_instrument_and_exchange_time(self):
+        self.db._clock_us=lambda:100
+        old=event('old',None,payload=MetricPayload('rate',D('1'),'ratio'),event_at_us=40,received_at_us=95,known_at_us=95)
+        new=event('new',None,payload=MetricPayload('rate',D('2'),'ratio'))
+        other=event('other',None,payload=MetricPayload('rate',D('3'),'ratio'),instrument='ETH-USD')
+        for e in (old,new,other):self.assertTrue(self.engine.ingest(e).accepted)
+        cut=CausalCutoffs(100,100,0,'boot')
+        self.assertEqual(3,len(self.engine.select(cut)))
+        self.assertEqual((new,),self.engine.select(cut,instrument='BTC-USD',event_since_us=50))
+
+    def test_correction_moving_event_time_never_resurrects_superseded_revision(self):
+        self.db._clock_us=lambda:100
+        a=event('a',None,payload=MetricPayload('rate',D('1'),'ratio'),logical_key='k',event_at_us=60,received_at_us=95,known_at_us=95)
+        b=event('b',None,payload=MetricPayload('rate',D('2'),'ratio'),logical_key='k',revision=1,
+            event_at_us=40,received_at_us=96,known_at_us=96,supersedes_id='a')
+        for e in (a,b):self.assertTrue(self.engine.ingest(e).accepted)
+        cut=CausalCutoffs(100,100,0,'boot')
+        self.assertEqual((b,),self.engine.select(cut))
+        self.assertEqual((),self.engine.select(cut,event_since_us=50))
+        # A correction that moves exchange time after the close hides the key; it does not revive 'a'.
+        c=event('c',None,payload=MetricPayload('rate',D('3'),'ratio'),logical_key='k',revision=2,
+            event_at_us=100,received_at_us=97,known_at_us=97,supersedes_id='b')
+        self.assertTrue(self.engine.ingest(c).accepted)
+        self.assertEqual((),self.engine.select(CausalCutoffs(99,100,0,'boot')))
+        self.assertEqual((c,),self.engine.select(cut))
+
+    def test_logical_key_cannot_change_instrument_across_revisions(self):
+        self.db._clock_us=lambda:100
+        a=event('a',None,payload=MetricPayload('rate',D('1'),'ratio'),logical_key='k')
+        b=event('b',None,payload=MetricPayload('rate',D('2'),'ratio'),logical_key='k',revision=1,instrument='ETH-USD')
+        self.assertTrue(self.engine.ingest(a).accepted)
+        self.assertFalse(self.engine.ingest(b).accepted)
+        self.assertEqual((a,),self.engine.select(CausalCutoffs(100,100,0,'boot')))
+
+    def test_engine_caches_are_bounded(self):
+        cache=self.s._BoundedCache(3)
+        for i in range(5):cache[i]=i
+        self.assertEqual([2,3,4],list(cache))
+        self.assertIsNone(cache.get(0))
+        cache.get(2);cache[5]=5
+        self.assertEqual([4,2,5],list(cache))  # reads refresh recency
+        self.assertIsInstance(self.engine._decoded,self.s._BoundedCache)
+        for name in ('_snapshot_inputs','_snapshot_evidence','_snapshot_inventory','_encoded_evidence',
+                '_hold_evidence','_persisted_encoded_results','_persisted_holds'):
+            self.assertIsInstance(getattr(self.engine,name),self.s._BoundedCache)
 
     def test_public_invalidation_cannot_forge_informational_reason(self):
         self.engine.ingest(event())

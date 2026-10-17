@@ -1,0 +1,34 @@
+{
+  "fixture_status": "synthetic_test_data_not_current_provider_evidence",
+  "response": {
+    "model": "jev-test-fixture",
+    "answers": {
+      "aave:regime": {
+        "type": "choice",
+        "choice": "trending",
+        "probabilities": {"trending": 0.7, "mean_reverting": 0.1, "high_vol": 0.1, "crisis": 0.1},
+        "confidence": 0.6
+      },
+      "aave:direction": {
+        "type": "choice",
+        "choice": "long",
+        "probabilities": {"long": 0.9, "short": 0.05, "neutral": 0.05},
+        "confidence": 0.85
+      },
+      "aave:setup_quality": {
+        "type": "choice",
+        "choice": "2",
+        "probabilities": {"0": 0.1, "1": 0.1, "2": 0.7, "3": 0.1},
+        "confidence": 0.6
+      },
+      "aave:risk_state": {
+        "type": "choice",
+        "choice": "safe",
+        "probabilities": {"safe": 0.7, "near_limit": 0.2, "reduce": 0.1},
+        "confidence": 0.55
+      },
+      "aave:toxic_flow": {"type": "noul", "noul": 0.5}
+    },
+    "usage": null
+  }
+}

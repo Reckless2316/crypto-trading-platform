@@ -294,6 +294,48 @@ class ContractTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             c.DecisionBatch("request", "a" * 64, "b" * 64, "model", 10, 11, 100, (), "c" * 64)
 
+    def test_jev_audit_keeps_provider_identity_and_nullable_usage(self):
+        import base64
+        import hashlib
+        import zlib
+        raw_request = b'{"model":"jev-1.14.0"}'
+        raw_response = b'{"model":"jev-1.14.0","answers":{},"usage":null}'
+        batch = c.DecisionBatch(
+            "local-request", "a" * 64, "b" * 64, "jev-1.14.0", 10, 9, 100, (),
+            hashlib.sha256(raw_response).hexdigest(), "response_invalid",
+            provider_request_id="vendor-request", usage_input_tokens=None,
+            usage_output_tokens=None, provider_status_code=200, boot_id="boot", schema_hash="c" * 64,
+            question_hash="d" * 64, provider_model_id="jev-1.14.0",
+            request_body_hash=hashlib.sha256(raw_request).hexdigest(),
+            raw_request_length=len(raw_request), raw_response_length=len(raw_response),
+            raw_request_zlib_b64_chunks=c._encode_jev_audit(raw_request),
+            raw_response_zlib_b64_chunks=c._encode_jev_audit(raw_response),
+            request_started_mono_ns=5, call_latency_ns=4,
+        )
+        restored = c.DecisionBatch.from_json(batch.to_json())
+        self.assertEqual(restored.request_id, "local-request")
+        self.assertEqual(restored.provider_request_id, "vendor-request")
+        self.assertIsNone(restored.usage_input_tokens)
+        self.assertIsNone(restored.usage_output_tokens)
+        self.assertEqual(restored.raw_response_bytes, raw_response)
+        self.assertEqual(restored.raw_request_bytes, raw_request)
+        with self.assertRaises(ValueError):
+            dataclasses.replace(batch, raw_response_zlib_b64_chunks=c._encode_jev_audit(raw_response) + ("dHJhaWxpbmc=",))
+        oversized = bytes(range(256)) * (1_025)
+        with self.assertRaises(ValueError):
+            compressed_bomb = base64.b64encode(zlib.compress(oversized)).decode("ascii")
+            chunks = tuple(compressed_bomb[i:i + c._JEV_AUDIT_CHUNK_CHARS]
+                           for i in range(0, len(compressed_bomb), c._JEV_AUDIT_CHUNK_CHARS))
+            dataclasses.replace(batch, raw_response_zlib_b64_chunks=chunks,
+                raw_response_length=len(oversized), raw_response_hash=hashlib.sha256(oversized).hexdigest())
+        max_audit = bytes(range(256)) * 1_024
+        self.assertEqual(len(max_audit), 262_144)
+        self.assertEqual(c._inflate_jev_audit(c._encode_jev_audit(max_audit)), max_audit)
+
+    def test_jev_choice_distribution_rejects_bool_probability(self):
+        with self.assertRaises(ValueError):
+            c.ChoiceDistribution(("long", "short"), (True, 0.0))
+
 
 if __name__ == "__main__":
     unittest.main()

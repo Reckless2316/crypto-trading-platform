@@ -18,13 +18,14 @@ from pathlib import Path
 from typing import Callable, Iterator
 
 from .contracts import (
-    AccountRevision, AccountView, AppendResult, Balance, ContractViolation,
+    AccountRevision, AccountView, AppendResult, Balance, ContractViolation, CausalCutoffs,
     ControlState, DecisionReference, IntentState, ManifestEntry, MarketRules, Mode,
     OrderEvent, OrderProposal, Permit, PersistenceUnavailable, PreparedIntent,
     Reservation, RiskLimits, RiskVerdict, SessionArchive, SessionCutoff, ReviewJob,
-    candidate_wire_id, canonical_bytes, checked_money, content_hash, decimal_text,
+    candidate_wire_id, canonical_bytes, checked_money, content_hash, decimal_text, CANDIDATE_WIRE_IDS,
     decimal_value, strict_json, ExactRatio, ExactNavEvidence, Holding,
-    MAX_DECIMAL_SCALE, StateUnavailable,
+    MAX_DECIMAL_SCALE, StateUnavailable, HistoricalInventory,
+    CalibrationArtifact, DecisionBatch, NumericSnapshot,
 )
 
 _MIGRATION = Path(__file__).resolve().parents[2] / 'data/migrations/001_autonomous_ledger.sql'
@@ -180,6 +181,20 @@ class Ledger:
         self._transaction_failed = False
         self._clock_us: Callable[[], int] = lambda: time.time_ns() // 1000
         self._monotonic_ns: Callable[[], int] = time.monotonic_ns
+        self._outcome_verifier = None
+
+    def configure_outcome_verifier(self, verifier) -> None:
+        """Bind one trusted in-process source dependency, never a wire value.
+
+        A reopened ledger has no verifier until authority explicitly wires it.
+        This does not approve a calibrator or enable trading.
+        """
+        from .calibration import OutcomeEvidenceVerifier
+        if not isinstance(verifier, OutcomeEvidenceVerifier):
+            raise ContractViolation('typed authority outcome verifier required')
+        if self._outcome_verifier is not None and self._outcome_verifier is not verifier:
+            raise ContractViolation('outcome verifier already bound')
+        self._outcome_verifier = verifier
 
     @property
     def source_entries_ready(self) -> bool:
@@ -362,6 +377,47 @@ class Ledger:
             for row in self.connection.execute('SELECT '+json_column+','+hash_column+' FROM '+table):
                 if content_hash(strict_json(row[0])) != row[1]:
                     raise PersistenceUnavailable('content hash integrity failure in '+table)
+        # Label events are the source of truth. Verify their contiguous
+        # append-only chain against the current mutable projection on startup.
+        for label in self.connection.execute('SELECT * FROM outcome_labels'):
+            events = self.connection.execute('SELECT * FROM label_events WHERE label_id=? ORDER BY revision',
+                (label['label_id'],)).fetchall()
+            if not events:
+                raise PersistenceUnavailable('outcome label has no event history')
+            previous = None
+            for revision, event in enumerate(events):
+                payload = strict_json(event['payload_json'])
+                if event['kind'] not in ('pending', 'resolved', 'corrected'):
+                    raise PersistenceUnavailable('unknown label projection event kind')
+                expected_id = 'label-event-' + content_hash((label['label_id'], revision,
+                    event['kind'], event['payload_hash']))
+                if (event['revision'] != revision or event['previous_event_id'] != previous
+                        or event['label_event_id'] != expected_id):
+                    raise PersistenceUnavailable('label event lineage integrity failure')
+                previous = event['label_event_id']
+            latest = events[-1]
+            payload = strict_json(latest['payload_json'])
+            first_payload = strict_json(events[0]['payload_json'])
+            forecast = self.connection.execute('''SELECT f.horizon_candles,d.recorded_at_us,s.candle_close_us
+                FROM forecasts f JOIN decisions d USING(decision_id)
+                JOIN snapshots s USING(snapshot_id) WHERE f.forecast_id=?''',
+                (label['forecast_id'],)).fetchone()
+            from .calibration import fixed_horizon_maturity
+            if (events[0]['kind'] != 'pending' or forecast is None
+                    or forecast['horizon_candles'] != 4
+                    or label['label_version'] != first_payload.get('label_version')
+                    or label['maturity_us'] != first_payload.get('maturity_us')
+                    or label['maturity_us'] != fixed_horizon_maturity(forecast['candle_close_us'],4)):
+                raise PersistenceUnavailable('label maturity/version does not match originating event')
+            expected = (latest['kind'], payload.get('net_positive_outcome'),
+                payload.get('net_return'), payload.get('resolved_at_us'),
+                payload.get('execution_manifest_hash'), payload.get('missing_reason'),
+                latest['revision'])
+            actual = (label['status'], label['outcome'], label['net_return'],
+                label['resolved_at_us'], label['execution_manifest_hash'],
+                label['missing_reason'], label['version'])
+            if actual != expected:
+                raise PersistenceUnavailable('label projection does not match event history')
         for row in self.connection.execute('SELECT release_hash,manifest_json FROM release_bundles'):
             manifest = strict_json(row['manifest_json'])
             if type(manifest) is not dict:
@@ -451,6 +507,154 @@ class Ledger:
             'SELECT coalesce(sum(version),0) FROM candidate_control WHERE account_id=?'):
             version += self.connection.execute(sql,(account_id,)).fetchone()[0]
         return AccountRevision(sequence,version)
+
+    def inventory_as_of(self, account_id: str, cutoffs: CausalCutoffs) -> HistoricalInventory:
+        """Rebuild native inventory from the committed causal journal prefix.
+
+        Revision history supplies the transactionally committed table watermarks.
+        Mutable balance projections and current accounting state are intentionally
+        not consulted. This returns only `inventory:<asset>` accounts; USD cash is
+        journaled separately under `cash` and is deliberately not represented here.
+        """
+        _identifier(account_id)
+        if type(cutoffs) is not CausalCutoffs:
+            raise ContractViolation('typed causal cutoffs required')
+        try:
+            history=self.connection.execute('''SELECT append_sequence,journal_sequence,version,
+                    evidence_watermarks_json,known_at_us,recorded_at_us
+                FROM account_revision_history WHERE account_id=?
+                AND known_at_us<=? AND recorded_at_us<=?
+                ORDER BY append_sequence DESC LIMIT 1''',
+                (account_id,cutoffs.knowledge_cutoff_us,cutoffs.knowledge_cutoff_us)).fetchone()
+            if history is None:
+                raise ContractViolation('no cutoff-visible account revision history')
+            for name in ('append_sequence','journal_sequence','version','known_at_us','recorded_at_us'):
+                if type(history[name]) is not int or history[name]<0:
+                    raise ContractViolation('malformed account revision history')
+            if history['known_at_us']<history['recorded_at_us']:
+                raise ContractViolation('incoherent account revision visibility')
+            watermarks=strict_json(history['evidence_watermarks_json'])
+            expected=set(_EXPORT_TIMES)-{'account_revision_history'}
+            if type(watermarks) is not dict:
+                raise ContractViolation('incomplete historical evidence watermarks')
+            # Migration 001 predates these six explicitly introduced accounting
+            # tables. Its exact, canonical key set proves their committed prefix
+            # was empty; do not generalize this compatibility rule to other keys.
+            legacy_accounting_prefix=set(watermarks)==expected-_ACCOUNTING_EXPORT_TABLES
+            if legacy_accounting_prefix:
+                if canonical_bytes(watermarks).decode()!=history['evidence_watermarks_json']:
+                    raise ContractViolation('noncanonical legacy evidence watermarks')
+                watermarks={**watermarks,**{table:0 for table in _ACCOUNTING_EXPORT_TABLES}}
+            elif set(watermarks)!=expected:
+                raise ContractViolation('incomplete historical evidence watermarks')
+            for table,value in watermarks.items():
+                if type(value) is not int or value<0:
+                    raise ContractViolation('malformed historical evidence watermark')
+            if not legacy_accounting_prefix and canonical_bytes(watermarks).decode()!=history['evidence_watermarks_json']:
+                raise ContractViolation('noncanonical historical evidence watermarks')
+            tx_watermark=watermarks['journal_transactions']
+            posting_watermark=watermarks['journal_postings']
+            txs=self.connection.execute('''SELECT rowid,transaction_id,sequence,account_id,event_at_us,recorded_at_us
+                FROM journal_transactions WHERE rowid<=? ORDER BY sequence''',(tx_watermark,)).fetchall()
+            # The journal sequence is global and append-only. A hole means the
+            # watermark cannot prove a complete prefix.
+            if any(type(row['sequence']) is not int or row['sequence']!=i
+                    for i,row in enumerate(txs,1)):
+                raise ContractViolation('gap in committed journal sequence prefix')
+            account_txs=[row for row in txs if row['account_id']==account_id]
+            max_sequence=max((row['sequence'] for row in account_txs),default=0)
+            if max_sequence!=history['journal_sequence']:
+                raise ContractViolation('account revision does not match committed journal prefix')
+            if self.connection.execute('''SELECT 1 FROM journal_transactions
+                    WHERE rowid>? AND account_id=? AND sequence<=? LIMIT 1''',
+                    (tx_watermark,account_id,history['journal_sequence'])).fetchone():
+                raise ContractViolation('journal sequence lies beyond its committed row watermark')
+            quantities: dict[str,Fraction]={}
+            posting_lineage=[]
+            for tx in account_txs:
+                if (type(tx['sequence']) is not int or tx['sequence']<=0
+                        or type(tx['transaction_id']) is not str or not tx['transaction_id']
+                        or type(tx['event_at_us']) is not int or tx['event_at_us']<0
+                        or type(tx['recorded_at_us']) is not int or tx['recorded_at_us']<0):
+                    raise ContractViolation('malformed journal transaction timestamps')
+                if tx['recorded_at_us']>cutoffs.knowledge_cutoff_us:
+                    raise ContractViolation('journal prefix exceeds knowledge cutoff')
+                postings=self.connection.execute('''SELECT rowid,line_no,ledger_account,asset,native_delta,
+                        usd_delta_u,recorded_at_us FROM journal_postings
+                    WHERE transaction_id=? ORDER BY line_no''',(tx['transaction_id'],)).fetchall()
+                if any(type(p['rowid']) is not int or p['rowid']>posting_watermark for p in postings):
+                    raise ContractViolation('journal transaction has postings beyond its committed watermark')
+                if len(postings)<2 or any(type(p['line_no']) is not int or p['line_no']!=i
+                        for i,p in enumerate(postings)):
+                    raise ContractViolation('incomplete journal postings at historical watermark')
+                usd_total=0
+                tx_native: dict[str,Fraction]={}
+                native_conservation: dict[str,Fraction]={}
+                line_payload=[]
+                for posting in postings:
+                    if type(posting['ledger_account']) is not str or not posting['ledger_account']:
+                        raise ContractViolation('malformed journal account')
+                    if type(posting['usd_delta_u']) is not int or type(posting['recorded_at_us']) is not int or posting['recorded_at_us']<0:
+                        raise ContractViolation('malformed journal posting amount or timestamp')
+                    checked_money(posting['usd_delta_u'])
+                    if posting['recorded_at_us']>cutoffs.knowledge_cutoff_us:
+                        raise ContractViolation('journal postings exceed knowledge cutoff')
+                    usd_total+=posting['usd_delta_u']
+                    native=None
+                    if posting['native_delta'] is None:
+                        if posting['asset'] is not None:
+                            raise ContractViolation('malformed native posting identity')
+                    else:
+                        if (type(posting['asset']) is not str or not posting['asset']
+                                or type(posting['native_delta']) is not str):
+                            raise ContractViolation('malformed native posting asset')
+                        native=decimal_value(posting['native_delta'])
+                        if decimal_text(native)!=posting['native_delta']:
+                            raise ContractViolation('noncanonical native posting quantity')
+                        native_conservation[posting['asset']]=native_conservation.get(posting['asset'],Fraction(0))+Fraction(native)
+                        if posting['ledger_account'].startswith('inventory:'):
+                            asset=posting['ledger_account'][len('inventory:'):]
+                            if not asset or asset!=posting['asset']:
+                                raise ContractViolation('inventory posting asset mismatch')
+                            tx_native[asset]=tx_native.get(asset,Fraction(0))+Fraction(native)
+                    line_payload.append((posting['rowid'],posting['line_no'],posting['ledger_account'],
+                        posting['asset'],posting['native_delta'],posting['usd_delta_u'],posting['recorded_at_us']))
+                if usd_total!=0:
+                    raise ContractViolation('unbalanced historical journal transaction')
+                if any(quantity for quantity in native_conservation.values()):
+                    raise ContractViolation('unbalanced native asset postings')
+                if tx['event_at_us']<=cutoffs.candle_close_us:
+                    posting_lineage.append((tx['rowid'],tx['transaction_id'],tx['sequence'],tx['event_at_us'],
+                        tx['recorded_at_us'],tuple(line_payload)))
+                    for asset,delta in tx_native.items():
+                        quantities[asset]=quantities.get(asset,Fraction(0))+delta
+            result=[]
+            for asset,quantity in sorted(quantities.items()):
+                if quantity==0:
+                    continue
+                denominator=quantity.denominator
+                while denominator%2==0: denominator//=2
+                while denominator%5==0: denominator//=5
+                if denominator!=1:
+                    raise ContractViolation('native inventory is not a finite decimal')
+                d=quantity.denominator;twos=fives=0
+                while d%2==0: d//=2;twos+=1
+                while d%5==0: d//=5;fives+=1
+                scale=max(twos,fives)
+                scaled=quantity.numerator*10**scale//quantity.denominator
+                sign='-' if scaled<0 else ''
+                digits=str(abs(scaled)).rjust(scale+1,'0')
+                text=(sign+digits if scale==0 else sign+digits[:-scale]+'.'+digits[-scale:])
+                value=decimal_value(text)
+                result.append((asset,value))
+            revision=AccountRevision(history['journal_sequence'],history['version'])
+            lineage_hash=content_hash({'account_id':account_id,'cutoffs':cutoffs.to_dict(),
+                'revision':revision.to_dict(),'postings':tuple(posting_lineage)})
+            return HistoricalInventory(cutoffs,account_id,revision,tuple(result),lineage_hash)
+        except ContractViolation:
+            raise
+        except Exception as exc:
+            raise ContractViolation('historical inventory prefix unavailable or malformed') from exc
 
     def invalidate_account(self, account_id: str) -> None:
         """Called by accounting in its outer transaction after economic changes."""
@@ -746,6 +950,374 @@ class Ledger:
         self.connection.execute('INSERT INTO order_events(event_id,append_sequence,intent_id,kind,venue_event_key,payload_json,event_at_us,received_at_us,recorded_at_us) SELECT ?,coalesce(max(append_sequence),0)+1,?,?,?,?,?,?,? FROM order_events',
             (event_id,intent_id,kind,venue_event_key,payload_json,event_at_us,received_at_us,recorded_at_us))
 
+    def append_forecast(self, *, forecast_id: str, decision_id: str, candidate_id: int,
+            side: str, direction_probability: float | None = None, probabilities: dict | None = None,
+            execution_policy_hash: str, eligibility: bool, calibrated_p: float | None = None,
+            calibrator_hash: str | None = None, recorded_at_us: int | None = None) -> bool:
+        """Record one immutable four-candle forecast and its pending label.
+
+        Candidate status is deliberately not filtered: HOLD, vetoed, rejected,
+        and eligible forecasts all enter the outcome cohort. The probability
+        must be the proposed-direction probability, never a confidence score.
+        """
+        import math
+        from .contracts import DecisionBatch, CANDIDATE_WIRE_IDS
+        from .calibration import fixed_horizon_maturity
+        if (type(forecast_id) is not str or not forecast_id or type(decision_id) is not str
+                or not decision_id or type(candidate_id) is not int or not 1 <= candidate_id <= 6
+                or type(side) is not str or side not in ('buy', 'sell')
+                or type(eligibility) is not bool
+                or type(execution_policy_hash) is not str or len(execution_policy_hash) != 64
+                or any(ch not in '0123456789abcdef' for ch in execution_policy_hash)):
+            raise ContractViolation('invalid forecast evidence')
+        if calibrated_p is not None and (type(calibrated_p) not in (int, float)
+                or not math.isfinite(calibrated_p) or not 0 <= calibrated_p <= 1):
+            raise ContractViolation('invalid calibrated probability')
+        if (calibrator_hash is not None and (type(calibrator_hash) is not str
+                or len(calibrator_hash) != 64 or any(ch not in '0123456789abcdef' for ch in calibrator_hash))
+                or (calibrated_p is None) != (calibrator_hash is None)):
+            raise ContractViolation('calibration identity mismatch')
+        if calibrated_p is not None:
+            # A caller-supplied probability/hash pair is not proof of a
+            # reviewed calibrator or its exact supported forecast input.
+            raise PersistenceUnavailable('reviewed calibration estimate verification unavailable')
+        now = self._clock_us() if recorded_at_us is None else recorded_at_us
+        if type(now) is not int or now < 0:
+            raise ContractViolation('invalid forecast timestamp')
+        with self.transaction() as c:
+            row = c.execute('''SELECT d.model_id,d.status,d.response_json,d.response_hash,d.request_id,
+                d.received_at_us AS decision_received_at_us,d.recorded_at_us AS decision_recorded_at_us,
+                s.recorded_at_us AS snapshot_recorded_at_us,
+                s.candle_close_us,s.release_hash,s.snapshot_id,s.valid,s.state_json
+                FROM decisions d JOIN snapshots s USING(snapshot_id) WHERE d.decision_id=?''',
+                (decision_id,)).fetchone()
+            if row is None or row['status'] != 'completed':
+                raise ContractViolation('forecast decision is not complete')
+            if not row['valid'] or now < row['candle_close_us'] or now >= row['candle_close_us'] + 4*3_600_000_000:
+                raise ContractViolation('forecast timestamp is invalid or after fixed horizon maturity')
+            if (content_hash(strict_json(row['response_json'])) != row['response_hash']):
+                raise PersistenceUnavailable('persisted decision batch hash mismatch')
+            try:
+                batch = DecisionBatch.from_json(row['response_json'])
+            except (TypeError, ValueError) as exc:
+                raise PersistenceUnavailable('persisted typed DecisionBatch unavailable') from exc
+            if (batch.request_id != row['request_id'] or batch.model_id != row['model_id']
+                    or batch.bundle_hash != row['release_hash']
+                    or batch.state_hash != content_hash(strict_json(row['state_json']))):
+                raise ContractViolation('DecisionBatch does not match persisted decision/snapshot')
+            if now < max(row['decision_received_at_us'],row['decision_recorded_at_us'],
+                    row['snapshot_recorded_at_us'],batch.received_at_us):
+                raise ContractViolation('forecast timestamp is before persisted decision knowledge')
+            internal_id = next((name for name, wire in CANDIDATE_WIRE_IDS if wire == candidate_id), None)
+            selected = next((item for item in batch.decisions if item.candidate_id == internal_id), None)
+            if selected is None:
+                raise ContractViolation('forecast candidate is absent from persisted judgment')
+            class_probability = getattr(selected.direction_probabilities, selected.direction.value)
+            binary_probability = (None if selected.direction.value == 'neutral'
+                else getattr(selected.direction_probabilities, 'long' if side == 'buy' else 'short'))
+            wire_probabilities = {'direction_probability': binary_probability,
+                'direction_class_probability': class_probability,
+                'selected_direction': selected.direction.value,
+                'direction_probabilities': {'long': selected.direction_probabilities.long,
+                    'short': selected.direction_probabilities.short,
+                    'neutral': selected.direction_probabilities.neutral},
+                'regime': selected.regime.value, 'decision_hash': row['response_hash']}
+            if (direction_probability is not None and direction_probability != binary_probability
+                    or probabilities is not None and probabilities.get('direction_probability') != binary_probability):
+                raise ContractViolation('caller probability disagrees with immutable decision')
+            probabilities_json = canonical_bytes(wire_probabilities).decode()
+            candidate = c.execute('SELECT status FROM candidate_results WHERE decision_id=? AND candidate_id=?',
+                (decision_id,candidate_id)).fetchone()
+            if candidate is None:
+                raise ContractViolation('forecast candidate result missing')
+            maturity_us = fixed_horizon_maturity(row['candle_close_us'], 4)
+            inserted = c.execute('''INSERT OR IGNORE INTO forecasts
+                (forecast_id,decision_id,candidate_id,side,horizon_candles,probabilities_json,
+                calibrated_p,calibrator_hash,eligibility,execution_policy_hash,recorded_at_us)
+                VALUES (?,?,?,?,4,?,?,?,?,?,?)''',
+                (forecast_id,decision_id,candidate_id,side,probabilities_json,
+                 None if calibrated_p is None else str(calibrated_p),calibrator_hash,
+                 int(eligibility),execution_policy_hash,now)).rowcount
+            existing = c.execute('SELECT * FROM forecasts WHERE forecast_id=?',(forecast_id,)).fetchone()
+            if existing is None:
+                raise ContractViolation('forecast conflicts with an existing economic identity')
+            expected = (decision_id,candidate_id,side,4,probabilities_json,
+                None if calibrated_p is None else str(calibrated_p),calibrator_hash,
+                int(eligibility),execution_policy_hash,now)
+            actual = tuple(existing[k] for k in ('decision_id','candidate_id','side','horizon_candles',
+                'probabilities_json','calibrated_p','calibrator_hash','eligibility','execution_policy_hash','recorded_at_us'))
+            if actual != expected:
+                raise ContractViolation('forecast identity/content conflict')
+            label_id = 'label-' + content_hash((forecast_id,0))
+            label = c.execute('SELECT * FROM outcome_labels WHERE label_id=?',(label_id,)).fetchone()
+            if label is None:
+                c.execute('''INSERT INTO outcome_labels(label_id,forecast_id,label_version,maturity_us,
+                    resolved_at_us,status,net_return,outcome,execution_manifest_hash,missing_reason,version)
+                    VALUES (?,?,0,?,NULL,'pending',NULL,NULL,NULL,'awaiting_first_executable_quote_and_four_candle_evidence',0)''',
+                    (label_id,forecast_id,maturity_us))
+                payload = {'label_version':0,'status':'pending','maturity_us':maturity_us,
+                    'missing_reason':'awaiting_first_executable_quote_and_four_candle_evidence',
+                    'requires_verified_execution_evidence':True}
+                self._append_label_event(c,label_id,0,None,'pending',payload,now)
+            elif label['forecast_id'] != forecast_id or label['maturity_us'] != maturity_us:
+                raise ContractViolation('label identity conflict')
+        return bool(inserted)
+
+    def calibration_rows(self, *, before_us: int, after_us: int | None = None, instrument: str, regime,
+                         side: str, model_id: str, schema_hash: str, dictionary_hash: str,
+                         label_hash: str, cost_hash: str) -> tuple[dict, ...]:
+        """Calibration rows built only from ledger-verified label events known by `before_us`.
+
+        Each label contributes its latest resolved/corrected event recorded at or before the
+        cutoff (an as-of view: later corrections are invisible). Forecasts without a binary
+        proposed-direction probability (neutral) are excluded. `after_us` keeps decisions
+        strictly after a training cutoff. Rows outside the exact cohort and versions are
+        dropped, then overlapping four-hour windows are purged deterministically: rows are
+        taken in quote order and any row starting before the last kept horizon is skipped.
+        """
+        from .calibration import label_definition_hash
+        if type(before_us) is not int or (after_us is not None and type(after_us) is not int):
+            raise ContractViolation('integer calibration block cutoffs required')
+        names = {wire: name for name, wire in CANDIDATE_WIRE_IDS}
+        rows = []
+        for label in self.connection.execute('SELECT label_id,forecast_id FROM outcome_labels ORDER BY label_id').fetchall():
+            event = self.connection.execute('SELECT * FROM label_events WHERE label_id=? AND recorded_at_us<=? '
+                'ORDER BY revision DESC LIMIT 1', (label['label_id'], before_us)).fetchone()
+            if event is None or event['kind'] not in ('resolved', 'corrected'):
+                continue
+            context = self.connection.execute('SELECT f.candidate_id,f.side,f.probabilities_json,f.execution_policy_hash,'
+                'f.recorded_at_us AS forecast_at_us,d.response_json,d.model_id,s.field_hash,s.candle_close_us '
+                'FROM forecasts f JOIN decisions d USING(decision_id) JOIN snapshots s USING(snapshot_id) '
+                'WHERE f.forecast_id=?', (label['forecast_id'],)).fetchone()
+            payload = strict_json(event['payload_json'])
+            probabilities = strict_json(context['probabilities_json'])
+            if probabilities.get('direction_probability') is None:
+                continue
+            if after_us is not None and context['candle_close_us'] <= after_us:
+                continue
+            batch = DecisionBatch.from_json(context['response_json'])
+            rows.append({
+                'forecast_id': label['forecast_id'], 'label_event_id': event['label_event_id'],
+                'decision_at_us': context['candle_close_us'], 'forecast_at_us': context['forecast_at_us'],
+                'first_executable_quote_us': payload['first_executable_quote_us'],
+                'horizon_close_us': payload['horizon_close_us'], 'resolved_at_us': payload['resolved_at_us'],
+                'direction_probability': probabilities['direction_probability'],
+                'net_return': decimal_value(payload['net_return']),
+                'net_positive_outcome': payload['net_positive_outcome'],
+                'terminal_direction_outcome': payload.get('terminal_direction_outcome'),
+                'costs_included': payload['costs_included'], 'execution_manifest_hash': payload['execution_manifest_hash'],
+                'observations': payload['observations'], 'side': context['side'],
+                'instrument': names[context['candidate_id']].upper() + '-USD', 'regime': probabilities['regime'],
+                'model_id': context['model_id'], 'schema_hash': batch.schema_hash, 'dictionary_hash': context['field_hash'],
+                'label_hash': label_definition_hash(payload), 'cost_hash': context['execution_policy_hash']})
+        wanted = {'instrument': instrument, 'regime': getattr(regime, 'value', regime), 'side': side,
+            'model_id': model_id, 'schema_hash': schema_hash, 'dictionary_hash': dictionary_hash,
+            'label_hash': label_hash, 'cost_hash': cost_hash}
+        kept, horizon = [], None
+        for row in sorted((r for r in rows if all(r[k] == v for k, v in wanted.items())),
+                key=lambda r: (r['first_executable_quote_us'], r['forecast_id'], r['label_event_id'])):
+            if horizon is not None and row['first_executable_quote_us'] <= horizon:
+                continue
+            kept.append(row);horizon = row['horizon_close_us']
+        return tuple(kept)
+
+    def record_calibration_attestation(self, *, release_hash: str, **build_args) -> str:
+        """Build, attest and append a calibration from ledger label events only.
+
+        Rows come from `calibration_rows` at the block cutoffs, never from the caller.
+        The release manifest must name the attested artifact as its calibrator. One
+        calibrator may be attested for several releases; each pairing is its own run.
+        """
+        from .calibration import ATTESTATION_METHOD, attest_calibration_artifact, build_calibration_artifact
+        training_cutoff, calibration_cutoff = build_args.get('training_cutoff_us'), build_args.get('calibration_cutoff_us')
+        now = self._clock_us()
+        if type(calibration_cutoff) is not int or calibration_cutoff > now:
+            raise ContractViolation('calibration cutoff must not be in the future')
+        cohort = {key: build_args.get(key) for key in ('instrument', 'regime', 'model_id', 'schema_hash',
+            'dictionary_hash', 'label_hash', 'cost_hash')}
+        cohort['side'] = build_args.get('side', 'buy')
+        training = self.calibration_rows(before_us=training_cutoff, **cohort)
+        calibration = self.calibration_rows(before_us=calibration_cutoff, after_us=training_cutoff, **cohort)
+        base = build_calibration_artifact(training=training, calibration=calibration, **build_args)
+        attested, metrics = attest_calibration_artifact(base, training=training, calibration=calibration, **build_args)
+        run_id = content_hash((ATTESTATION_METHOD, attested.artifact_hash, release_hash))
+        with self.transaction() as c:
+            release = c.execute('SELECT manifest_json FROM release_bundles WHERE release_hash=?', (release_hash,)).fetchone()
+            manifest = strict_json(release['manifest_json']) if release else None
+            if type(manifest) is not dict or manifest.get('calibrator_hash') != attested.artifact_hash:
+                raise ContractViolation('release does not name the attested calibrator')
+            payload = canonical_bytes({'artifact': attested.to_dict(), 'metrics': metrics,
+                'calibration_cutoff_us': calibration_cutoff}).decode()
+            values = (run_id, release_hash, metrics['training_rows_hash'],
+                metrics['calibration_rows_hash'], ATTESTATION_METHOD, payload, 'completed')
+            existing = c.execute('SELECT * FROM evaluation_runs WHERE run_id=?', (run_id,)).fetchone()
+            if existing is not None:
+                if tuple(existing)[:7] != values:
+                    raise ContractViolation('calibration attestation identity conflict')
+            else:
+                c.execute('INSERT INTO evaluation_runs VALUES (?,?,?,?,?,?,?,?)', values + (now,))
+        return attested.artifact_hash
+
+    def attested_calibration(self, artifact_hash: str, release_hash: str) -> CalibrationArtifact | None:
+        """The recorded attested artifact for this release, or None (fail closed)."""
+        from .calibration import ATTESTATION_METHOD
+        run_id = content_hash((ATTESTATION_METHOD, artifact_hash, release_hash))
+        row = self.connection.execute("SELECT * FROM evaluation_runs WHERE run_id=? AND release_hash=? AND holdout_id=? AND status='completed'",
+            (run_id, release_hash, ATTESTATION_METHOD)).fetchone()
+        release = self.connection.execute('SELECT manifest_json FROM release_bundles WHERE release_hash=?', (release_hash,)).fetchone()
+        if row is None or release is None:
+            return None
+        try:
+            manifest = strict_json(release['manifest_json'])
+            artifact = CalibrationArtifact.from_dict(strict_json(row['metrics_json'])['artifact'])
+        except (TypeError, ValueError, KeyError, ContractViolation):
+            return None
+        if (type(manifest) is not dict or manifest.get('calibrator_hash') != artifact_hash
+                or artifact.artifact_hash != artifact_hash
+                or not (artifact.uncertainty_passed and artifact.tail_checks_passed)):
+            return None
+        return artifact
+
+    def verified_decision_snapshot(self, batch: DecisionBatch, snapshot: NumericSnapshot) -> dict | None:
+        """Persisted completed decision equal to `batch`, joined to the persisted valid `snapshot`."""
+        if type(batch) is not DecisionBatch or type(snapshot) is not NumericSnapshot or self.connection.in_transaction:
+            return None
+        row = self.connection.execute('SELECT * FROM decisions WHERE request_id=?', (batch.request_id,)).fetchone()
+        if row is None or row['status'] != 'completed' or row['response_json'] is None:
+            return None
+        try:
+            if content_hash(strict_json(row['response_json'])) != row['response_hash']:
+                return None
+            if DecisionBatch.from_json(row['response_json']) != batch or row['model_id'] != batch.model_id:
+                return None
+        except (TypeError, ValueError, ContractViolation):
+            return None
+        anchor = self.connection.execute('SELECT * FROM snapshots WHERE snapshot_id=?', (row['snapshot_id'],)).fetchone()
+        persisted = self.connection.execute('SELECT * FROM snapshots WHERE snapshot_id=?', (snapshot.snapshot_id,)).fetchone()
+        if anchor is None or persisted is None:
+            return None
+        if (persisted['state_json'] != anchor['state_json'] or not persisted['valid']
+                or persisted['release_hash'] != batch.bundle_hash or persisted['account_id'] != snapshot.account_id
+                or persisted['candle_close_us'] != snapshot.cutoffs.candle_close_us
+                or persisted['knowledge_cutoff_us'] != snapshot.cutoffs.knowledge_cutoff_us
+                or persisted['lineage_hash'] != snapshot.lineage_hash
+                or content_hash(strict_json(persisted['state_json'])) != batch.state_hash
+                or self._source_lineage_invalid(snapshot.snapshot_id)):
+            return None
+        # Bind the caller's snapshot to the exact candidate row the judgment saw.
+        from .state import _wire_values
+        from .contracts import default_field_dictionary
+        try:
+            wire_id = candidate_wire_id(snapshot.candidate_id)
+            expected = _wire_values(snapshot.features, default_field_dictionary().candidate_fields, snapshot.candidate_id)
+            rows = [row for row in strict_json(persisted['state_json'])[1] if row and row[0] == wire_id]
+        except (ContractViolation, TypeError, ValueError, KeyError, IndexError):
+            return None
+        if snapshot.instrument != snapshot.candidate_id.upper() + '-USD' or rows != [expected]:
+            return None
+        return {'decision_id': row['decision_id'], 'field_hash': persisted['field_hash']}
+
+    def _append_label_event(self, connection: sqlite3.Connection, label_id: str,
+            revision: int, previous_event_id: str | None, kind: str,
+            payload: dict, recorded_at_us: int) -> str:
+        payload_json = canonical_bytes(payload).decode()
+        payload_hash = content_hash(payload)
+        event_id = 'label-event-' + content_hash((label_id,revision,kind,payload_hash))
+        connection.execute('INSERT INTO label_events VALUES (?,?,?,?,?,?,?,?)',
+            (event_id,label_id,revision,previous_event_id,kind,payload_json,payload_hash,recorded_at_us))
+        return event_id
+
+    def revise_outcome_label(self, label_id: str, kind: str, payload: dict,
+            *, recorded_at_us: int | None = None) -> str:
+        """Append an immutable label revision and rebuild its mutable projection.
+
+        A missing executable observation stays `pending`; it is never converted
+        to a negative label. Corrections append a new event and retain history.
+        """
+        from .calibration import label_mature
+        if type(label_id) is not str or not label_id or type(payload) is not dict:
+            raise ContractViolation('invalid label revision')
+        if kind not in ('pending','resolved','corrected'):
+            raise ContractViolation('unsupported label revision kind')
+        if kind in ('resolved', 'corrected') and self._outcome_verifier is None:
+            # This ledger does not yet have an evidence resolver that binds
+            # executable quotes, depth, fills, fees and slippage to source
+            # events. Caller assertions and hashes alone cannot resolve labels.
+            raise PersistenceUnavailable('verified causal outcome evidence resolver unavailable; label remains pending')
+        now = self._clock_us() if recorded_at_us is None else recorded_at_us
+        if type(now) is not int or now < 0:
+            raise ContractViolation('invalid label event timestamp')
+        payload_json = canonical_bytes(payload).decode()
+        with self.transaction() as c:
+            label = c.execute('''SELECT l.*,f.horizon_candles FROM outcome_labels l
+                JOIN forecasts f USING(forecast_id) WHERE l.label_id=?''',(label_id,)).fetchone()
+            if label is None:
+                raise ContractViolation('unknown outcome label')
+            latest = c.execute('SELECT * FROM label_events WHERE label_id=? ORDER BY revision DESC LIMIT 1',(label_id,)).fetchone()
+            if latest is None:
+                raise PersistenceUnavailable('label event lineage missing')
+            if now < latest['recorded_at_us']:
+                raise ContractViolation('label revision timestamp precedes immutable predecessor')
+            # Label time is append-only: never later than the clock, never before any existing
+            # label event, and never inside an already attested calibration block.
+            if now > self._clock_us():
+                raise ContractViolation('label revision timestamp is in the future')
+            if now < (c.execute('SELECT max(recorded_at_us) FROM label_events').fetchone()[0] or 0):
+                raise ContractViolation('label revision timestamp precedes latest label event')
+            attested_cutoff = c.execute("SELECT max(json_extract(metrics_json,'$.calibration_cutoff_us')) FROM evaluation_runs WHERE holdout_id LIKE 'calibration-attestation-%'").fetchone()[0]
+            if attested_cutoff is not None and now <= attested_cutoff:
+                raise ContractViolation('label revision timestamp precedes an attested calibration cutoff')
+            if kind == 'corrected' and latest['kind'] not in ('resolved','corrected'):
+                raise ContractViolation('only a resolved label can be corrected')
+            if kind == 'resolved' and latest['kind'] not in ('pending',):
+                raise ContractViolation('resolved label requires pending predecessor')
+            outcome = net_return = resolved_at = manifest_hash = None
+            missing_reason = payload.get('missing_reason')
+            if kind in ('resolved','corrected'):
+                from dataclasses import asdict
+                from .contracts import DecisionBatch
+                from .calibration import OutcomeVerificationRequest, verified_outcome_payload
+                forecast = c.execute('''SELECT f.forecast_id,f.decision_id,f.candidate_id,f.side,
+                    f.execution_policy_hash,f.recorded_at_us AS forecast_at_us,
+                    d.response_json,d.response_hash,d.model_id,s.field_hash,s.candle_close_us
+                    FROM forecasts f JOIN decisions d USING(decision_id)
+                    JOIN snapshots s USING(snapshot_id) WHERE f.forecast_id=?''',
+                    (label['forecast_id'],)).fetchone()
+                if (forecast is None or label['horizon_candles'] != 4
+                        or content_hash(strict_json(forecast['response_json'])) != forecast['response_hash']):
+                    raise PersistenceUnavailable('forecast execution context unavailable')
+                batch = DecisionBatch.from_json(forecast['response_json'])
+                if batch.schema_hash is None or batch.model_id != forecast['model_id']:
+                    raise PersistenceUnavailable('exact outcome model/schema context unavailable')
+                request = OutcomeVerificationRequest(label_id,label['forecast_id'],forecast['decision_id'],
+                    forecast['candidate_id'],forecast['side'],forecast['model_id'],batch.schema_hash,
+                    forecast['field_hash'],forecast['execution_policy_hash'],forecast['candle_close_us'],
+                    forecast['forecast_at_us'],now,latest['label_event_id'],payload_json)
+                try:
+                    evidence = self._outcome_verifier.verify(request)
+                    payload = verified_outcome_payload(request,evidence,self._outcome_verifier)
+                except Exception as exc:
+                    raise PersistenceUnavailable('verified causal execution outcome unavailable') from exc
+                payload['verification_context'] = asdict(request)
+                outcome = payload['net_positive_outcome']
+                net_return = payload['net_return']
+                resolved_at = payload['resolved_at_us']
+                manifest_hash = payload['execution_manifest_hash']
+                missing_reason = None
+            else:
+                if any(k in payload for k in ('net_positive_outcome','terminal_direction_outcome',
+                        'net_return','resolved_at_us','execution_manifest_hash')):
+                    raise ContractViolation('pending label cannot carry an outcome')
+                if type(missing_reason) is not str or not missing_reason:
+                    raise ContractViolation('pending label needs a missingness reason')
+            revision = latest['revision'] + 1
+            event_id = self._append_label_event(c,label_id,revision,latest['label_event_id'],kind,payload,now)
+            status = 'corrected' if kind == 'corrected' else kind
+            c.execute('''UPDATE outcome_labels SET resolved_at_us=?,status=?,net_return=?,outcome=?,
+                execution_manifest_hash=?,missing_reason=?,version=version+1 WHERE label_id=?''',
+                (resolved_at,status,net_return,outcome,manifest_hash,missing_reason,label_id))
+        return event_id
+
     def _record_revisions(self) -> None:
         """Commit a revision and an exact durable prefix for every evidence table.
 
@@ -816,6 +1388,160 @@ class Ledger:
                     raise ContractViolation('missing review job reference')
             c.execute('INSERT INTO review_jobs VALUES (?,?,?,?,?,?,?,?,?,?,?,?)',(job.job_id,job.dedupe_key,job.kind,job.session_id,job.snapshot_id,job.decision_id,job.status.value,job.payload_hash,job.attempts,job.next_attempt_us,job.to_json(),self._clock_us()))
             return AppendResult(True,job.job_id,self._job_revision(job))
+
+    @staticmethod
+    def _review_incident_key(account_id: str, candidate_id: int, release_hash: str,
+            incident_epoch: int, kind: str) -> str:
+        return canonical_bytes((account_id,candidate_id,release_hash,incident_epoch,kind)).decode()
+
+    def pause_candidate_for_review(self, account_id: str, candidate_id: int,
+            release_hash: str, incident_epoch: int, kind: str, job: ReviewJob) -> AppendResult:
+        """Atomically persist a provenance-bound, append-only sticky review pause.
+
+        No clear or recovery policy is authorized by the current contract; this
+        method only records the pause and does not provide a clearing operation.
+        """
+        if (type(account_id) is not str or not account_id or type(candidate_id) is not int
+                or not 1 <= candidate_id <= 6 or type(release_hash) is not str
+                or len(release_hash)!=64 or any(ch not in '0123456789abcdef' for ch in release_hash)
+                or type(incident_epoch) is not int
+                or incident_epoch < 0 or type(kind) is not str or not kind or len(kind)>64
+                or type(job) is not ReviewJob):
+            raise ContractViolation('invalid candidate review pause')
+        if kind not in ('low_confidence','crisis'):
+            raise ContractViolation('unsupported candidate review incident kind')
+        expected_key=self._review_incident_key(account_id,candidate_id,release_hash,incident_epoch,kind)
+        if (job.dedupe_key!=expected_key or job.kind!=kind
+                or job.decision_id is None or job.snapshot_id is None):
+            raise ContractViolation('review job does not match candidate incident identity')
+        event_id='candidate-review-'+content_hash((account_id,candidate_id,release_hash,incident_epoch,kind))
+        with self.transaction() as c:
+            self._require_account(account_id)
+            from .contracts import DecisionBatch, CANDIDATE_WIRE_IDS
+            evidence_row=c.execute('''SELECT d.decision_id,d.request_id,d.model_id,d.response_json,
+                d.response_hash,d.status,d.received_at_us,d.recorded_at_us,
+                s.snapshot_id,s.account_id,s.release_hash,s.state_json,s.valid
+                FROM decisions d JOIN snapshots s USING(snapshot_id) WHERE d.decision_id=?''',
+                (job.decision_id,)).fetchone()
+            if (evidence_row is None or evidence_row['snapshot_id']!=job.snapshot_id
+                    or evidence_row['account_id']!=account_id
+                    or evidence_row['release_hash']!=release_hash
+                    or evidence_row['status']!='completed' or not evidence_row['valid']
+                    or evidence_row['response_json'] is None
+                    or evidence_row['response_hash'] is None):
+                raise ContractViolation('candidate review lacks same-account persisted decision evidence')
+            if content_hash(strict_json(evidence_row['response_json']))!=evidence_row['response_hash']:
+                raise PersistenceUnavailable('persisted review decision hash mismatch')
+            try:
+                batch=DecisionBatch.from_json(evidence_row['response_json'])
+            except (TypeError, ValueError) as exc:
+                raise PersistenceUnavailable('persisted typed review decision unavailable') from exc
+            if (batch.request_id!=evidence_row['request_id']
+                    or batch.model_id!=evidence_row['model_id']
+                    or batch.bundle_hash!=release_hash
+                    or batch.state_hash!=content_hash(strict_json(evidence_row['state_json']))
+                    or evidence_row['received_at_us'] is None
+                    or incident_epoch!=evidence_row['received_at_us']):
+                raise ContractViolation('candidate review decision/snapshot provenance mismatch')
+            candidate_name=next((name for name,wire in CANDIDATE_WIRE_IDS if wire==candidate_id),None)
+            selected=next((item for item in batch.decisions if item.candidate_id==candidate_name),None)
+            result=c.execute('SELECT status FROM candidate_results WHERE decision_id=? AND candidate_id=?',
+                (job.decision_id,candidate_id)).fetchone()
+            if selected is None or result is None or result['status']!='hold':
+                raise ContractViolation('candidate review evidence is absent or not held')
+            if kind=='low_confidence':
+                critical={'direction':selected.direction_confidence,'regime':selected.regime_confidence,
+                    'quality':selected.quality_confidence,'risk':selected.risk_confidence}
+                low={name:value for name,value in critical.items() if value<0.60}
+                if not low:
+                    raise ContractViolation('low-confidence review lacks threshold evidence')
+                evidence={'critical_confidences':critical,'below_threshold':low}
+            else:
+                if selected.regime.value!='crisis':
+                    raise ContractViolation('crisis review lacks persisted crisis evidence')
+                evidence={'regime':selected.regime.value,
+                    'direction':selected.direction.value,
+                    'direction_confidences':{'long':selected.direction_probabilities.long,
+                        'short':selected.direction_probabilities.short,
+                        'neutral':selected.direction_probabilities.neutral}}
+            incident_details={'account_id':account_id,'candidate_id':candidate_id,
+                'release_hash':release_hash,'incident_epoch':incident_epoch,'kind':kind,
+                'decision_id':job.decision_id,'snapshot_id':job.snapshot_id,
+                'decision_hash':evidence_row['response_hash'],
+                'snapshot_hash':content_hash(strict_json(evidence_row['state_json'])),
+                'evidence':evidence}
+            if job.payload_hash!=content_hash(incident_details):
+                raise ContractViolation('review job payload hash does not bind canonical incident evidence')
+            previous=c.execute('SELECT job_id,job_json FROM review_jobs WHERE job_id=? OR dedupe_key=?',
+                (job.job_id,job.dedupe_key)).fetchall()
+            if previous and (len(previous)!=1 or previous[0]['job_json']!=job.to_json()):
+                raise ContractViolation('review job identity/content conflict')
+            for table,key,value in (('review_sessions','session_id',job.session_id),
+                    ('snapshots','snapshot_id',job.snapshot_id),('decisions','decision_id',job.decision_id)):
+                if value is not None and not c.execute('SELECT 1 FROM '+table+' WHERE '+key+'=?',(value,)).fetchone():
+                    raise ContractViolation('missing review job reference')
+            if job.session_id is not None:
+                session=c.execute('SELECT account_id FROM review_sessions WHERE session_id=?',
+                    (job.session_id,)).fetchone()
+                if session is None or session['account_id']!=account_id:
+                    raise ContractViolation('cross-account review session reference')
+            control=c.execute('SELECT permit_epoch FROM account_control WHERE account_id=?',(account_id,)).fetchone()
+            event=c.execute('SELECT account_id,request_id,reason FROM control_events WHERE event_id=? OR request_id=?',
+                (event_id,event_id)).fetchall()
+            reason='candidate review pause:'+str(candidate_id)+':'+kind
+            if event and (len(event)!=1 or tuple(event[0])!=(account_id,event_id,reason)):
+                raise ContractViolation('candidate review event identity conflict')
+            if not event:
+                c.execute("INSERT INTO control_events VALUES (?,?,?,?,'review','policy',?,?)",
+                    (event_id,account_id,event_id,control[0],reason,self._clock_us()))
+            if not previous:
+                c.execute('INSERT INTO review_jobs VALUES (?,?,?,?,?,?,?,?,?,?,?,?)',
+                    (job.job_id,job.dedupe_key,job.kind,job.session_id,job.snapshot_id,job.decision_id,
+                     job.status.value,job.payload_hash,job.attempts,job.next_attempt_us,job.to_json(),self._clock_us()))
+            existing=c.execute('SELECT review_paused,incident_epoch,review_job_id FROM candidate_control WHERE account_id=? AND candidate_id=?',
+                (account_id,candidate_id)).fetchone()
+            if existing and existing['incident_epoch']>incident_epoch:
+                raise ContractViolation('candidate incident epoch regressed')
+            if existing:
+                # A pause is sticky. A later signal can advance its evidence link,
+                # but neither confidence nor release changes can clear it.
+                if (not existing['review_paused'] or existing['review_job_id']!=job.job_id
+                        or existing['incident_epoch']!=max(existing['incident_epoch'],incident_epoch)):
+                    c.execute('UPDATE candidate_control SET review_paused=1,review_job_id=?,incident_epoch=?,version=version+1 WHERE account_id=? AND candidate_id=?',
+                        (job.job_id,max(existing['incident_epoch'],incident_epoch),account_id,candidate_id))
+            else:
+                c.execute('INSERT INTO candidate_control VALUES (?, ?, 1, ?, ?, 0)',
+                    (account_id,candidate_id,job.job_id,incident_epoch))
+            result_id=previous[0]['job_id'] if previous else job.job_id
+            return AppendResult(not bool(previous),result_id,self._revision(account_id))
+
+    def latch_account_crisis(self, account_id: str, incident_id: str, reason: str) -> bool:
+        """Durably halt account entries and invalidate permits, idempotently."""
+        if (type(account_id) is not str or not account_id or type(incident_id) is not str
+                or not incident_id or len(incident_id)>256 or type(reason) is not str
+                or not reason or len(reason)>256):
+            raise ContractViolation('invalid account crisis incident')
+        event_id='crisis-'+content_hash((account_id,incident_id))
+        event_reason='crisis:'+reason
+        with self.transaction() as c:
+            self._require_account(account_id)
+            row=c.execute('SELECT * FROM account_control WHERE account_id=?',(account_id,)).fetchone()
+            previous=c.execute('SELECT account_id,request_id,reason FROM control_events WHERE event_id=? OR request_id=?',
+                (event_id,event_id)).fetchall()
+            if previous:
+                if len(previous)!=1 or tuple(previous[0])!=(account_id,event_id,event_reason):
+                    raise ContractViolation('crisis event identity/content conflict')
+                if not row['crisis_halted'] or row['permit']!='none' or row['lease_boot_id'] is not None:
+                    now=self._clock_us()
+                    c.execute("UPDATE account_control SET permit='none',permit_epoch=permit_epoch+1,crisis_halted=1,lease_boot_id=NULL,lease_deadline_mono_ns=NULL,version=version+1,halt_reason=?,updated_at_us=? WHERE account_id=?",
+                        (reason,now,account_id))
+                return False
+            now=self._clock_us()
+            c.execute("INSERT INTO control_events VALUES (?,?,?,?,'review','policy',?,?)",
+                (event_id,account_id,event_id,row['permit_epoch'],event_reason,now))
+            c.execute("UPDATE account_control SET permit='none',permit_epoch=permit_epoch+1,crisis_halted=1,lease_boot_id=NULL,lease_deadline_mono_ns=NULL,version=version+1,halt_reason=?,updated_at_us=? WHERE account_id=?",
+                (reason,now,account_id))
+            return True
 
     def _job_revision(self, job: ReviewJob) -> AccountRevision:
         accounts = set()

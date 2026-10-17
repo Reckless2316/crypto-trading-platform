@@ -8,7 +8,7 @@ from decimal import Decimal
 from pathlib import Path
 
 from bot.autonomous.contracts import (AccountRevision, ContractViolation, IntentState,
-    OrderEvent, OrderReference, PersistenceUnavailable, ReceiptStatus, ReviewJob,
+    CausalCutoffs, OrderEvent, OrderReference, PersistenceUnavailable, ReceiptStatus, ReviewJob,
     RiskLimits, RiskVerdict, SessionCutoff, VenueOrderResult, canonical_bytes, content_hash)
 from tests.autonomous.support import HASH_A, HASH_B, order_proposal
 
@@ -124,6 +124,7 @@ class LedgerTests(unittest.TestCase):
         finally:
             self.ledger._clock_us=original_clock
         return now
+
 
     def ready(self):
         now = self.seed(valid=True)
@@ -1412,6 +1413,9 @@ class AccountingTests(unittest.TestCase):
             from bot.autonomous.contracts import strict_json
             payload=strict_json(upgraded.connection.execute('SELECT export_json FROM review_sessions WHERE session_id=?',(archive.session_id,)).fetchone()[0])
             self.assertTrue(all(payload[table]==[] for table in additions))
+            historical_inventory=upgraded.inventory_as_of('paper-test',CausalCutoffs(self.now,self.now,1,'legacy-boot'))
+            self.assertEqual((),historical_inventory.quantities)
+            self.assertEqual(0,historical_inventory.revision.journal_sequence)
         finally:upgraded.close()
 
     def test_accounting_write_boundary_failures_roll_back_every_projection(self):
@@ -1448,3 +1452,94 @@ class AccountingTests(unittest.TestCase):
                     self.assertEqual(before,snapshot())
                     self.assertFalse(ledger.dispatch_enabled)
                 finally:ledger.close()
+
+
+class HistoricalInventoryTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.path = Path(self.directory.name) / "historical-ledger.sqlite3"
+        from bot.autonomous.ledger import Ledger
+        self.ledger = Ledger.open(self.path)
+        self.ledger.create_paper_account("paper-history")
+        row=self.ledger.connection.execute("SELECT max(known_at_us),max(recorded_at_us) FROM account_revision_history WHERE account_id='paper-history'").fetchone()
+        self.base=max(row)
+
+    def tearDown(self):
+        self.ledger.close()
+        self.directory.cleanup()
+
+    def append_native_tx(self, txid, source_kind, event_at_us, recorded_at_us, postings):
+        self.ledger._clock_us=lambda:recorded_at_us
+        with self.ledger.transaction() as c:
+            sequence=c.execute("SELECT coalesce(max(sequence),0)+1 FROM journal_transactions").fetchone()[0]
+            c.execute("INSERT INTO journal_transactions(transaction_id,sequence,account_id,source_kind,source_id,event_at_us,recorded_at_us) VALUES (?,?,?,?,?,?,?)",
+                (txid,sequence,"paper-history",source_kind,txid,event_at_us,recorded_at_us))
+            for line_no,(ledger_account,asset,native_delta,usd_delta) in enumerate(postings):
+                c.execute("INSERT INTO journal_postings(transaction_id,line_no,ledger_account,asset,native_delta,usd_delta_u,recorded_at_us) VALUES (?,?,?,?,?,?,?)",
+                    (txid,line_no,ledger_account,asset,native_delta,usd_delta,recorded_at_us))
+
+    def test_inventory_excludes_post_close_fill_and_flow_and_keeps_exact_fee_quantity(self):
+        close=self.base+10
+        self.append_native_tx("fill-before-close","fill",close,self.base+20,(
+            ("cash",None,None,101),("fee_expense",None,None,-101),
+            ("inventory:BTC","BTC","0.12345678901234567890123456789012345678",0),
+            ("settlement","BTC","-0.12345678901234567890123456789012345678",0),
+            ("inventory:FEE","FEE","-0.00000000000000000000000000000000000001",0),
+            ("fee_suspense","FEE","0.00000000000000000000000000000000000001",0),
+            ("cash","USD","50",0),("capital","USD","-50",0)))
+        self.append_native_tx("fill-after-close","fill",close+1,self.base+30,(
+            ("cash",None,None,900),("fee_expense",None,None,-900),
+            ("inventory:BTC","BTC","9",0),("settlement","BTC","-9",0)))
+        self.append_native_tx("flow-after-close","transfer",close+2,self.base+40,(
+            ("cash",None,None,500),("capital",None,None,-500),
+            ("inventory:BTC","BTC","5",0),("capital","BTC","-5",0)))
+        cutoffs=CausalCutoffs(close,self.base+100,1,"boot-history")
+        inventory=self.ledger.inventory_as_of("paper-history",cutoffs)
+        self.assertEqual((("BTC",Decimal("0.12345678901234567890123456789012345678")),
+            ("FEE",Decimal("-0.00000000000000000000000000000000000001"))),inventory.quantities)
+        self.assertEqual(cutoffs,inventory.cutoffs)
+        self.assertEqual("paper-history",inventory.account_id)
+        self.assertEqual(3,inventory.revision.journal_sequence)
+        self.assertNotIn("USD",dict(inventory.quantities))
+        self.assertEqual(64,len(inventory.lineage_hash))
+
+    def test_late_known_pre_close_event_is_excluded_at_older_knowledge_cutoff(self):
+        close=self.base+10
+        self.append_native_tx("visible","fill",close,self.base+20,(
+            ("cash",None,None,125),("fee_expense",None,None,-125),
+            ("inventory:BTC","BTC","1.25",0),("settlement","BTC","-1.25",0)))
+        cutoff=CausalCutoffs(close,self.base+100,1,"boot-history")
+        self.append_native_tx("late-known","fill",close-1,self.base+200,(
+            ("inventory:BTC","BTC","7",-700),("cash:USD",None,None,700)))
+        inventory=self.ledger.inventory_as_of("paper-history",cutoff)
+        self.assertEqual((("BTC",Decimal("1.25")),),inventory.quantities)
+        self.assertEqual(1,inventory.revision.journal_sequence)
+
+    def test_inventory_rejects_transaction_truncated_at_watermark(self):
+        close=self.base+10
+        self.append_native_tx("truncated","fill",close,self.base+20,(
+            ("cash",None,None,100),("fee_expense",None,None,-100),
+            ("inventory:BTC","BTC","1",0),("settlement","BTC","-1",0)))
+        selected=self.ledger.connection.execute("SELECT append_sequence,evidence_watermarks_json FROM account_revision_history WHERE account_id='paper-history' ORDER BY append_sequence DESC LIMIT 1").fetchone()
+        from bot.autonomous.contracts import strict_json
+        watermarks=strict_json(selected['evidence_watermarks_json'])
+        monetary_prefix=self.ledger.connection.execute("SELECT rowid FROM journal_postings WHERE transaction_id='truncated' AND line_no=1").fetchone()[0]
+        watermarks['journal_postings']=monetary_prefix
+        self.ledger.connection.execute("DROP TRIGGER account_revision_history_no_update")
+        self.ledger.connection.execute("UPDATE account_revision_history SET evidence_watermarks_json=? WHERE append_sequence=?",
+            (canonical_bytes(watermarks).decode(),selected['append_sequence']))
+        with self.assertRaises(ContractViolation):
+            self.ledger.inventory_as_of("paper-history",CausalCutoffs(close,self.base+100,1,"boot-history"))
+
+    def test_inventory_rejects_unbalanced_native_asset_postings(self):
+        close=self.base+10
+        self.append_native_tx("native-imbalance","fill",close,self.base+20,(
+            ("cash",None,None,100),("fee_expense",None,None,-100),
+            ("inventory:BTC","BTC","1",0),("settlement","BTC","-0.5",0)))
+        with self.assertRaises(ContractViolation):
+            self.ledger.inventory_as_of("paper-history",CausalCutoffs(close,self.base+100,1,"boot-history"))
+
+    def test_inventory_fails_closed_without_cutoff_visible_history(self):
+        cutoffs=CausalCutoffs(self.base,self.base,1,"boot-history")
+        with self.assertRaises(ContractViolation):
+            self.ledger.inventory_as_of("missing-history",cutoffs)

@@ -37,12 +37,12 @@ The installed `.venv` uses Python 3.14.4; the deployment image specifies Python 
 | 2 Durable journal/reservations | complete through 57509ea; 49 focused tests pass; independent spec/quality review passes |
 | 3 Equity/flows/latches | complete through a4fbd8d; 133 tests; independent spec/quality PASS; base 67ad62e |
 | 4 Causal source/archive | complete 26dfa8d; 164 covering tests; independent spec/quality PASS |
-| 5 Numeric state/token proof | pending |
-| 6 Research/six schema definitions | pending |
-| 7 Jev client/validation | pending |
-| 8 Outcomes/calibration | pending |
-| 9 Kelly sizing | pending |
-| 10 Policy/escalation | pending |
+| 5 Numeric state/token proof | accepted for local software build; independent spec/quality PASS; 194 affected tests pass; promotion blockers remain (see `.agenkit/sdd/task-05-*`) |
+| 6 Research/six schema definitions | accepted (R4 re-review spec PASS/quality APPROVED); activation blocked until verify re-decodes values from artifact bytes |
+| 7 Jev client/validation | accepted for scoped offline client (57 tests); no live provider call made |
+| 8 Outcomes/calibration | accepted after three review rounds; ledger-sourced as-of labels, attested calibrator bound to release, conservative Wilson p |
+| 9 Kelly sizing | accepted; quarter-Kelly with hard ceilings and µUSD-floored caps; book/capability provenance deferred to Task 12 |
+| 10 Policy/escalation | accepted; entry composition produces bounded proposals only; crisis/low-confidence escalation first |
 | 11 Hard risk | pending |
 | 12 Authority/paper execution | pending |
 | 13 Live transport/reconciliation | pending |
@@ -57,6 +57,10 @@ The installed `.venv` uses Python 3.14.4; the deployment image specifies Python 
 | 22 Ship/live gates | not authorized yet |
 
 Each task requires observed RED/GREEN checks and task review. Baseline and task results will be appended with actual commands, working directory, outcomes, commit identities and unresolved findings. A unit-test pass cannot substitute for actual market evidence or live promotion approval.
+
+### Task 5 final acceptance
+
+Task 5 is accepted for the local software build after independent specification and quality review PASS with no open findings. The root reran the affected contracts, ledger, risk-limit, causality and state suite: 194 tests passed; `git diff --check` passed. Exact reviewed file digests are in `.agenkit/sdd/task-05-review.md`. Approved release/rank registry evidence, production tokenizer proof, and release/evidence eligibility integration remain promotion blockers. No live/provider calls, deployment, activation, arming, or Notion work was performed. Continue at Task 6 under the approved plan; pause when the five-hour allowance has 10% remaining.
 
 ### Task 1 acceptance
 
@@ -93,3 +97,8 @@ Task3 implementation `08270b3` and report `95e3525` record117 focused tests pass
 Task 3 is accepted through source `a4fbd8daf554e39372f429aa12954d4924073a3a`, implementation report `a4d96f1faa3540a2aaf97a72d58072fe0b596746`, and independent full original-base review `.agenkit/sdd/task-03-rereview.md` (specification PASS, quality PASS, no remaining findings). Fix `07ecc17` prevents historical terminal fills from generating unrelated incidents, serializes exact native compensations without lossy projections, and canonicalizes persisted fill/flow decimals while preserving source identities. Fix `a4fbd8d` atomically discards unsupported correction compensation and commits retained-evidence inhibition. The final contracts/ledger/risk covering command passes 133 tests on Python 3.12.14; root independently reran it with 133 tests OK in 2.236s. Task 4 may now proceed under its approved brief and prepared archive/source-clock guidance. No live qualification or activation is claimed.
 
 Direct AgenKit fixes are committed in `e2056db`, with evidence appendix `cc5f88d`:125 focused contracts/ledger/risk tests pass under Python3.12.14 after the final source edit. A fresh independent reviewer is examining the complete original-base Task3 diff; acceptance remains pending. Jev's current public contract handoff and four verified documentation-evidence files are saved at `docs/research/2026-10-17-autonomous-agent/jev-integration/`. Task7 must retain enough raw or typed evidence for real authority revalidation, separate provider/local request IDs, and nullable usage. State-only tokenizer proof and authenticated model behavior remain unverified; no provider evaluation was performed.
+
+
+### Tasks 6–10 acceptance (2026-10-17)
+
+The cross-review findings for Tasks 4/5 (late-recorded selection leak, exact-minute sampling, unbounded caches and replay) are remediated and independently accepted. Measured steady-state snapshot time is about 12.5 ms, flat over 7 synthetic hours, and memory levels off under bounded caches. Tasks 6–10 passed independent spec and quality review after test-first remediation, including two Criticals in Task 8 and one in Task 9; mutation runs confirmed the guarding tests. Repository-wide suite: 392 tests OK on Python 3.12.14. Detailed records: `.agenkit/sdd/progress.md` and the task briefs/reports. Requirements carried into Tasks 12, 15 and 16 are recorded in their briefs. Nothing is live-ready: no live/provider calls, deployment, activation or arming occurred.

@@ -8,17 +8,218 @@ adopted. No network, numeric feature computation or trading activation lives her
 """
 from __future__ import annotations
 
+import bisect
 import hashlib
+import math
 import os
 import re
+import statistics
 import stat
 import zlib
+from collections import OrderedDict
 from dataclasses import dataclass, replace
+from decimal import Decimal, ROUND_HALF_EVEN, localcontext
 from pathlib import Path
 from types import MappingProxyType
 
 from .contracts import (BookPayload, CandlePayload, CausalCutoffs, ContractViolation,
-    IngestResult, Record, SourceEvent, canonical_bytes, content_hash, strict_json)
+    AccountRevision, ApprovedBundle, EncodedState, Feature, FieldDictionary,
+    HistoricalInventory, IngestResult, NumericSnapshot, ProviderTokenCounter,
+    Record, SharedContext, SourceEvent, StateHold, StateHoldDraft, StateUnavailable,
+    TokenAccountingUnavailable, TokenCount, canonical_bytes, content_hash,
+    default_field_dictionary, state_hold_audit_hash, strict_json, candidate_wire_id)
+
+
+def require_token_budget(count: int) -> None:
+    """Enforce the complete state-only provider token limit."""
+    if type(count) is not int or not 0 <= count < 400:
+        raise ValueError('state token budget exceeded')
+
+
+def book_metrics(bids, asks, band_bps=10.0):
+    """Compute midpoint, quoted spread and depth imbalance in a symmetric band."""
+    if (not bids or not asks or type(band_bps) not in (int,float)
+            or not math.isfinite(band_bps) or band_bps <= 0):
+        raise ValueError('invalid book')
+    if any(type(level) not in (tuple,list) or len(level)!=2
+           or any(type(x) not in (int,float) or not math.isfinite(x) or x<=0 for x in level)
+           for levels in (bids,asks) for level in levels):
+        raise ValueError('invalid level')
+    bid, ask = max(p for p, _ in bids), min(p for p, _ in asks)
+    if bid >= ask:
+        raise ValueError('crossed book')
+    mid = (bid + ask) / 2
+    lower, upper = mid * (1 - band_bps / 10000), mid * (1 + band_bps / 10000)
+    try:
+        bid_depth = math.fsum(q for p, q in bids if lower <= p <= mid)
+        ask_depth = math.fsum(q for p, q in asks if mid <= p <= upper)
+    except (OverflowError, ValueError) as exc:
+        raise ValueError('invalid depth') from exc
+    if not all(math.isfinite(x) for x in (mid, bid_depth, ask_depth, bid_depth + ask_depth)) or bid_depth + ask_depth <= 0:
+        raise ValueError('invalid depth')
+    result = mid, 10000 * (ask - bid) / mid, (bid_depth - ask_depth) / (bid_depth + ask_depth)
+    if not all(math.isfinite(x) for x in result):
+        raise ValueError('nonfinite book feature')
+    return result
+
+
+def _wire_values(features, definitions, identity=None):
+    if tuple(feature.name for feature in features) != tuple(definition.name for definition in definitions):
+        raise ContractViolation('feature slots do not match the field dictionary')
+    by_name = {feature.name: feature for feature in features}
+    values = []
+    mask = 0
+    for index, definition in enumerate(definitions):
+        feature = by_name.get(definition.name)
+        if feature is not None and feature.valid:
+            mask |= 1 << definition.validity_bit
+        if definition.name in ('candidate_id', 'dictionary_version', 'shared_validity_mask', 'candidate_validity_mask'):
+            if definition.name == 'candidate_id':
+                value = candidate_wire_id(identity)
+            elif definition.name == 'dictionary_version':
+                value = 1
+            else:
+                value = 0
+        elif feature is None or not feature.valid:
+            value = 0 if definition.precision == 0 else 0.0
+        else:
+            number = feature.value
+            if type(number) not in (int, float) or not math.isfinite(number):
+                raise ContractViolation(f'invalid numeric feature: {definition.name}')
+            with localcontext() as context:
+                context.prec = 50
+                scaled = Decimal(str(number)) * definition.scale
+                quantum = Decimal(1).scaleb(-definition.precision)
+                quantized = scaled.quantize(quantum, rounding=ROUND_HALF_EVEN)
+                value = int(quantized) if definition.precision == 0 else float(quantized)
+            if not math.isfinite(value):
+                raise ContractViolation(f'nonfinite encoded feature: {definition.name}')
+        values.append(value)
+    values[-1] = mask
+    return values
+
+
+def encode_state(snapshots: tuple[NumericSnapshot, ...], context: SharedContext,
+                 dictionary: FieldDictionary,
+                 token_counter: ProviderTokenCounter, *, candidate_order: tuple[str, ...],
+                 ranked_bundle: ApprovedBundle) -> EncodedState | StateHoldDraft:
+    """Encode a complete numeric state and prove its state-only token count."""
+    if (type(snapshots) is not tuple or type(context) is not SharedContext
+            or type(dictionary) is not FieldDictionary or type(candidate_order) is not tuple
+            or type(ranked_bundle) is not ApprovedBundle):
+        raise ContractViolation('typed state inputs required')
+    if dictionary.dictionary_hash!=default_field_dictionary().dictionary_hash:
+        raise ContractViolation('state encoding requires the registered numeric field dictionary')
+    if not snapshots:
+        raise StateUnavailable('audited HOLD requires frozen candidate snapshots')
+    if any(type(snapshot) is not NumericSnapshot for snapshot in snapshots):
+        raise ContractViolation('typed numeric snapshots required')
+    bundle=ranked_bundle.bundle
+    approved_order=tuple(candidate.candidate_id for candidate in bundle.candidates)
+    snapshot_ids=tuple(snapshot.candidate_id for snapshot in snapshots)
+    if (candidate_order!=approved_order or len(set(candidate_order))!=len(candidate_order)
+            or set(candidate_order)!=set(snapshot_ids) or len(set(snapshot_ids))!=len(snapshot_ids)):
+        raise ContractViolation('explicit rank order must match approved bundle and snapshot universe')
+    anchor=snapshots[0]
+    identity=(anchor.cutoffs.candle_close_us,anchor.cutoffs.knowledge_cutoff_us,
+        anchor.cutoffs.boot_id,anchor.account_id,anchor.release_hash,anchor.account_revision)
+    if any((snapshot.cutoffs.candle_close_us,snapshot.cutoffs.knowledge_cutoff_us,
+            snapshot.cutoffs.boot_id,snapshot.account_id,snapshot.release_hash,snapshot.account_revision)!=identity
+            for snapshot in snapshots):
+        raise ContractViolation('mixed frozen candidate batch identity')
+    if (anchor.release_hash!=ranked_bundle.bundle_hash
+            or bundle.expires_at_us<=anchor.cutoffs.knowledge_cutoff_us
+            or type(bundle.policy_hash) is not str or len(bundle.policy_hash)!=64):
+        raise StateUnavailable('approved ranking bundle does not match the frozen release/window')
+    by_id={snapshot.candidate_id:snapshot for snapshot in snapshots}
+    definitions={candidate.candidate_id:candidate for candidate in bundle.candidates}
+    eligible=[]
+    reasons={}
+    unresolved=False
+    for candidate_id in candidate_order:
+        snapshot=by_id[candidate_id]
+        measured=_feature_value(snapshot.features,'eligible')
+        defined=definitions[candidate_id].eligible
+        if measured not in (0,1):
+            reasons[candidate_id]='eligibility_unavailable'
+            unresolved=True
+        elif bool(measured)!=defined:
+            raise StateUnavailable('snapshot eligibility differs from approved bundle')
+        elif defined:
+            eligible.append(snapshot)
+        else:
+            reasons[candidate_id]='not_eligible'
+    if unresolved:
+        return _state_hold_draft(anchor,ranked_bundle,candidate_order,
+            tuple(by_id[candidate_id] for candidate_id in candidate_order),reasons,
+            'eligibility_unavailable')
+    if not eligible:
+        return _state_hold_draft(anchor,ranked_bundle,candidate_order,
+            tuple(by_id[candidate_id] for candidate_id in candidate_order),reasons,
+            'no_eligible_candidates')
+    if len(eligible)>5:
+        raise ContractViolation('approved state universe exceeds five eligible candidates')
+
+    shared_features=list(context.features)
+    close_index=next((i for i,field in enumerate(dictionary.shared_fields) if field.name=='candle_close_ms'),None)
+    if close_index is None:
+        raise ContractViolation('field dictionary lacks candle_close_ms')
+    shared_features[close_index]=Feature('candle_close_ms',float(anchor.cutoffs.candle_close_us//1000),True)
+    bound_context=SharedContext(tuple(shared_features),sum(1<<i for i,f in enumerate(shared_features) if f.valid))
+    shared = _wire_values(bound_context.features, dictionary.shared_fields)
+    candidates = eligible[:]
+    rows = [_wire_values(s.features, dictionary.candidate_fields, s.candidate_id) for s in candidates]
+    while candidates:
+        wire_state = [shared, rows]
+        raw = canonical_bytes(wire_state).decode('ascii')
+        try:
+            proof = token_counter.count_state(raw)
+        except TokenAccountingUnavailable:
+            raise
+        except Exception as exc:
+            raise TokenAccountingUnavailable('provider state token proof unavailable') from exc
+        if type(proof) is not TokenCount:
+            raise TokenAccountingUnavailable('provider returned no typed token proof')
+        if type(proof.state_tokens) is not int or proof.state_tokens < 0:
+            raise TokenAccountingUnavailable('provider returned invalid token count')
+        if (type(proof.provider_id) is not str or not proof.provider_id
+                or type(proof.tokenizer_id) is not str or not proof.tokenizer_id
+                or type(proof.compatibility_hash) is not str
+                or not re.fullmatch('[0-9a-f]{64}',proof.compatibility_hash)):
+            raise TokenAccountingUnavailable('provider token proof identity is incomplete')
+        if proof.state_tokens >= 400:
+            excluded=candidates.pop()
+            reasons[excluded.candidate_id]='token_budget'
+            rows.pop()
+            continue
+        require_token_budget(proof.state_tokens)
+        included=set(s.candidate_id for s in candidates)
+        excluded_ids=tuple(candidate_id for candidate_id in candidate_order if candidate_id not in included)
+        excluded_reasons=tuple((candidate_id,reasons[candidate_id]) for candidate_id in excluded_ids)
+        excluded_snapshots=tuple(by_id[candidate_id] for candidate_id in excluded_ids)
+        return EncodedState(raw, content_hash(wire_state), dictionary.dictionary_hash,
+            tuple(s.candidate_id for s in candidates), proof, tuple(candidates),candidate_order,
+            excluded_ids,excluded_reasons,excluded_snapshots,ranked_bundle.bundle_hash,bundle.policy_hash,
+            ranked_bundle)
+    reasons.update({snapshot.candidate_id:'mandatory_state_over_budget' for snapshot in eligible})
+    return _state_hold_draft(anchor,ranked_bundle,candidate_order,
+        tuple(by_id[candidate_id] for candidate_id in candidate_order),reasons,
+        'mandatory_state_over_budget')
+
+
+def _state_hold_draft(anchor,ranked_bundle,candidate_order,snapshots,reasons,reason):
+    excluded_reasons=tuple((candidate_id,reasons.get(candidate_id,'not_eligible'))
+        for candidate_id in candidate_order)
+    audit_hash=state_hold_audit_hash(anchor.cutoffs,anchor.account_id,anchor.release_hash,
+        candidate_order,excluded_reasons,snapshots,ranked_bundle.bundle_hash,
+        ranked_bundle.bundle.policy_hash)
+    return StateHoldDraft(anchor.cutoffs,anchor.account_id,anchor.release_hash,candidate_order,
+        candidate_order,excluded_reasons,reason,snapshots,ranked_bundle.bundle_hash,
+        ranked_bundle.bundle.policy_hash,audit_hash,ranked_bundle)
+
+
+def _feature_value(features, name):
+    return next((feature.value for feature in features if feature.name == name and feature.valid), None)
 
 
 def causal_visible(event_at_us, received_at_us, known_at_us,
@@ -187,19 +388,56 @@ def _from_row(row):
     return SourceEvent.from_dict(data)
 
 
+class _BoundedCache(OrderedDict):
+    """Bounded LRU evidence cache (get/set refresh recency); eviction only causes fail-closed refusals."""
+    def __init__(self,capacity):
+        super().__init__()
+        self.capacity=capacity
+
+    def __setitem__(self,key,value):
+        super().__setitem__(key,value)
+        self.move_to_end(key)
+        while len(self)>self.capacity:self.popitem(last=False)
+
+    def get(self,key,default=None):
+        if key not in self:return default
+        self.move_to_end(key)
+        return super().__getitem__(key)
+
+
 class StateEngine:
-    def __init__(self,ledger,archive_root,policies: tuple[SourceClockPolicy,...]):
+    # A boundary sample older than this is missing, never forward-filled.
+    BOUNDARY_MAX_AGE_US=5_000_000
+    # Snapshot replay starts this long before the first boundary; book streams must
+    # publish a full-book checkpoint at least this often or features fail closed.
+    BOOK_REPLAY_WINDOW_US=300_000_000
+    # Per-engine evidence entries; one candle batch uses far fewer.
+    CACHE_CAPACITY=1024
+    # Decoded append-only source rows: one 65-minute window at 1s checkpoint cadence is 3900
+    # per instrument, so this covers six candidates with headroom.
+    DECODE_CACHE_CAPACITY=32768
+
+    def __init__(self,ledger,archive_root,policies: tuple[SourceClockPolicy,...],account_id=None):
         if type(policies) is not tuple or not policies or any(type(p) is not SourceClockPolicy for p in policies):
             raise ContractViolation('explicit source policies required')
         policy_map={(p.source,p.stream):p for p in policies}
         if len(policy_map)!=len(policies):raise ContractViolation('duplicate source policy')
         self.ledger=ledger
+        self.account_id=account_id
         self.policies=policies
         self._policy_map=MappingProxyType(policy_map)
         ledger._source_required=True
         self.archive=SegmentArchive(archive_root)
         self._books={};self._bad_sources=set();self._orphan_floors={};self._archive_failed=True
         self.orphans=();self.recovery_errors=()
+        self._snapshot_inputs=_BoundedCache(self.CACHE_CAPACITY)
+        self._snapshot_evidence=_BoundedCache(self.CACHE_CAPACITY)
+        self._snapshot_inventory=_BoundedCache(self.CACHE_CAPACITY)
+        self._encoded_evidence=_BoundedCache(self.CACHE_CAPACITY)
+        self._hold_evidence=_BoundedCache(self.CACHE_CAPACITY)
+        self._persisted_encoded_results=_BoundedCache(self.CACHE_CAPACITY)
+        self._persisted_holds=_BoundedCache(self.CACHE_CAPACITY)
+        self._decoded=_BoundedCache(self.DECODE_CACHE_CAPACITY)
         ledger._bind_source_engine(self)
         self.recover()
 
@@ -221,6 +459,264 @@ class StateEngine:
         if self._archive_failed or key in self._bad_sources:return None
         value=self._books.get(key)
         return value[1] if value else None
+
+    def snapshot(self, symbol: str, cutoffs: CausalCutoffs) -> NumericSnapshot:
+        """Build candidate features only from events visible at the frozen cutoffs.
+
+        Historical inventory and book mids are reconstructed at the frozen cutoffs.
+        Current AccountView is reserved for execution-time controls.
+        """
+        self._require_owner()
+        if type(symbol) is not str or not symbol.endswith('-USD') or type(cutoffs) is not CausalCutoffs:
+            raise ContractViolation('USD instrument and typed frozen cutoffs required')
+        candidate_id=symbol[:-4].lower()
+        replay_from=cutoffs.candle_close_us-60*60_000_000-self.BOOK_REPLAY_WINDOW_US
+        events=tuple(event for event in self.select(cutoffs,instrument=symbol,event_since_us=replay_from)
+            if event.instrument==symbol and event.event_at_us>=replay_from and causal_visible(event.event_at_us,event.received_at_us,
+                event.known_at_us,cutoffs.candle_close_us,cutoffs.knowledge_cutoff_us))
+        book_events=sorted((event for event in events if isinstance(event.payload,BookPayload)
+            and event.sequence is not None),key=lambda event:(event.source,event.stream,event.sequence,event.event_id))
+        grouped={};book_refs=[]
+        for event in book_events:grouped.setdefault((event.source,event.stream,event.instrument),[]).append(event)
+        expected=tuple(cutoffs.candle_close_us-60_000_000*i for i in reversed(range(61)))
+        per_minute={timestamp:[] for timestamp in expected}
+        # One book stream per instrument: never stitch venues into one mid/RV series.
+        ambiguous=len(grouped)>1
+        for key,sequence_events in sorted(grouped.items()):
+            # Replay the stream once, keeping (running max exchange time, book or None after a break).
+            book_state=None;timeline=[];last_at=None
+            for event in sequence_events:
+                book_refs.append(event.event_id)
+                if last_at is not None and event.event_at_us<last_at:book_state=None
+                elif event.payload.is_snapshot:
+                    book_state=(event.sequence,event.payload)
+                elif book_state is not None and event.sequence==book_state[0]+1:
+                    try:book_state=(event.sequence,_apply(event,book_state))
+                    except ContractViolation:book_state=None
+                else:book_state=None
+                last_at=event.event_at_us if last_at is None else max(last_at,event.event_at_us)
+                timeline.append((last_at,book_state))
+            # As-of sampling: the latest state at or before each boundary, within the age bound.
+            # Exchange timestamps are never moved onto the boundary.
+            times=[entry[0] for entry in timeline]
+            for boundary in expected:
+                index=bisect.bisect_right(times,boundary)-1
+                if index<0:continue
+                event_at,sample=timeline[index]
+                if ambiguous or sample is None or boundary-event_at>self.BOUNDARY_MAX_AGE_US:continue
+                per_minute[boundary].append(sample[1])
+        metrics=None
+        try:
+            close_books=per_minute[cutoffs.candle_close_us]
+            if len(close_books)!=1:raise ValueError('missing or ambiguous close book')
+            final_book=close_books[0]
+            metrics=book_metrics(tuple((float(p),float(q)) for p,q in final_book.bids),
+                tuple((float(p),float(q)) for p,q in final_book.asks))
+        except (ValueError,TypeError,OverflowError,IndexError):
+            metrics=None
+        mids=[]
+        try:
+            for timestamp in expected:
+                books=per_minute[timestamp]
+                if len(books)!=1:raise ValueError('missing or ambiguous minute book')
+                book=books[0]
+                metrics_at=book_metrics(tuple((float(p),float(q)) for p,q in book.bids),
+                    tuple((float(p),float(q)) for p,q in book.asks))
+                mids.append(metrics_at[0])
+            if any(not math.isfinite(mid) or mid<=0 for mid in mids):raise ValueError('invalid midpoint')
+        except (ValueError,TypeError,OverflowError,IndexError):
+            mids=[]
+        try:
+            returns=[math.log(current/previous) for previous,current in zip(mids,mids[1:])] if len(mids)==61 else []
+            one_hour_return=(mids[-1]/mids[0]-1) if len(mids)==61 else None
+            if any(not math.isfinite(value) for value in returns) or (one_hour_return is not None and not math.isfinite(one_hour_return)):
+                raise ValueError('nonfinite volatility input')
+            rv=statistics.stdev(returns) if len(returns)==60 else None
+        except (ValueError,OverflowError,ZeroDivisionError):
+            returns=[];rv=None;one_hour_return=None
+
+        account_id=self.account_id
+        if account_id is None:
+            accounts=tuple(row[0] for row in self.ledger.connection.execute('SELECT account_id FROM accounts ORDER BY account_id'))
+            if len(accounts)!=1:
+                raise StateUnavailable('snapshot requires one explicit current execution account')
+            account_id=accounts[0]
+        inventory=self.ledger.inventory_as_of(account_id,cutoffs)
+        if inventory.account_id!=account_id or inventory.cutoffs!=cutoffs:
+            raise StateUnavailable('historical inventory identity differs from frozen account/cutoffs')
+        base_asset=symbol[:-4]
+        historical=dict(inventory.quantities)
+        try:base_quantity=historical.get(base_asset,Decimal(0));base_inventory=float(base_quantity)
+        except (TypeError,ValueError,OverflowError):base_inventory=float('nan')
+        inventory_valid=math.isfinite(base_inventory)
+        feature_values={
+            'mid':(metrics[0],True) if metrics else (0.0,False),
+            'spread_bps':(metrics[1],True) if metrics else (0.0,False),
+            'imbalance':(metrics[2],True) if metrics else (0.0,False),
+            'rv_60m':(rv,rv is not None), 'rv_samples':(60 if rv is not None else 0,rv is not None),
+            'return_1h':(one_hour_return,one_hour_return is not None),
+            'base_inventory':(base_inventory if inventory_valid else 0.0,inventory_valid),
+            'inventory_usd':(base_inventory*metrics[0] if metrics and inventory_valid else 0.0,inventory_valid and metrics is not None and math.isfinite(base_inventory*metrics[0])),
+            'eligible':(0.0,False), 'evidence_age_minutes':(0.0,False),
+            'evidence_expiry_minutes':(0.0,False), 'thesis_condition_bits':(0.0,False),
+            'position_headroom':(0.0,False), 'estimated_roundtrip_cost_bps':(0.0,False),
+        }
+        names=('candidate_id','mid','spread_bps','imbalance','rv_60m','rv_samples','return_1h',
+            'base_inventory','inventory_usd','eligible','evidence_age_minutes','evidence_expiry_minutes',
+            'thesis_condition_bits','position_headroom','estimated_roundtrip_cost_bps','candidate_validity_mask')
+        features=tuple(Feature(name, float(feature_values.get(name,(0.0,False))[0] or 0.0),
+            feature_values.get(name,(0.0,False))[1]) for name in names)
+        mask=sum((1<<index) for index,feature in enumerate(features) if feature.valid)
+        input_ids=tuple(sorted(set(book_refs)))
+        lineage=content_hash((input_ids,inventory.lineage_hash))
+        snapshot_hash=content_hash((symbol,cutoffs,features,mask,lineage,inventory.revision,account_id,
+            inventory.lineage_hash))
+        self._snapshot_inputs[snapshot_hash]=input_ids
+        self._snapshot_inventory[snapshot_hash]=inventory
+        release_row=self.ledger.connection.execute('SELECT active_release_hash FROM account_control WHERE account_id=?',(account_id,)).fetchone()
+        snapshot=NumericSnapshot(candidate_id,symbol,snapshot_hash,cutoffs,features,mask,lineage,
+            inventory.revision,account_id=account_id,release_hash=release_row[0] if release_row else None)
+        self._snapshot_evidence[snapshot_hash]=snapshot
+        return snapshot
+
+    def encode(self, snapshots, context, dictionary, token_counter, *, candidate_order, ranked_bundle):
+        """Encode only registered immutable snapshots and retain the exact proved bytes."""
+        self._require_owner()
+        if any(self._snapshot_evidence.get(snapshot.snapshot_hash)!=snapshot for snapshot in snapshots):
+            raise StateUnavailable('encoding requires registered immutable snapshots')
+        outcome=encode_state(snapshots,context,dictionary,token_counter,
+            candidate_order=candidate_order,ranked_bundle=ranked_bundle)
+        if type(outcome) is EncodedState:
+            previous=self._encoded_evidence.get(outcome.state_hash)
+            if previous is not None and previous!=outcome:
+                raise StateUnavailable('same state bytes produced conflicting rank/token proof')
+            self._encoded_evidence[outcome.state_hash]=outcome
+        else:
+            previous=self._hold_evidence.get(outcome.audit_hash)
+            if previous is not None and previous!=outcome:
+                raise StateUnavailable('same HOLD audit identity produced conflicting evidence')
+            self._hold_evidence[outcome.audit_hash]=outcome
+        return outcome
+
+    def persist_encoded_state(self, encoded: EncodedState | StateHoldDraft) -> EncodedState | StateHold:
+        """Commit frozen snapshot evidence before a state can be dispatched or HOLD returned."""
+        self._require_owner()
+        if type(encoded) not in (EncodedState,StateHoldDraft):
+            raise ContractViolation('typed encoded state or HOLD draft required')
+        if self.ledger.connection.in_transaction:
+            raise ContractViolation('state persistence requires its own top-level commit')
+        if type(encoded) is EncodedState:
+            registered=self._encoded_evidence.get(encoded.state_hash)
+            persisted=self._persisted_encoded_results.get(encoded.state_hash)
+            if registered is None or (encoded!=registered and encoded!=persisted):
+                raise StateUnavailable('encoded bytes/token proof were not registered by this engine')
+            # Persist and verify against the original immutable, unpersisted snapshot evidence.
+            encoded=registered
+            ranked_bundle=encoded.ranked_bundle
+            if (not encoded.candidate_order or type(ranked_bundle) is not ApprovedBundle
+                    or encoded.rank_bundle_hash!=ranked_bundle.bundle_hash
+                    or encoded.rank_bundle_hash!=encoded.snapshots[0].release_hash
+                    or encoded.rank_policy_hash!=ranked_bundle.bundle.policy_hash
+                    or encoded.candidate_order!=tuple(c.candidate_id for c in ranked_bundle.bundle.candidates)):
+                raise StateUnavailable('encoded state lacks exact approved bundle/ranking identity')
+            snapshots=encoded.snapshots+encoded.excluded_snapshots
+            account_id=snapshots[0].account_id if snapshots else None
+            release_hash=snapshots[0].release_hash if snapshots else None
+            state_json=encoded.canonical_state_json
+            state_hash=encoded.state_hash
+            tokenizer_hash=content_hash((encoded.token_count.provider_id,encoded.token_count.tokenizer_id,
+                encoded.token_count.proof_method,encoded.token_count.compatibility_hash))
+            token_count=encoded.token_count.state_tokens
+            included=set(encoded.candidate_ids)
+            exclusion=dict(encoded.excluded_candidate_reasons)
+            field_hash=encoded.field_dictionary_hash
+            for snapshot in encoded.snapshots:
+                if self._snapshot_evidence.get(snapshot.snapshot_hash)!=snapshot:
+                    raise StateUnavailable('snapshot differs from immutable registered evidence')
+                expected=_wire_values(snapshot.features,default_field_dictionary().candidate_fields,snapshot.candidate_id)
+                rows=strict_json(state_json)[1]
+                row=rows[encoded.candidate_ids.index(snapshot.candidate_id)]
+                if row!=expected:
+                    raise ContractViolation('candidate wire row differs from registered snapshot evidence')
+        else:
+            if self._hold_evidence.get(encoded.audit_hash)!=encoded:
+                raise StateUnavailable('HOLD proof was not registered by this engine')
+            ranked_bundle=encoded.ranked_bundle
+            if (type(ranked_bundle) is not ApprovedBundle
+                    or encoded.rank_bundle_hash!=ranked_bundle.bundle_hash
+                    or encoded.rank_bundle_hash!=encoded.release_hash
+                    or encoded.rank_policy_hash!=ranked_bundle.bundle.policy_hash
+                    or encoded.candidate_order!=tuple(c.candidate_id for c in ranked_bundle.bundle.candidates)):
+                raise StateUnavailable('HOLD lacks exact approved bundle/ranking identity')
+            snapshots=encoded.snapshots
+            account_id=encoded.account_id;release_hash=encoded.release_hash
+            state_json=canonical_bytes({'outcome':'HOLD','reason':encoded.reason,
+                'audit_hash':encoded.audit_hash,'candidate_order':encoded.candidate_order,
+                'exclusions':encoded.excluded_candidate_reasons,'rank_bundle_hash':encoded.rank_bundle_hash,
+                'rank_policy_hash':encoded.rank_policy_hash}).decode('ascii')
+            state_hash=content_hash(strict_json(state_json));tokenizer_hash=None;token_count=None
+            included=set();exclusion=dict(encoded.excluded_candidate_reasons)
+            field_hash=default_field_dictionary().dictionary_hash
+        if (not snapshots or len({s.account_id for s in snapshots})!=1
+                or len({s.release_hash for s in snapshots})!=1
+                or any(s.snapshot_hash not in self._snapshot_inputs for s in snapshots)):
+            raise StateUnavailable('snapshot source lineage or shared identity unavailable')
+        if type(release_hash) is not str or not re.fullmatch('[0-9a-f]{64}',release_hash):
+            raise ContractViolation('invalid active release identity')
+        for snapshot in snapshots:
+            if self._snapshot_evidence.get(snapshot.snapshot_hash)!=snapshot:
+                raise StateUnavailable('snapshot differs from immutable registered evidence')
+            inventory=self._snapshot_inventory.get(snapshot.snapshot_hash)
+            if inventory is None or (inventory.account_id!=snapshot.account_id
+                    or inventory.cutoffs!=snapshot.cutoffs):
+                raise StateUnavailable('historical inventory evidence binding unavailable')
+        first=snapshots[0]
+        batch_identity=(first.cutoffs,first.account_id,first.release_hash,first.account_revision)
+        if any((s.cutoffs,s.account_id,s.release_hash,s.account_revision)!=batch_identity for s in snapshots):
+            raise StateUnavailable('persisted snapshot batch identity mismatch')
+        now=self.ledger._clock_us();persisted=[]
+        with self.ledger.transaction() as tx:
+            control=tx.execute('SELECT active_release_hash FROM account_control WHERE account_id=?',(account_id,)).fetchone()
+            if control is None or control[0]!=release_hash:
+                raise StateUnavailable('active release changed before state persistence')
+            for snapshot in snapshots:
+                row_reason=exclusion.get(snapshot.candidate_id)
+                valid=int(snapshot.candidate_id in included)
+                snapshot_id=content_hash((snapshot.snapshot_hash,state_hash,account_id,release_hash,
+                    getattr(encoded,'rank_bundle_hash',release_hash),getattr(encoded,'rank_policy_hash',None),row_reason))
+                account_revision=canonical_bytes(snapshot.account_revision).decode('ascii')
+                values=(snapshot_id,account_id,release_hash,snapshot.cutoffs.candle_close_us,
+                    snapshot.cutoffs.knowledge_cutoff_us,field_hash,state_json,tokenizer_hash,token_count,
+                    snapshot.lineage_hash,account_revision,valid,row_reason,now)
+                old=tx.execute('SELECT * FROM snapshots WHERE snapshot_id=?',(snapshot_id,)).fetchone()
+                input_ids=self._snapshot_inputs[snapshot.snapshot_hash]
+                if old is not None:
+                    if tuple(old)[:-1]!=values[:-1]:raise ContractViolation('snapshot identity conflict')
+                    old_inputs=tuple(row[0] for row in tx.execute(
+                        'SELECT event_id FROM snapshot_inputs WHERE snapshot_id=? ORDER BY line_no',(snapshot_id,)))
+                    if old_inputs!=input_ids:raise ContractViolation('snapshot lineage identity conflict')
+                else:
+                    tx.execute('INSERT INTO snapshots VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)',values)
+                    for line_no,event_id in enumerate(input_ids):
+                        tx.execute('INSERT INTO snapshot_inputs VALUES (?,?,?,NULL,NULL,NULL,?)',
+                            (snapshot_id,line_no,event_id,now))
+                persisted.append(replace(snapshot,snapshot_id=snapshot_id))
+        if self.ledger.connection.in_transaction:
+            raise ContractViolation('state audit transaction did not commit at top level')
+        if type(encoded) is StateHoldDraft:
+            committed=self._persisted_holds.get(encoded.audit_hash)
+            if committed is not None:return committed
+            committed=StateHold(encoded,tuple(item.snapshot_id for item in persisted),now)
+            self._persisted_holds[encoded.audit_hash]=committed
+            return committed
+        included_rows=tuple(item for item in persisted if item.candidate_id in included)
+        excluded_rows=tuple(item for item in persisted if item.candidate_id not in included)
+        persisted_encoded=replace(encoded,snapshots=included_rows,excluded_snapshots=excluded_rows)
+        committed=self._persisted_encoded_results.get(encoded.state_hash)
+        if committed is not None and committed!=persisted_encoded:
+            raise ContractViolation('persisted encoded-state identity conflict')
+        self._persisted_encoded_results[encoded.state_hash]=persisted_encoded
+        return committed or persisted_encoded
 
     def recover(self):
         self._require_owner()
@@ -291,6 +787,10 @@ class StateEngine:
         if (event.known_at_us>now or event.received_at_us-event.event_at_us>policy.max_age_us
             or event.event_at_us-event.received_at_us>policy.max_future_skew_us):
             return self._reject(event,'source_clock_unavailable',book_failure=True)
+        # A logical key names one fact about one instrument across all of its revisions.
+        if c.execute('SELECT 1 FROM source_events WHERE source=? AND stream=? AND logical_key=? AND instrument IS NOT ?',
+                (event.source,event.stream,event.logical_key,event.instrument)).fetchone():
+            return self._reject(event,'invalid_supersession')
         if event.supersedes_id:
             prior=c.execute('SELECT * FROM source_events WHERE event_id=?',(event.supersedes_id,)).fetchone()
             if prior is None or (prior['source'],prior['stream'],prior['logical_key'],prior['instrument'])!=(event.source,event.stream,event.logical_key,event.instrument) or prior['revision']>=event.revision:
@@ -335,13 +835,32 @@ class StateEngine:
         self._health()
         return IngestResult(True,event.event_id,(),content_hash(event))
 
-    def select(self,cutoffs: CausalCutoffs) -> tuple[SourceEvent,...]:
+    def select(self,cutoffs: CausalCutoffs,*,instrument=None,event_since_us=None) -> tuple[SourceEvent,...]:
+        """Latest visible revision per logical key, optionally bounded to one instrument/exchange-time window."""
         self._require_owner()
         if type(cutoffs) is not CausalCutoffs:raise ContractViolation('typed frozen cutoffs required')
+        if (instrument is not None and type(instrument) is not str) or (event_since_us is not None and type(event_since_us) is not int):
+            raise ContractViolation('typed selection window required')
         if self.ledger.connection.in_transaction:raise ContractViolation('selection requires committed database')
         selected={}
-        for row in self.ledger.connection.execute("SELECT * FROM source_events e WHERE NOT EXISTS (SELECT 1 FROM source_invalidations i WHERE i.event_id=e.event_id AND i.reason!='source_revision_superseded' AND i.known_at_us<=? AND i.recorded_at_us<=?)",(cutoffs.knowledge_cutoff_us,cutoffs.knowledge_cutoff_us)):
-            event=_from_row(row)
+        # Rows committed after the knowledge cutoff never join or re-rank a historical selection.
+        # Ranking happens over every revision known by the cutoff before any exchange-time or
+        # instrument window, so a correction can hide a key but never resurrect what it superseded.
+        known=lambda x:(f"{x}.recorded_at_us<=:k AND {x}.known_at_us<=:k AND {x}.received_at_us<=:k"
+            f" AND NOT EXISTS (SELECT 1 FROM source_invalidations i WHERE i.event_id={x}.event_id"
+            " AND i.reason!='source_revision_superseded' AND i.known_at_us<=:k AND i.recorded_at_us<=:k)")
+        sql=("SELECT * FROM source_events e WHERE "+known('e')+" AND e.event_at_us<=:close"
+            " AND NOT EXISTS (SELECT 1 FROM source_events r WHERE r.source=e.source AND r.stream=e.stream"
+            " AND r.logical_key=e.logical_key AND "+known('r')+
+            " AND (r.known_at_us,r.revision,r.event_id)>(e.known_at_us,e.revision,e.event_id))")
+        args={'k':cutoffs.knowledge_cutoff_us,'close':cutoffs.candle_close_us}
+        if instrument is not None:sql+=' AND e.instrument=:instrument';args['instrument']=instrument
+        if event_since_us is not None:sql+=' AND e.event_at_us>=:since';args['since']=event_since_us
+        for row in self.ledger.connection.execute(sql,args):
+            # source_events is append-only (enforced by triggers), so a decoded row never goes stale.
+            event=self._decoded.get(row['event_id'])
+            if event is None:
+                event=_from_row(row);self._decoded[event.event_id]=event
             if not causal_visible(event.event_at_us,event.received_at_us,event.known_at_us,cutoffs.candle_close_us,cutoffs.knowledge_cutoff_us):continue
             key=(event.source,event.stream,event.logical_key)
             rank=(event.known_at_us,event.revision,event.event_id)

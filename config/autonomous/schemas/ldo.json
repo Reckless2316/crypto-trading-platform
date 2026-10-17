@@ -1,0 +1,402 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://crypto-trading-platform.invalid/autonomous/ldo.schema.json",
+  "title": "LDO research candidate row",
+  "description": "Research rubric only. H1 disclosures are historical and do not establish current NEST status, cash flow, or purchases.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "candidate_id",
+    "instrument",
+    "row_kind",
+    "admission_status",
+    "required_evidence",
+    "conditions",
+    "thesis",
+    "evidence_row_semantics",
+    "decision_rubric"
+  ],
+  "properties": {
+    "candidate_id": {
+      "const": "ldo"
+    },
+    "instrument": {
+      "const": "LDO-USD"
+    },
+    "row_kind": {
+      "const": "research_candidate"
+    },
+    "admission_status": {
+      "enum": [
+        "HOLD",
+        "RESEARCH_ONLY"
+      ]
+    },
+    "required_evidence": {
+      "const": [
+        "price",
+        "market_cap",
+        "fdv",
+        "circulating_supply",
+        "total_supply",
+        "forward_supply",
+        "revenue",
+        "fees",
+        "incentives",
+        "token_accrual",
+        "tvl_or_aum",
+        "active_users",
+        "concentration",
+        "execution_costs"
+      ]
+    },
+    "claim_status": {
+      "enum": [
+        "mechanism_confirmed",
+        "execution_confirmed",
+        "proposal",
+        "estimate",
+        "speculation",
+        "unknown"
+      ]
+    },
+    "conditions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "condition_id",
+          "status",
+          "evidence_refs"
+        ],
+        "properties": {
+          "condition_id": {
+            "enum": [
+              "current_nest_deficit_and_hurdle",
+              "executed_purchase_transactions",
+              "current_30_90d_fees_revenue_and_costs",
+              "current_supply_treasury_and_sellable_unlocks",
+              "staking_deposits_and_queue_treatment",
+              "retained_depositors_and_usage",
+              "custody_cluster_and_beneficial_owner_concentration",
+              "executable_listing_depth_and_cost"
+            ]
+          },
+          "status": {
+            "$ref": "#/$defs/conditionStatus"
+          },
+          "evidence_refs": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      }
+    },
+    "thesis": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "hypothesis",
+        "bear_case",
+        "invalidation"
+      ],
+      "properties": {
+        "hypothesis": {
+          "const": "recurring surplus may eventually fund durable purchases after the NEST hurdle and deficit clear"
+        },
+        "bear_case": {
+          "const": "market-share loss, weak ETH, expense growth, or waivers may prevent sustainable token accrual"
+        },
+        "invalidation": {
+          "type": "array",
+          "items": {
+            "enum": [
+              "hurdle_remains_unmet",
+              "purchases_exceed_durable_surplus",
+              "current_cash_flow_or_supply_reconciliation_fails"
+            ]
+          }
+        }
+      }
+    },
+    "evidence_row_semantics": {
+      "$ref": "#/$defs/evidenceRow"
+    },
+    "decision_rubric": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "regime",
+        "direction",
+        "setup_quality",
+        "risk_state",
+        "toxic_flow_probability",
+        "toxic_flow"
+      ],
+      "properties": {
+        "regime": {
+          "enum": [
+            "trending",
+            "mean_reverting",
+            "high_vol",
+            "crisis"
+          ]
+        },
+        "direction": {
+          "enum": [
+            "long",
+            "short",
+            "neutral"
+          ]
+        },
+        "setup_quality": {
+          "type": "integer",
+          "enum": [
+            0,
+            1,
+            2,
+            3
+          ]
+        },
+        "risk_state": {
+          "enum": [
+            "safe",
+            "near_limit",
+            "reduce"
+          ]
+        },
+        "toxic_flow_probability": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "toxic_flow": {
+          "type": "boolean",
+          "description": "Derived as probability >= 0.50; missing or invalid probability blocks."
+        }
+      }
+    }
+  },
+  "$defs": {
+    "conditionStatus": {
+      "enum": [
+        "unknown",
+        "source_documented",
+        "independently_verified",
+        "proposal",
+        "estimate",
+        "speculation",
+        "conflicted",
+        "stale",
+        "noncausal"
+      ]
+    },
+    "claimStatus": {
+      "enum": [
+        "mechanism_confirmed",
+        "execution_confirmed",
+        "proposal",
+        "estimate",
+        "speculation",
+        "unknown"
+      ]
+    },
+    "evidenceRow": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "metric",
+        "value",
+        "unit",
+        "source_class",
+        "source_url",
+        "raw_sha256",
+        "raw_path",
+        "parser_version",
+        "method",
+        "cutoff_us",
+        "event_at_us",
+        "publication_at_us",
+        "request_started_at_us",
+        "received_at_us",
+        "received_at_upper_bound_us",
+        "period_start_us",
+        "period_end_us",
+        "finality",
+        "validity",
+        "invalid_reason",
+        "claim_status",
+        "methodology_hash",
+        "finality_policy_hash",
+        "expires_at_us"
+      ],
+      "properties": {
+        "metric": {
+          "type": "string"
+        },
+        "value": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Canonical decimal string; null means unknown, never zero."
+        },
+        "unit": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source_class": {
+          "enum": [
+            "primary",
+            "secondary",
+            "unverified"
+          ]
+        },
+        "source_url": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uri"
+        },
+        "raw_sha256": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^[a-fA-F0-9]{64}$"
+        },
+        "raw_path": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "parser_version": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "method": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "cutoff_us": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "event_at_us": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "publication_at_us": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "request_started_at_us": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "received_at_us": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "received_at_upper_bound_us": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "period_start_us": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "period_end_us": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "finality": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "validity": {
+          "enum": [
+            "valid",
+            "invalid",
+            "unknown"
+          ]
+        },
+        "invalid_reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "claim_status": {
+          "$ref": "#/$defs/claimStatus"
+        },
+        "methodology_hash": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^[a-fA-F0-9]{64}$"
+        },
+        "finality_policy_hash": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^[a-fA-F0-9]{64}$"
+        },
+        "expires_at_us": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        }
+      },
+      "description": "Unknown timestamps remain null. Proposal is not execution; source access failure is missing evidence, not zero."
+    }
+  },
+  "x-canonical-rubric-mapping": "unmapped_inert_research_rows",
+  "x-canonical-thesis-clauses": [
+    "actual_revenue_hurdle_deficit_cleared",
+    "purchases_verified",
+    "not_eth_price_only_activation"
+  ],
+  "x-production-admission": "disabled_pending_verified_evidence_and_release"
+}

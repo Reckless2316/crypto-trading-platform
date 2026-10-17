@@ -12,6 +12,8 @@ import json
 import math
 import re
 import types
+import base64
+import zlib
 from dataclasses import dataclass, fields
 from decimal import Context, Decimal, InvalidOperation, localcontext
 from enum import Enum
@@ -37,6 +39,36 @@ MAX_DECIMAL_DIGITS = 38
 MAX_DECIMAL_SCALE = 38
 _HASH = re.compile(r"[0-9a-f]{64}\Z")
 _DECIMAL = re.compile(r"-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?\Z")
+_MAX_JEV_AUDIT_BYTES = 262_144
+_JEV_AUDIT_CHUNK_CHARS = 3_000
+
+
+def _encode_jev_audit(raw: bytes) -> tuple[str, ...]:
+    if type(raw) is not bytes or len(raw) > _MAX_JEV_AUDIT_BYTES:
+        raise ContractViolation("JEV audit envelope exceeds size")
+    encoded = base64.b64encode(zlib.compress(raw, 9)).decode("ascii")
+    return tuple(encoded[i:i + _JEV_AUDIT_CHUNK_CHARS]
+                 for i in range(0, len(encoded), _JEV_AUDIT_CHUNK_CHARS))
+
+
+def _inflate_jev_audit(chunks: tuple[str, ...]) -> bytes:
+    try:
+        if type(chunks) is not tuple or not chunks or len(chunks) > 512:
+            raise ContractViolation("invalid JEV audit chunk set")
+        if any(type(chunk) is not str or not chunk or len(chunk) > _JEV_AUDIT_CHUNK_CHARS for chunk in chunks):
+            raise ContractViolation("invalid JEV audit chunk")
+        compressed = base64.b64decode("".join(chunks), validate=True)
+        inflater = zlib.decompressobj()
+        raw = inflater.decompress(compressed, _MAX_JEV_AUDIT_BYTES + 1)
+        if (len(raw) > _MAX_JEV_AUDIT_BYTES or inflater.unconsumed_tail
+                or inflater.unused_data or not inflater.eof):
+            raise ContractViolation("JEV audit envelope exceeds size or has trailing data")
+        tail = inflater.flush()
+        if len(raw) + len(tail) > _MAX_JEV_AUDIT_BYTES:
+            raise ContractViolation("JEV audit envelope exceeds size")
+        return raw + tail
+    except (ValueError, zlib.error) as exc:
+        raise ContractViolation("invalid compressed JEV audit envelope") from exc
 
 
 def checked_money(value: int) -> int:
@@ -362,6 +394,43 @@ class CausalCutoffs(Record):
 
 
 @dataclass(frozen=True)
+class HistoricalInventory(Record):
+    """Exact inventory-account holdings; negatives remain visible for downstream policy.
+
+    Every asset posted under `inventory:<asset>` is represented, including base,
+    fee, and non-USD flow assets. USD cash is posted under `cash` and is not part
+    of this inventory view; callers must use a separate cash observation.
+    """
+    cutoffs: CausalCutoffs
+    account_id: str
+    revision: AccountRevision
+    quantities: tuple[tuple[str, Decimal], ...]
+    lineage_hash: str
+    def _validate(self):
+        if type(self.cutoffs) is not CausalCutoffs or type(self.revision) is not AccountRevision:
+            raise ContractViolation("historical inventory requires typed cutoffs and revision")
+        if type(self.account_id) is not str or not self.account_id or len(self.account_id)>256 or not self.account_id.isascii():
+            raise ContractViolation("invalid historical inventory account")
+        if type(self.lineage_hash) is not str or not _HASH.fullmatch(self.lineage_hash):
+            raise ContractViolation("invalid historical inventory lineage hash")
+        if type(self.quantities) is not tuple:
+            raise ContractViolation("historical quantities must be an immutable tuple")
+        assets=[]
+        for entry in self.quantities:
+            if type(entry) is not tuple or len(entry)!=2:
+                raise ContractViolation("invalid historical quantity")
+            asset,quantity=entry
+            if type(asset) is not str or not asset or len(asset)>256 or not asset.isascii():
+                raise ContractViolation("invalid historical asset")
+            decimal_text(quantity)
+            if quantity==0:
+                raise ContractViolation("zero historical quantities must be omitted")
+            assets.append(asset)
+        if assets!=sorted(set(assets)):
+            raise ContractViolation("historical quantities must be unique and sorted")
+
+
+@dataclass(frozen=True)
 class BookPayload(Record):
     bids: tuple[tuple[Decimal, Decimal], ...]
     asks: tuple[tuple[Decimal, Decimal], ...]
@@ -602,6 +671,13 @@ class EncodedState(Record):
     candidate_ids: tuple[str, ...]
     token_count: TokenCount
     snapshots: tuple[NumericSnapshot, ...]
+    candidate_order: tuple[str, ...] = ()
+    excluded_candidate_ids: tuple[str, ...] = ()
+    excluded_candidate_reasons: tuple[tuple[str, str], ...] = ()
+    excluded_snapshots: tuple[NumericSnapshot, ...] = ()
+    rank_bundle_hash: str | None = None
+    rank_policy_hash: str | None = None
+    ranked_bundle: ApprovedBundle | None = None
     def _validate(self):
         parsed = strict_json(self.canonical_state_json)
         if canonical_bytes(parsed).decode("ascii") != self.canonical_state_json or content_hash(parsed) != self.state_hash:
@@ -610,6 +686,40 @@ class EncodedState(Record):
             raise ContractViolation("invalid included candidates")
         if tuple(s.candidate_id for s in self.snapshots) != self.candidate_ids or self.token_count.state_tokens >= 400:
             raise ContractViolation("snapshot order/token budget mismatch")
+        order=self.candidate_order or self.candidate_ids
+        if (len(set(order))!=len(order) or set(order)!=(set(self.candidate_ids)|set(self.excluded_candidate_ids))
+                or len(set(self.excluded_candidate_ids))!=len(self.excluded_candidate_ids)
+                or tuple(s.candidate_id for s in self.excluded_snapshots)!=self.excluded_candidate_ids
+                or tuple(candidate for candidate in order if candidate in set(self.candidate_ids))!=self.candidate_ids
+                or tuple(candidate for candidate in order if candidate in set(self.excluded_candidate_ids))!=self.excluded_candidate_ids):
+            raise ContractViolation("candidate rank order/exclusion mismatch")
+        if tuple(candidate for candidate,_ in self.excluded_candidate_reasons)!=self.excluded_candidate_ids:
+            raise ContractViolation("candidate exclusion reasons mismatch")
+        if any(type(reason) is not str or reason not in ('not_eligible','max_candidates','token_budget','eligibility_unavailable')
+                for _,reason in self.excluded_candidate_reasons):
+            raise ContractViolation("unknown candidate exclusion reason")
+        all_snapshots=self.snapshots+self.excluded_snapshots
+        if all_snapshots:
+            anchor=all_snapshots[0]
+            identity=(anchor.cutoffs.candle_close_us,anchor.cutoffs.knowledge_cutoff_us,
+                anchor.cutoffs.boot_id,anchor.account_id,anchor.release_hash,anchor.account_revision)
+            for snapshot in all_snapshots:
+                if (snapshot.cutoffs.candle_close_us,snapshot.cutoffs.knowledge_cutoff_us,
+                        snapshot.cutoffs.boot_id,snapshot.account_id,snapshot.release_hash,
+                        snapshot.account_revision)!=identity:
+                    raise ContractViolation("encoded candidate batch identity mismatch")
+            if self.candidate_order:
+                if (type(self.rank_bundle_hash) is not str or not _HASH.fullmatch(self.rank_bundle_hash)
+                        or self.rank_bundle_hash!=anchor.release_hash
+                        or type(self.rank_policy_hash) is not str or not _HASH.fullmatch(self.rank_policy_hash)
+                        or type(self.ranked_bundle) is not ApprovedBundle
+                        or self.ranked_bundle.bundle_hash!=self.rank_bundle_hash
+                        or self.ranked_bundle.bundle.policy_hash!=self.rank_policy_hash
+                        or tuple(c.candidate_id for c in self.ranked_bundle.bundle.candidates)!=self.candidate_order
+                        or self.ranked_bundle.bundle.expires_at_us<=anchor.cutoffs.knowledge_cutoff_us):
+                    raise ContractViolation("encoded state lacks approved ranking proof identity")
+                if any(snapshot.release_hash!=self.rank_bundle_hash for snapshot in all_snapshots):
+                    raise ContractViolation("rank bundle differs from snapshot release")
         if type(parsed) is not list or len(parsed) != 2:
             raise ContractViolation("state must contain shared array and candidate rows")
         shared, rows = parsed
@@ -618,6 +728,8 @@ class EncodedState(Record):
             raise ContractViolation("invalid complete shared state")
         if type(rows) is not list or len(rows) != len(self.candidate_ids):
             raise ContractViolation("candidate row count mismatch")
+        if self.candidate_order and shared[1] != all_snapshots[0].cutoffs.candle_close_us // 1000:
+            raise ContractViolation("shared candle close is not bound to candidate cutoff")
         dictionary = default_field_dictionary()
         _validate_wire_slots(shared, dictionary.shared_fields)
         for candidate_id, row, snapshot in zip(self.candidate_ids, rows, self.snapshots):
@@ -627,6 +739,80 @@ class EncodedState(Record):
                 raise ContractViolation("candidate wire/snapshot validity mask mismatch")
 
 
+def state_hold_audit_hash(cutoffs, account_id, release_hash, candidate_order,
+                          excluded_candidate_reasons, snapshots, rank_bundle_hash, rank_policy_hash):
+    return content_hash((cutoffs,account_id,release_hash,candidate_order,
+        excluded_candidate_reasons,snapshots,rank_bundle_hash,rank_policy_hash))
+
+
+def _validate_state_hold(cutoffs, account_id, release_hash, candidate_order,
+                         excluded_candidate_ids, excluded_candidate_reasons, snapshots,
+                         rank_bundle_hash, rank_policy_hash, audit_hash, ranked_bundle):
+    if type(cutoffs) is not CausalCutoffs or type(account_id) is not str or not account_id:
+        raise ContractViolation("state HOLD requires frozen account identity")
+    if any(type(value) is not str or not _HASH.fullmatch(value)
+           for value in (release_hash,rank_bundle_hash,rank_policy_hash,audit_hash)):
+        raise ContractViolation("state HOLD requires release and rank proof hashes")
+    if (type(ranked_bundle) is not ApprovedBundle or ranked_bundle.bundle_hash!=release_hash
+            or ranked_bundle.bundle_hash!=rank_bundle_hash
+            or ranked_bundle.bundle.policy_hash!=rank_policy_hash
+            or tuple(c.candidate_id for c in ranked_bundle.bundle.candidates)!=candidate_order
+            or ranked_bundle.bundle.expires_at_us<=cutoffs.knowledge_cutoff_us):
+        raise ContractViolation("state HOLD lacks exact approved rank proof")
+    if type(candidate_order) is not tuple or len(set(candidate_order))!=len(candidate_order):
+        raise ContractViolation("invalid state HOLD candidate order")
+    if candidate_order!=excluded_candidate_ids or tuple(s.candidate_id for s in snapshots)!=candidate_order:
+        raise ContractViolation("state HOLD must account for every ranked candidate")
+    if tuple(candidate for candidate,_ in excluded_candidate_reasons)!=candidate_order:
+        raise ContractViolation("state HOLD exclusion audit mismatch")
+    if any(type(reason) is not str or reason not in ('not_eligible','max_candidates','mandatory_state_over_budget','eligibility_unavailable')
+           for _,reason in excluded_candidate_reasons):
+        raise ContractViolation("unknown state HOLD reason")
+    if any(snapshot.cutoffs!=cutoffs or snapshot.account_id!=account_id or snapshot.release_hash!=release_hash
+           for snapshot in snapshots):
+        raise ContractViolation("state HOLD snapshot identity mismatch")
+    expected=state_hold_audit_hash(cutoffs,account_id,release_hash,candidate_order,
+        excluded_candidate_reasons,snapshots,rank_bundle_hash,rank_policy_hash)
+    if audit_hash!=expected:
+        raise ContractViolation("state HOLD audit hash mismatch")
+
+
+@dataclass(frozen=True)
+class StateHoldDraft(Record):
+    """Non-actionable state HOLD evidence, before its audit rows commit."""
+    cutoffs: CausalCutoffs
+    account_id: str
+    release_hash: str
+    candidate_order: tuple[str, ...]
+    excluded_candidate_ids: tuple[str, ...]
+    excluded_candidate_reasons: tuple[tuple[str, str], ...]
+    reason: str
+    snapshots: tuple[NumericSnapshot, ...]
+    rank_bundle_hash: str
+    rank_policy_hash: str
+    audit_hash: str
+    ranked_bundle: ApprovedBundle | None = None
+    def _validate(self):
+        if self.reason not in ('no_eligible_candidates','mandatory_state_over_budget','eligibility_unavailable'):
+            raise ContractViolation("invalid state HOLD draft reason")
+        _validate_state_hold(self.cutoffs,self.account_id,self.release_hash,self.candidate_order,
+            self.excluded_candidate_ids,self.excluded_candidate_reasons,self.snapshots,
+            self.rank_bundle_hash,self.rank_policy_hash,self.audit_hash,self.ranked_bundle)
+
+
+@dataclass(frozen=True)
+class StateHold(Record):
+    """Actionable/auditable HOLD identity, returned only after durable commit."""
+    draft: StateHoldDraft
+    snapshot_ids: tuple[str, ...]
+    committed_at_us: int
+    def _validate(self):
+        if (type(self.draft) is not StateHoldDraft or self.committed_at_us < 0
+                or len(self.snapshot_ids)!=len(self.draft.snapshots)
+                or any(type(value) is not str or not _HASH.fullmatch(value) for value in self.snapshot_ids)):
+            raise ContractViolation("invalid committed state HOLD")
+
+
 @dataclass(frozen=True)
 class Question(Record):
     candidate_id: str
@@ -634,9 +820,14 @@ class Question(Record):
     prompt_hash: str
     labels: tuple[str, ...]
     horizon_candles: int = 4
+    question_id: str = ""
+    prompt: str = ""
+    criteria: tuple[tuple[str, str], ...] = ()
     def _validate(self):
         if self.kind not in ("regime", "direction", "setup_quality", "risk_state", "toxic_flow") or self.horizon_candles != 4:
             raise ContractViolation("invalid question")
+        if self.question_id and (not self.prompt or tuple(label for label, _ in self.criteria) != self.labels):
+            raise ContractViolation("compiled question lacks exact prompt/rubric")
 
 
 @dataclass(frozen=True)
@@ -668,6 +859,21 @@ class DirectionDistribution(Record):
 
 
 @dataclass(frozen=True)
+class ChoiceDistribution(Record):
+    """Complete provider Choice probabilities, retained for independent audit."""
+    labels: tuple[str, ...]
+    probabilities: tuple[float, ...]
+    def _validate(self):
+        if (len(self.labels) < 2 or len(self.labels) != len(self.probabilities)
+                or len(set(self.labels)) != len(self.labels)
+                or any(type(label) is not str or not label for label in self.labels)
+                or any(type(p) not in (int, float) or not math.isfinite(p) or not 0 <= p <= 1
+                       for p in self.probabilities)
+                or abs(math.fsum(self.probabilities) - 1.0) > 1e-6):
+            raise ContractViolation("invalid complete Choice distribution")
+
+
+@dataclass(frozen=True)
 class CandidateDecision(Record):
     candidate_id: str
     regime: Regime
@@ -680,6 +886,9 @@ class CandidateDecision(Record):
     quality_confidence: float
     risk_confidence: float
     noul_probability: float
+    regime_distribution: ChoiceDistribution | None = None
+    quality_distribution: ChoiceDistribution | None = None
+    risk_distribution: ChoiceDistribution | None = None
     def _validate(self):
         if not 0 <= self.setup_quality <= 3:
             raise ContractViolation("invalid setup quality")
@@ -701,8 +910,23 @@ class DecisionBatch(Record):
     received_mono_ns: int
     received_at_us: int
     decisions: tuple[CandidateDecision, ...]
-    raw_response_hash: str
+    raw_response_hash: str | None
     rejection_reason: str | None = None
+    provider_request_id: str | None = None
+    provider_status_code: int | None = None
+    usage_input_tokens: int | None = None
+    usage_output_tokens: int | None = None
+    boot_id: str | None = None
+    schema_hash: str | None = None
+    question_hash: str | None = None
+    provider_model_id: str | None = None
+    request_body_hash: str | None = None
+    raw_request_length: int | None = None
+    raw_response_length: int | None = None
+    raw_request_zlib_b64_chunks: tuple[str, ...] | None = None
+    raw_response_zlib_b64_chunks: tuple[str, ...] | None = None
+    request_started_mono_ns: int | None = None
+    call_latency_ns: int | None = None
     def _validate(self):
         if len({d.candidate_id for d in self.decisions}) != len(self.decisions):
             raise ContractViolation("duplicate candidate decision")
@@ -710,6 +934,53 @@ class DecisionBatch(Record):
             raise ContractViolation("rejected/late batch cannot contain decisions")
         if not self.decisions and self.rejection_reason is None:
             raise ContractViolation("empty judgment batch needs a rejection reason")
+        if (self.request_started_mono_ns is not None or self.call_latency_ns is not None):
+            if (type(self.request_started_mono_ns) is not int or type(self.call_latency_ns) is not int
+                    or self.request_started_mono_ns > self.received_mono_ns
+                    or self.call_latency_ns != self.received_mono_ns - self.request_started_mono_ns):
+                raise ContractViolation("invalid full-call latency audit")
+        if any(value is not None and (type(value) is not int or value < 0)
+               for value in (self.usage_input_tokens, self.usage_output_tokens)):
+            raise ContractViolation("invalid nullable provider token usage")
+        # Legacy/local rejected batches may omit audit bytes. A completed provider
+        # response, however, must retain enough immutable material to revalidate it.
+        if self.raw_request_zlib_b64_chunks is not None:
+            raw_request = _inflate_jev_audit(self.raw_request_zlib_b64_chunks)
+            if (self.raw_request_length != len(raw_request) or self.request_body_hash is None
+                    or hashlib.sha256(raw_request).hexdigest() != self.request_body_hash):
+                raise ContractViolation("raw request/hash mismatch")
+        if self.raw_response_zlib_b64_chunks is not None:
+            raw_response = _inflate_jev_audit(self.raw_response_zlib_b64_chunks)
+            if (self.raw_response_length != len(raw_response) or self.raw_response_hash is None
+                    or hashlib.sha256(raw_response).hexdigest() != self.raw_response_hash):
+                raise ContractViolation("raw provider response/hash mismatch")
+            if (self.raw_request_zlib_b64_chunks is None or self.boot_id is None or self.schema_hash is None
+                    or self.question_hash is None or self.request_body_hash is None):
+                raise ContractViolation("provider response audit identity incomplete")
+            if self.decisions and self.provider_model_id != self.model_id:
+                raise ContractViolation("provider model differs from requested model")
+        if self.provider_status_code is not None and (type(self.provider_status_code) is not int or not 100 <= self.provider_status_code <= 599):
+            raise ContractViolation("invalid provider HTTP status")
+
+    @property
+    def raw_request_bytes(self) -> bytes | None:
+        if self.raw_request_zlib_b64_chunks is None:
+            return None
+        raw = _inflate_jev_audit(self.raw_request_zlib_b64_chunks)
+        if (self.raw_request_length != len(raw) or self.request_body_hash is None
+                or hashlib.sha256(raw).hexdigest() != self.request_body_hash):
+            raise ContractViolation("raw request/hash mismatch")
+        return raw
+
+    @property
+    def raw_response_bytes(self) -> bytes | None:
+        if self.raw_response_zlib_b64_chunks is None:
+            return None
+        raw = _inflate_jev_audit(self.raw_response_zlib_b64_chunks)
+        if (self.raw_response_length != len(raw) or self.raw_response_hash is None
+                or hashlib.sha256(raw).hexdigest() != self.raw_response_hash):
+            raise ContractViolation("raw provider response/hash mismatch")
+        return raw
 
 
 @dataclass(frozen=True)
@@ -743,11 +1014,27 @@ class CalibrationArtifact(Record):
     uncertainty_passed: bool
     tail_checks_passed: bool
     cost_convention: str = "net_of_all_costs"
+    sides: tuple[str, ...] = ("buy",)
     def _validate(self):
         if not self.training_cutoff_us < self.valid_from_us < self.expires_at_us or self.independent_samples <= 0 or not self.mapping or not self.instruments or not self.regimes:
             raise ContractViolation("invalid calibration support/window")
+        if not self.sides or len(set(self.sides)) != len(self.sides) or not set(self.sides) <= {"buy", "sell"}:
+            raise ContractViolation("invalid calibration side cohort")
         if self.win_per_dollar <= 0 or self.loss_per_dollar <= 0 or self.cost_convention != "net_of_all_costs":
             raise ContractViolation("invalid calibrated payoff convention")
+
+
+@dataclass(frozen=True)
+class ExecutableBook(Record):
+    """Venue order book observed for sizing; `lineage_hash` binds the source events."""
+    venue: str
+    instrument: str
+    observed_at_us: int
+    book: BookPayload
+    lineage_hash: str
+    def _validate(self):
+        if not self.book.is_snapshot or not self.book.bids or not self.book.asks or any(qty <= 0 for _, qty in self.book.bids + self.book.asks):
+            raise ContractViolation("executable book requires a full two-sided snapshot")
 
 
 @dataclass(frozen=True)
@@ -1493,8 +1780,13 @@ class SizedProposal(Record):
     loss_budget_usd_u: int
     account_revision: AccountRevision
     artifact_hash: str
+    instrument: str
+    limit_price: Decimal
+    max_fee_usd_u: int
+    book_lineage_hash: str
+    edge_input_hash: str
     def _validate(self):
-        if self.base_quantity <= 0 or min(self.notional_usd_u, self.loss_budget_usd_u) <= 0:
+        if self.base_quantity <= 0 or self.limit_price <= 0 or min(self.notional_usd_u, self.loss_budget_usd_u) <= 0 or self.max_fee_usd_u < 0:
             raise ContractViolation("nonpositive sized proposal")
 
 

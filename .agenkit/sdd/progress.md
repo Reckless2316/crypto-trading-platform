@@ -1,8 +1,111 @@
 # Autonomous agent implementation
 
-## PAUSED — explicit operator instruction
+## 2026-10-17 — Task 8 accepted on substance; Task 9 remediation; Task 10 entry composition (uncommitted)
 
-Operator explicitly requested `pause` during Task 5. Root immediately interrupted `/root/build_task05`; all other current child agents are completed. No further build/review/research is authorized until operator resumes. Tasks 3/4 are accepted and committed; Task 5 remains incomplete/unreviewed. Preserve all partial working files. Last worker handoff: requested Task 5 base `9bd127c439b01921998a4bfcf6d420ef03a50489`, actual starting HEAD `d9226c17a98cd65233d82f9540f7c8850aca33bc`; isolated feature-math TDD started. Unresolved integration seam: existing `Ledger.account_view` is current-only; historical inventory must derive from committed causal journal/valuation evidence or an explicitly frozen evidence-bound historical view, never silently from current mutable holdings. No Task 5 passing result or acceptance claimed. Latest observed five-hour metadata `2026-10-17T09:42:34.905Z`: 86% used / 14% remaining. Immediate explicit pause supersedes waiting for the 10%-remaining threshold.
+Third review round:
+- Task 8 fixes C1, C2 and I1–I5 confirmed (spec PASS).
+- Task 9 spec FAIL. **X1 Critical:** a SHORT judgment was sized as a spot buy using a long-only calibrator.
+
+Remediated test-first:
+- **X1:** `size_entry` refuses non-LONG (`spot_entry_requires_long`). `CalibrationArtifact.sides`, the builder `side` and the `estimate_edge` check give `unsupported_side`.
+- **I-A:** `Ledger.calibration_rows` filters on the exact cohort, versions and side, then purges overlapping four-hour windows deterministically in quote order. A noisy-history test covers this (sell counterfactuals and overlapping buys).
+- **I-B:** label events are append-only in time (no later than the clock, no earlier than the latest label event, after the latest attested calibration cutoff).
+- **I-C:** book and capability provenance moved to authority; requirement recorded in `task-12-brief.md`.
+- **I-D:** caps are integer µUSD floors, which makes rounding provably within caps; each cap has a binding test. A mutation run kills all 9 (gross, cash, venue, asset, market expiry, tick bound, minimum notional, long-only, fee bound); control passes.
+- **M-a:** reserved loss is the full µUSD loss cap, at least the modeled loss.
+- **M-c:** a zero fee bound is refused. M-b (all-in cost against cost convention) is open and recorded.
+
+Task 10 entry composition:
+- `policy.EntryContext` and `evaluate_candidate(..., context=)` produce a bounded `OrderProposal` only when every check passes: entry gate (quality ≥ 2, confidence > 0.80, safe, non-toxic, long), calibrator named by the release, release not expired, sizing success, and persisted decision provenance.
+- An integration test shows `risk.assess` allows the armed paper proposal and vetoes it under kill, disarm, drawdown latch, daily halt, crisis halt or missing exposure configuration. An armed and killed `ControlState` cannot be constructed.
+
+Suites: repository-wide 386 OK.
+
+## 2026-10-17 — acceptances and Task 8 remediation, Task 9 built (uncommitted)
+
+- **State-engine remediation ACCEPTED.** Independent re-review: spec PASS, quality APPROVED. N2 follow-up (a logical key cannot change instrument) was fixed test-first; the N1 one-stream-per-instrument contract was added to the Task 16 brief.
+- **Task 6 ACCEPTED.** R4 re-review: spec PASS, quality APPROVED. The activation prerequisite (re-decode inside verify) is recorded in the Task 6 report and the Task 15 brief.
+- **Task 8 first review: spec FAIL** with two Criticals (C1 snapshot not bound to candidate row/instrument; C2 attestation over caller rows rather than ledger label events) and I1–I5. All were remediated test-first: ledger-sourced as-of rows, candidate wire-row binding, required real Ledger and `now_us`, half minimum 50, run key per release, every gate with its own reason-code test. Mutation check: C1×2, C2, I2 and I4 mutants all killed; control passes. Re-review pending.
+- **Task 9 built:** `ExecutableBook` contract; `SizedProposal` carries limit price, fee bound, book lineage and edge input hash. `size_entry` re-derives the edge through `estimate_edge` (equality required); computes quarter-Kelly with hard ceilings of 0.25 and 0.25%; caps by 1% pending loss, 5% asset, 20% gross, cash after fees and reservations, venue capacity, and 1% depth participation; requires spread <= 10 bps and limit = ask × (1 + 10 bps) floored to tick; floors the lot and re-checks all caps after micro-USD ceiling. Review pending (same reviewer).
+- Suites: repository-wide 366 OK; `git diff --check` clean.
+
+## 2026-10-17 — review round: state I1/I2 fixed, Task6 R4, Task8 edge gate built (uncommitted)
+
+State engine review (spec PASS, quality CHANGES REQUIRED) remediated test-first:
+- **I1:** more than one book stream for an instrument makes every boundary ambiguous, so mid/RV fail closed and venues are never stitched together. Integration must pin one book stream per instrument (Task 16 contract).
+- **I2:** `select` ranks across every revision known by the cutoff before any window. A correction can hide a key but never resurrect the revision it superseded, including when it moves exchange time before the window or past the close.
+- **M1:** missing inventory evidence now refuses. **M3:** decode cache is 32768 (six instruments). **M4:** LRU refresh on get/set. **M5:** tests added for the exact age bound and for evicted evidence being refused; M2 was left documented.
+- Benchmark rerun: steady-state snapshot about 12.5 ms, unchanged.
+
+Task 6: R3 re-review spec PASS / CHANGES REQUIRED → R4 fixes. See the task-06-report addendum.
+
+Task 8 (calibration edge) built test-first:
+- `attest_calibration_artifact`: the artifact must rebuild exactly from the rows. Uncertainty check: each bin's rate in both chronological calibration halves is at least its Wilson lower bound. Tail check: at least 30 training wins and 30 losses, and calibration never shows a smaller win or a larger loss than the training W/L.
+- `Ledger.record_calibration_attestation` re-runs the attestation itself and appends an `evaluation_runs` row (holdout `calibration-attestation-v1`) only when the release manifest's `calibrator_hash` names the attested artifact.
+- `estimate_edge` returns an `EdgeEstimate` only when all of these hold: a ledger-verified persisted completed `DecisionBatch` and valid persisted snapshot (state hash, lineage, release, cutoffs, no invalid lineage); the decision is in that batch; the recorded attestation equals the supplied artifact; model, schema and field dictionary match; the cohort and validity window match; the direction is not neutral; and a supported bin exists. Conservative p is the bin's Wilson lower bound; validity is at most one hour.
+- No migration was needed. `append_forecast` still refuses caller-supplied calibrated_p (unchanged).
+
+Suites: autonomous 326 OK; repository-wide 358 expected (verify at commit).
+
+## 2026-10-17 — cross-review items 2 and 3 implemented (uncommitted, pending independent review)
+
+Item 2 (minute-boundary sampling) — `StateEngine.snapshot`:
+- As-of sampler: each of the 61 boundaries takes the latest reconstructed book with exchange time <= boundary, and is missing if that state is older than `BOUNDARY_MAX_AGE_US` (5 s), the stream broke (sequence gap, failed delta, or exchange-time regression), or no state exists. Exchange timestamps are never rewritten. Lineage still lists every replayed book event.
+- Tests (RED observed first): continuous feed at ±100 ms around boundaries; post-boundary book never used; stale sample missing; break before boundary never falls back to an older book; exchange-time regression breaks the stream until the next snapshot.
+
+Item 3 (unbounded storage/replay):
+- `select(cutoffs, *, instrument=None, event_since_us=None)` adds SQL instrument/exchange-time bounds (existing `source_receipt` index) plus `event_at_us <= candle_close_us`, which is equivalent to the existing `causal_visible` rule.
+- Snapshot replay is limited to `[first boundary - BOOK_REPLAY_WINDOW_US (5 min), close]`. **Input contract:** each state book stream must publish a full-book checkpoint at least every 5 min, otherwise mid/RV fail closed. RED proven: on identical events, disabling the window makes mid/RV valid from a stale pre-window book.
+- All seven evidence caches are `_BoundedCache(CACHE_CAPACITY=1024)`, in insertion order. Eviction only causes `StateUnavailable` refusals in encode/persist; nothing unverified dispatches. Decoded append-only rows are memoised in `_BoundedCache(DECODE_CACHE_CAPACITY=8192)`, safe because the `source_events` triggers forbid update/delete.
+- Longevity measurement (scratchpad `bench_longevity.py`: real Ledger plus archive, 6 books/min, snapshot every minute, Python 3.12): steady-state snapshot time is about 12–13 ms, flat from hour 2 to 7 of history (it was 155–225 ms per snapshot with full decode). Inputs plateau at 390 events (the window). With small caps (60/400), traced memory flattens at 2.1–2.2 MB from hour 4 to 7. Not measured: a real level-2 feed rate, multi-day runs, or DB file growth. Unmeasured gap: per-event archive publication cost at dense feed rates.
+
+Suites: autonomous 309 OK; repository-wide `unittest discover -s tests` 341 OK; `git diff --check` clean.
+
+## RESUMED — 2026-10-17, cross-review item 1 closed (uncommitted)
+
+Baseline on resume: `.venv-autonomous/bin/python -m unittest discover -s tests/autonomous -t .` → 300 tests OK (Python 3.12.14).
+
+Cross-review Important #1 (late-recorded source rows leaking into historical selection) fixed test-first:
+- RED: added `test_late_recorded_first_event_never_enters_past_selection` and `test_late_recorded_revision_never_replaces_past_selection` in `tests/autonomous/test_causality.py`; both failed with the reviewer's exact reproduction.
+- GREEN: `StateEngine.select` (`bot/autonomous/state.py`) now filters `source_events.recorded_at_us <= knowledge_cutoff_us` before revision ranking; the existing recorded-time invalidation filter is unchanged. `build_snapshot` consumes `select`, so the Jev state path inherits the bound.
+- Three older causality tests had asserted the leaky behaviour (ingest at clock 200, select at cutoff 110/130). Their fixtures now record each event at its known time; their invariants (equal-knowledge revision order, recorded-invalidation cutoff, supersession fallback) are kept unchanged.
+- Full suite: 302 tests OK.
+- Not committed: `state.py` also contains unaccepted Task 6/8/9 WIP hunks. This item still needs independent review before it supersedes the earlier Task 4 PASS.
+
+Remaining priority order is unchanged from the pause entry below, items 2–5 (minute-boundary sampler, bounded caches/longevity, Task6 R3, Task8/9). Not live-ready.
+
+## PAUSED — 2026-10-17, usage headroom checkpoint
+
+Operator asked to continue building and then requested a whole-work review from Task3 onward. A high-capability independent reviewer at medium reasoning inspected the frozen Task3–Task9 snapshot and returned **changes required**; report: `cross-review-task03-to-now-report.md`. Main snapshot hash `b83e17b7a61214a2f38920978b2bf00460a6d88801fded6841d5444cd9146e7d`, Task6 supplement hash `bed374593fb9ec24320ee07b51cbba5541c394bf0c4b1c5c73b4884b8c076354`. Primary quota reached 87% used; pause builders before the project’s 90% stop threshold. Both Task6 and Task8 builders were interrupted; edits remain in the worktree.
+
+Next actions on resume, in priority order:
+1. Fix Task4/5 causal leak: filter late-recorded source events before revision ranking and test late-first plus late-superseding insertion.
+2. Resolve exact-minute-boundary sampling without falsifying exchange timestamps; bound caches/history replay and measure longevity.
+3. Finish Task6 R3 (concrete versioned decoders, comparable/current financial periods, 90-day forward-supply bounds, subject-bound approvals, registry downgrade checks). The last green Task6 static diff was R2 `task-06-diff-r2.patch` (36 tests reported), but review failed on remaining items; R3 is unaccepted.
+4. Continue Task8 hardening. Last stable checkpoint before the cross-review was 117 calibration+ledger tests reported passing, but the full resolver/attestation integration and `EdgeEstimate` remain unavailable; subsequent P&L/Decimal hardening edits were in progress and not verified at interruption.
+5. Task9 sizing/policy remains fail-closed partial; do not call the system finished or live-ready.
+
+Task7 Jev client alone passed scoped offline spec and quality review (57 tests reported); this does not accept production tokenizer, authority consumer, mapping, or release integration. The dated market update is `docs/research/2026-10-17-autonomous-agent/INTRADAY-UPDATE-2026-10-17.md`. No live provider/venue calls, deployment, activation, arming, or external actions occurred.
+
+## RESUMED — 2026-10-17, review remediation underway
+
+Operator reissued the build request after the prior pause. Current primary and weekly usage counters reset to 0%; retain the hard stop at 90% primary use. Tasks 1–5 remain accepted. Task6 and Task7 implementation reviews both returned spec FAIL and quality FAIL against the preserved diffs. Task6 findings: admission gates are unconditional blockers, protocol/financial normalization is missing, freshness expiry can exceed source max-age, issuance trust is process-only and retained artifacts are not replay-verified, and chain/instrument identities are not bound. Task7 finding: per-field optional usage values are rejected; minor latency metric omits final envelope validation. Exact findings are in the independent agent review results from this run. Both original coders are assigned test-first remediation on disjoint scopes; no shared contracts, candidate integration, or production paths may change. Each will receive an independent re-review immediately on handoff. No live/provider calls, deployment, activation, arming, or Notion work authorized.
+
+Task7 remediation completed and independent re-review returned spec PASS and quality PASS with no residual findings for the scoped offline client (`/tmp/task07-scoped-rereview.diff`, SHA256 `807bff8a3f927fc904011afd8b8d7d55318c16256c8ed101a9204fb2442ecf5e`; 57 focused tests reported passing). This acceptance does not certify authority revalidation, tokenizer proof, candidate mappings, or promotion. Task7 coder moved to Task8 calibration/immutable outcome labels (`task-08-brief.md`) on calibration.py, test_calibration.py, and scoped ledger changes while Task6 remediation continues on separate paths. Both handoffs require immediate independent review.
+
+Operator requested a high-capability medium-reasoning cross-task review of all work from Task3 through current Task9 WIP. Frozen snapshot: `.agenkit/sdd/cross-review-task03-to-current.patch`, base `67ad62e2ddf0644fbffcd56aa5957e13e2957384`, SHA-256 `b83e17b7a61214a2f38920978b2bf00460a6d88801fded6841d5444cd9146e7d`. Reviewer `/root/cross_task_review_03_to_now` is read-only and active. Snapshot captured Task6 intermediate R3 before decoder completion and Task8 at the 117-test offline verifier checkpoint; it is an audit snapshot, not a claim of acceptance. Task6 R3 and Task8 builders resumed only after snapshot capture, on disjoint scopes. Current market refresh is saved as `docs/research/2026-10-17-autonomous-agent/INTRADAY-UPDATE-2026-10-17.md`.
+
+## PAUSED — 2026-10-17, operator instruction
+
+Operator asked to pause. All active reviewers were interrupted; no coder remains active. Resume from these preserved handoffs: Task 6 implementation is ready but **not accepted**; its scoped static diff is `.agenkit/sdd/task-06-diff.md`, report `.agenkit/sdd/task-06-report.md`, baseline `60dff6c48fe56a7f709697d18b6098574835cadc`, and coder reports 20 focused tests passing. Task 7 implementation is ready but **not accepted**; its static diff is `/tmp/task07-scoped-review.diff` (SHA256 `a27167f3e1267b92e19c4b0061f8a917dd382191afac59dbbddf7fa62b954204`), report `.agenkit/sdd/task-07-report.md`, same baseline, and coder reports 55 focused tests passing. The Task 6 reviewer errored because its fixed model was unsupported; the generic Task 6 reviewer and Task 7 reviewer were interrupted before verdict. On resume, launch two independent read-only contrarian reviewers from these exact snapshots, then address findings and re-review before acceptance. Do not proceed to dependent phases or candidate mapping until gates pass. Existing edits and reports are preserved; no live calls, staging, deployment, activation, or arming occurred.
+
+## Current resume — 2026-10-17 09:31 America/Denver, refreshed for current run
+
+Operator resumed the paused AgenKit build. Tasks 1–5 are accepted for local software development. Task 5 passed independent spec and quality review with no findings; its accepted verification is 194 affected contracts/ledger/risk/causality/state tests. It is not promotion-ready: release/rank registry, production tokenizer proof, and release/evidence eligibility integration remain blockers. Continue with two disjoint build lanes: Task 6 research/evidence/schema completion and Task 7 Jev client contract hardening. Root is lead and checkpoints integration; each lane gets its own independent, contrarian spec-and-quality review immediately at handoff. Preserve existing edits and do not stage mixed files. Task 7 must keep candidate mappings inert until Task 6 is accepted. No live/provider calls, deployment, activation, arming, or Notion work authorized.
+
+Latest usage metadata observed this run: primary five-hour window 55% used / 45% remaining; weekly 24% used. Stop all work and interrupt agents when primary `used_percent >= 90` (10% remaining); recheck before dispatch and periodically. AgenKit memory was updated for five changed files; it is now current.
+
+This resume supersedes contradictory older status entries below; those entries remain historical execution records only.
 
 ## Usage stop rule — operator instruction
 
