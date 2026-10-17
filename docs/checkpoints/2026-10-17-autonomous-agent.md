@@ -33,8 +33,8 @@ The installed `.venv` uses Python 3.14.4; the deployment image specifies Python 
 
 | Task | State |
 |---|---|
-| 1 Domain contracts/defaults | pending |
-| 2 Durable journal/reservations | pending |
+| 1 Domain contracts/defaults | complete; commits a77407a + 76e0527; 26 tests Python 3.12; independent spec/quality review passes |
+| 2 Durable journal/reservations | in progress |
 | 3 Equity/flows/latches | pending |
 | 4 Causal source/archive | pending |
 | 5 Numeric state/token proof | pending |
@@ -57,3 +57,7 @@ The installed `.venv` uses Python 3.14.4; the deployment image specifies Python 
 | 22 Ship/live gates | not authorized yet |
 
 Each task requires observed RED/GREEN checks and task review. Baseline and task results will be appended with actual commands, working directory, outcomes, commit identities and unresolved findings. A unit-test pass cannot substitute for actual market evidence or live promotion approval.
+
+### Task 1 acceptance
+
+Strict frozen domain records, canonical serialization, monetary validation, safe configuration and numeric field dictionary implemented. RED/GREEN evidence: initial10 missing-contract failures, implementation20 passing tests, then independent review identified numeric-ID and discrete-mask issues; test-first fixes increased coverage to26 passing Python3.12 tests. Both independent review stages now pass with no open findings. Task15 must implement core-manifest identity excluding embedded approvals and a separate package hash; this is recorded in its task brief. Full reports/diffs: `.agenkit/sdd/task-01-*`.

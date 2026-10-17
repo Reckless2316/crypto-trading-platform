@@ -56,7 +56,7 @@ During Build, establish Python 3.12 and install the existing requirements in the
 
 **Consumes:** approved architecture §3 types and §6 controls. **Produces:** frozen dataclasses and enums for every architecture boundary record, all typed errors, `canonical_bytes(value: object) -> bytes`, `content_hash(value: object) -> str`, `checked_money(value: int) -> int`, `decimal_value(value: str) -> Decimal`, `RiskLimits`, and a parsed versioned field dictionary. Types include `SourceEvent`, `CausalCutoffs`, `NumericSnapshot`, `SharedContext`, `FieldDictionary`, `ProviderTokenCounter`, `TokenCount`, `EncodedState`, `QuestionBatch`, `JudgeRequest`, `DecisionBatch`, `CandidateDecision`, `CalibrationArtifact`, `EdgeEstimate`, `UnavailableEdge`, `AccountView`, `AccountRevision`, `MarketRules`, `OrderProposal`, `PreparedIntent`, `ControlState`, `RiskVerdict`, `PolicyResult`, `SubmitOrderCommand`, `CancelOrderCommand`, `ControlCommand`, `IntentReceipt`, `ControlReceipt`, `ReconcileReason`, `ReconcileReport`, `OrderReference`, `VenueOrderResult`, `VenueAccountSnapshot`, `FillCursor`, `FillPage`, `DecisionReference`, `OrderEvent`, `AppendResult`, `SessionCutoff`, `SessionArchive`, `EvidenceRequest`, `EvidenceObservation`, `EvidenceManifest`, `CandidateDefinition`, `ThesisAssessment`, `ReviewJob`, `ReviewProposal`, `ReviewReport`, `EvaluationSplit`, `EvaluationResult`, `CandidateBundle`, `ApprovedBundle`, `GateApproval`, `BundleRejection`, `WorkerConfig`, `WorkerDependencies`, `IngestResult`, `SizedProposal`, `SizeRejection`, `Hold`, `RiskRejection`, and `PendingReconciliation`. Each gets the fields/units and invariants in architecture §3/§7; do not silently accept arbitrary dicts at these boundaries.
 
-- [ ] RED: add strict accounting/canonicalization tests, including this complete acceptance example.
+- [x] RED: add strict accounting/canonicalization tests, including this complete acceptance example.
 
 ```python
 import unittest
@@ -72,8 +72,8 @@ class ContractTests(unittest.TestCase):
                 checked_money(value)
 ```
 
-- [ ] Run `.venv/bin/python -m unittest tests.autonomous.test_contracts -v`; expect RED on absent/unsafe contracts.
-- [ ] Implement canonical primitives and the architecture's frozen records; reject unknown JSON fields, bool-as-int, unsupported enum values, nonfinite/probability violations, invalid timestamps and excessive decimals before domain construction.
+- [x] Run `.venv/bin/python -m unittest tests.autonomous.test_contracts -v`; expect RED on absent/unsafe contracts.
+- [x] Implement canonical primitives and the architecture's frozen records; reject unknown JSON fields, bool-as-int, unsupported enum values, nonfinite/probability violations, invalid timestamps and excessive decimals before domain construction.
 
 ```python
 import hashlib
@@ -93,7 +93,7 @@ def checked_money(value: int) -> int:
 ```
 
 Configuration fixes approved limits, 1,000ms Jev deadline, 2,000ms snapshot/book age, 5s private heartbeat, 15s reconciliation age, 10-bps imbalance band, 60 one-minute log returns, four-candle outcome horizon, Noul threshold 0.50, zero Jev retries, and default `mode=paper`, `armed=false`, `candidate_eligible=false`. Decimal text conversion uses explicit scale/rounding; authorization never reads rounded display values. Missing live/tokenizer/calibration configuration disables exposure.
-- [ ] GREEN: rerun the focused command; include mutation/round-trip/default-disable cases. Commit only the six task-owned files: `feat: define autonomous domain contracts`.
+- [x] GREEN: rerun the focused command; include mutation/round-trip/default-disable cases. Commit only the six task-owned files: `feat: define autonomous domain contracts`.
 
 ## Task 2: durable schema, journal and atomic reservations
 
