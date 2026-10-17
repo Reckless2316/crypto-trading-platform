@@ -9,6 +9,7 @@ except ImportError:
 
 class BinanceCollector(Collector):
     BASE = "https://api.binance.com/api/v3"
+    US_BASE = "https://api.binance.us/api/v3"
     INTERVAL_MAP = {"1m": "1m", "5m": "5m", "15m": "15m", "1h": "1h", "4h": "4h", "1d": "1d"}
 
     def __init__(self):
@@ -23,13 +24,17 @@ class BinanceCollector(Collector):
         if start < 0 or (end is not None and end <= start):
             raise ValueError("Require 0 <= start < end")
         interval = self.INTERVAL_MAP[timeframe]
-        url = f"{self.BASE}/klines"
         params = {"symbol": symbol.replace("-", ""), "interval": interval, "startTime": start, "limit": 1000}
         if end is not None:
             # Binance endTime is inclusive. The history service filters to its
             # half-open interval after receiving this page.
             params["endTime"] = end - 1
-        r = requests.get(url, params=params, timeout=10)
+        r = requests.get(f"{self.BASE}/klines", params=params, timeout=10)
+        if getattr(r, "status_code", None) == 451:
+            # Binance.US exposes the same public klines shape for US users who
+            # cannot access the global Binance API. Do not proxy or mask the
+            # caller's location; query the US exchange's official endpoint.
+            r = requests.get(f"{self.US_BASE}/klines", params=params, timeout=10)
         r.raise_for_status()
         candles = []
         for k in r.json():

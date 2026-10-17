@@ -1,5 +1,6 @@
 .env
 .venv/
+.venv-autonomous/
 __pycache__/
 *.py[cod]
 *.db
@@ -7,3 +8,5 @@ __pycache__/
 *.sqlite3
 *.log
 .pytest_cache/
+.agenkit/memory/codemap.json
+.agenkit/memory/manifest.json

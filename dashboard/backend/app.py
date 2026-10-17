@@ -415,13 +415,25 @@ def live_status():
         config = live_config()
         configured = bool(config.enabled and config.armed and config.api_key and config.api_secret and config.max_order_quote > 0)
         user_armed = configured and live_armed_until > time.time()
+        missing = []
+        if not config.enabled:
+            missing.append("SURGE_LIVE_TRADING_ENABLED=true")
+        if not config.armed:
+            missing.append("SURGE_LIVE_TRADING_ARMED=I_ACCEPT_LIVE_TRADING_RISK")
+        if not config.api_key:
+            missing.append("exchange API key")
+        if not config.api_secret:
+            missing.append("exchange API secret")
+        if config.max_order_quote <= 0:
+            missing.append("positive SURGE_LIVE_MAX_ORDER_QUOTE")
         return {"configured": configured, "enabled": config.enabled, "exchange": config.exchange_id,
                 "user_armed": user_armed, "armed_seconds_remaining": max(0, int(live_armed_until-time.time())) if user_armed else 0,
                 "max_order_quote": config.max_order_quote if configured else 0,
-                "mode": "live" if user_armed else "paper"}
-    except (LiveTradingDisabled, ValueError):
+                "mode": "live" if user_armed else "paper", "missing_requirements": missing}
+    except (LiveTradingDisabled, ValueError) as exc:
         return {"configured": False, "enabled": False, "exchange": None, "user_armed": False,
-                "armed_seconds_remaining": 0, "max_order_quote": 0, "mode": "paper"}
+                "armed_seconds_remaining": 0, "max_order_quote": 0, "mode": "paper",
+                "missing_requirements": [str(exc)]}
 
 
 @app.post("/api/live/arm")

@@ -9,7 +9,7 @@ services:
     container_name: surge-paper
     restart: unless-stopped
     ports:
-      - "127.0.0.1:8000:8000"
+      - "127.0.0.1:${SURGE_HOST_PORT:-8000}:8000"
     environment:
       SURGE_DB_PATH: /var/lib/surge/surge.sqlite3
       SURGE_COLLECTION_SECONDS: "300"

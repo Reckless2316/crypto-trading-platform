@@ -22,6 +22,15 @@ The installed `.venv` uses Python 3.14.4; the deployment image specifies Python 
 
 ## Task ledger
 
+### Build setup evidence
+
+- Approved design/research/plan checkpoint committed as `bf75801` before implementation.
+- Native managed worktree created at `/home/reckless/.codex/worktrees/bd91/crypto-trading-platform`; the preserved operator patch was applied there with approval. Persistent sandbox restrictions prevent normal edits there. Following the worktree skill's sandbox fallback, implementation uses the writable original checkout on `feat/autonomous-crypto-agent`, with all operator changes preserved. The worktree remains a backup, not an active second implementation.
+- Original tracked operator changes preserved in `/tmp/autonomous-agent-operator-20261017.patch`; a separate feature-branch baseline commit records them before task commits.
+- Baseline command `.venv/bin/python -m unittest discover -s tests -v`: 32 tests pass outside sandbox under Python 3.14.4. Same sandboxed command stalls in FastAPI TestClient and was interrupted; no production change made to work around it. Preexisting Starlette/httpx deprecation warning recorded.
+- Created `.venv-autonomous` using installed CPython 3.12.14 with `uv`, matching the deployment Python minor version. Installed existing development requirements. Under Python 3.12 all 32 original tests pass; concurrent Task 1's 10 new tests showed expected missing-contract RED failures. No original-test regression.
+- Task-specific briefs, verbatim global constraints, reports and task review packages are stored in `.agenkit/sdd/`; durable progress is `.agenkit/sdd/progress.md`.
+
 | Task | State |
 |---|---|
 | 1 Domain contracts/defaults | pending |
