@@ -1,10 +1,16 @@
 # Autonomous agent implementation
 
+## Usage stop rule — operator instruction
+
+Operator requests all work pause when the five-hour allowance reaches 10% remaining: primary `window_minutes=300`, `used_percent >= 90`. Monitor current-thread rollout `event_msg/token_count` rate-limit metadata before dispatch and regularly while working; do not substitute weekly usage, token context or elapsed wall time. At threshold interrupt all active agents, preserve edits, record exact usage timestamp/remaining work and stop until operator resumes. Latest observed metadata `2026-10-17T09:32:04.075Z`: primary 60% used / 40% remaining, weekly 9% used. This rule supersedes continuous execution once its condition is met.
+
 ## Resumed acceptance — Task 3 complete
 
 Task 3 is accepted through source `a4fbd8daf554e39372f429aa12954d4924073a3a` and report `a4d96f1faa3540a2aaf97a72d58072fe0b596746`. Original full-diff base remains `67ad62e`. Independent full review in `task-03-rereview.md` returns specification PASS and quality PASS with no remaining findings. R1–R3 fixed by `07ecc17`; additional failed-correction readiness finding R4 fixed test-first by `a4fbd8d`. Unsupported correction compensation now rolls back atomically while retaining evidence and unresolved inhibition. Final covering suite: 133 tests PASS on Python 3.12.14; root independently reran the full command (133 tests, 2.236s, OK). Task 4 is next, using its existing brief, integration map and design guidance. Tasks 1/2 stay accepted. No live/provider calls, deployment, release activation, Notion work or arming authorized.
 
-## Current direction — AgenKit leads directly
+Task 4 dispatched to fresh direct AgenKit worker `/root/build_task04` from base `4e57061`. Owns only ledger/state, causality tests/fixture and Task 4 report. Sequential production ownership; independent full task review required before Task 5. AgenKit CLI is unavailable in this resumed shell; the saved MEMORY.md fallback and prepared exact integration source map are in use.
+
+## Previous checkpoint — superseded by resumed acceptance above
 
 Operator resumed the build with AgenKit as the engineering workflow and root as its direct lead. The separate orchestrator agent is retired from this project; it and its unfinished reviewer remain interrupted. Notion work is canceled; only local draft payloads exist and no pages were created. Preserve those historical files without further work on them.
 
