@@ -34,6 +34,11 @@ BACKUP_TOOL = UNITS / "sqlite_backup.py"
 
 RUNTIME = "surge-paper-runtime"
 RUNTIME_VOLUME = "autonomous-runtime"
+ROLES = {"authority": RUNTIME, "reflex": "surge-reflex", "brain": "surge-brain", "dashboard": "surge-dashboard"}
+SECRET_OWNERS = {"jev_api_key": "surge-reflex", "anthropic_api_key": "surge-brain"}
+PROPOSALS_VOLUME = "autonomous-brain"
+DASHBOARD_STATE_VOLUME = "dashboard-state"
+SECRETS_DIR = "./deploy/autonomous/secrets/"
 SECRET_NAME = re.compile(
     r"(KEY|SECRET|TOKEN|PASSW|PASSPHRASE|PRIVATE|CREDENTIAL|AUTH|COINBASE|BINANCE|KRAKEN|JEV|ANTHROPIC|OPENAI|LIVE)",
     re.I)
@@ -101,9 +106,10 @@ class OverlayRuntimeServiceTests(unittest.TestCase):
         for name, service in self.config["services"].items():
             with self.subTest(service=name):
                 self.assertNotIn("env_file", service)
-                self.assertNotIn("secrets", service)
                 self.assertEqual(sorted(n for n in _env_names(service) if SECRET_NAME.search(n)), [])
-        self.assertNotIn("secrets", self.config)
+                for value in (service.get("environment") or {}).values() if isinstance(
+                        service.get("environment"), dict) else []:
+                    self.assertNotRegex(str(value), r"(sk-|KEY|SECRET|TOKEN)")
         self.assertNotRegex(OVERLAY.read_text(), r"\$\{?[A-Z_]*(KEY|SECRET|TOKEN)")
 
     def test_runtime_is_nonroot_readonly_and_unprivileged(self):
@@ -146,8 +152,10 @@ class OverlayRuntimeServiceTests(unittest.TestCase):
     def test_runtime_publishes_no_ports_and_is_isolated_from_dashboard_network(self):
         self.assertNotIn("ports", self.runtime)
         self.assertNotIn("expose", self.runtime)
-        dashboard_nets = set(self.config["services"]["surge"].get("networks") or ["default"])
-        self.assertTrue(set(self.runtime.get("networks") or ["default"]).isdisjoint(dashboard_nets))
+        dashboard = self.config["services"][ROLES["dashboard"]]
+        self.assertEqual("host", dashboard.get("network_mode"))  # loopback-only bind on the host
+        self.assertNotIn("networks", dashboard)
+        self.assertTrue(self.runtime.get("networks"))
 
     def test_runtime_command_is_paper_only_and_unarmed(self):
         command = _command_text(self.runtime)
@@ -157,7 +165,7 @@ class OverlayRuntimeServiceTests(unittest.TestCase):
         self.assertEqual(self.runtime.get("restart"), "on-failure", "a STOP-file exit must stay stopped")
 
     def test_dashboard_gets_runtime_volume_read_only_at_the_dir_it_reads(self):
-        surge = self.config["services"]["surge"]
+        surge = self.config["services"][ROLES["dashboard"]]
         mounts = [m for m in _volumes(surge) if m["source"] == RUNTIME_VOLUME]
         self.assertEqual(len(mounts), 1)
         self.assertTrue(mounts[0]["read_only"])
@@ -188,6 +196,110 @@ class OverlayRuntimeServiceTests(unittest.TestCase):
         resolved = json.loads(result.stdout)["services"][RUNTIME]
         self.assertNotIn("ports", resolved)
         self.assertEqual(sorted(n for n in resolved.get("environment", {}) if SECRET_NAME.search(n)), [])
+
+
+class FourRoleSplitTests(unittest.TestCase):
+    """authority / reflex / brain / dashboard: role-specific file secrets and minimal mounts."""
+
+    def setUp(self):
+        self.config = _yaml(OVERLAY)
+        self.services = self.config["services"]
+
+    def service(self, role):
+        return self.services[ROLES[role]]
+
+    def test_roles_exist_and_optional_roles_are_profile_gated(self):
+        for role in ROLES:
+            self.assertIn(ROLES[role], self.services, role)
+        self.assertNotIn("profiles", self.service("authority"))
+        self.assertNotIn("profiles", self.service("dashboard"))
+        self.assertEqual(["jev"], self.service("reflex")["profiles"])
+        self.assertEqual(["brain"], self.service("brain")["profiles"])
+        self.assertEqual(["legacy-display"], self.services["surge"]["profiles"],
+                         "the legacy env-configured dashboard must not start in the role deployment")
+
+    def test_every_secret_is_file_backed_and_mounted_into_exactly_one_role(self):
+        declared = self.config.get("secrets") or {}
+        self.assertEqual(set(SECRET_OWNERS), set(declared))
+        for name, spec in declared.items():
+            with self.subTest(secret=name):
+                self.assertEqual({"file"}, set(spec), "file-mounted only; never environment-sourced")
+                self.assertTrue(spec["file"].startswith(SECRETS_DIR), spec["file"])
+                owners = [svc for svc, body in self.services.items()
+                          if name in [s if isinstance(s, str) else s.get("source") for s in body.get("secrets") or []]]
+                self.assertEqual([SECRET_OWNERS[name]], owners)
+        for role in ("authority", "dashboard"):
+            self.assertNotIn("secrets", self.service(role), role)
+        for role, expected in (("reflex", ["jev_api_key"]), ("brain", ["anthropic_api_key"])):
+            mounted = [s if isinstance(s, str) else s.get("source") for s in self.service(role)["secrets"]]
+            self.assertEqual(expected, mounted, role)
+        ignore = ROOT / "deploy" / "autonomous" / "secrets" / ".gitignore"
+        self.assertTrue(ignore.exists())
+        self.assertIn("*", ignore.read_text().split())
+
+    def test_mounts_are_minimal_per_role(self):
+        def mounts(role):
+            return sorted((m["source"], m["read_only"]) for m in _volumes(self.service(role)))
+        self.assertEqual([(RUNTIME_VOLUME, False)], mounts("authority"))
+        self.assertEqual([], mounts("reflex"))
+        self.assertEqual(sorted([(RUNTIME_VOLUME, True), (PROPOSALS_VOLUME, False)]), mounts("brain"))
+        self.assertEqual(sorted([(RUNTIME_VOLUME, True), (PROPOSALS_VOLUME, True), (DASHBOARD_STATE_VOLUME, False)]),
+                         mounts("dashboard"))
+        for role in ROLES:
+            for m in _volumes(self.service(role)):
+                self.assertFalse(str(m["source"]).startswith(("/", ".", "~")), "no host bind mounts")
+                self.assertIn(m["source"], self.config["volumes"])
+            self.assertNotIn("volumes_from", self.service(role))
+
+    def test_every_role_is_hardened(self):
+        for role in ROLES:
+            body = self.service(role)
+            with self.subTest(role=role):
+                self.assertIs(True, body.get("read_only"))
+                self.assertEqual("surge", str(body.get("user")))
+                self.assertIn("ALL", body.get("cap_drop", []))
+                self.assertIn("no-new-privileges:true", body.get("security_opt", []))
+                self.assertFalse(body.get("privileged", False))
+                self.assertEqual("never", body.get("pull_policy"))
+                self.assertNotIn("ports", body)
+                self.assertNotIn("cap_add", body)
+
+    def test_networks_are_role_specific(self):
+        nets = {role: set(self.service(role).get("networks") or []) for role in ("authority", "reflex", "brain")}
+        for role, value in nets.items():
+            self.assertEqual(1, len(value), role)
+        self.assertEqual(3, len(set().union(*nets.values())), "no shared egress network between roles")
+        hosts = [svc for svc, body in self.services.items() if body.get("network_mode") == "host"]
+        self.assertEqual([ROLES["dashboard"]], hosts)
+
+    def test_role_commands(self):
+        authority = _command_text(self.service("authority"))
+        self.assertIn("--accounting ledger", authority)
+        brain = self.service("brain")
+        text = _command_text(brain)
+        self.assertIn("-m bot.autonomous.nightly", text)
+        self.assertIn("--brain anthropic", text)
+        self.assertIn("--brain-key-file /run/secrets/anthropic_api_key", text)
+        rw = [m["target"] for m in _volumes(brain) if not m["read_only"]][0].rstrip("/")
+        ro = [m["target"] for m in _volumes(brain) if m["read_only"]][0].rstrip("/")
+        self.assertTrue(re.search(r"--out-dir\s+(\S+)", text).group(1).startswith(rw + "/"))
+        self.assertTrue(re.search(r"--data-dir\s+(\S+)", text).group(1).startswith(ro + "/"))
+        dashboard = self.service("dashboard")
+        text = _command_text(dashboard)
+        self.assertIn("-m dashboard.launch", text)
+        self.assertIn("--host 127.0.0.1", text)
+        runtime_dir = re.search(r"--runtime-dir\s+(\S+)", text).group(1)
+        self.assertEqual(dashboard["environment"]["AUTONOMOUS_RUNTIME_DIR"], runtime_dir)
+        self.assertTrue(re.search(r"--session-dir\s+(\S+)", text).group(1).startswith(runtime_dir + "/control/sessions"))
+        state = [m["target"] for m in _volumes(dashboard) if not m["read_only"]][0].rstrip("/")
+        self.assertTrue(re.search(r"--state-dir\s+(\S+)", text).group(1).startswith(state + "/"))
+        brain_out = re.search(r"--out-dir\s+(\S+)", _command_text(brain)).group(1)
+        brain_rw = [m["target"] for m in _volumes(brain) if not m["read_only"]][0].rstrip("/")
+        dash_ro = [m["target"] for m in _volumes(dashboard) if m["source"] == PROPOSALS_VOLUME][0].rstrip("/")
+        self.assertEqual(dash_ro + brain_out[len(brain_rw):] + "/proposals", dashboard["environment"]["AUTONOMOUS_PROPOSALS_DIR"])
+        reflex = _command_text(self.service("reflex"))
+        self.assertIn("HANDOFF", reflex, "reflex cannot run as a separate process yet; it must refuse")
+        self.assertNotIn("bot.autonomous.runtime", reflex)
 
 
 class SystemdUnitTests(unittest.TestCase):
@@ -365,7 +477,9 @@ class RunbookTests(unittest.TestCase):
         text = RUNBOOK.read_text()
         for needle in ("STOP", "KILL", "Restart and recovery", ".backup", "WAL", "±10 s", "4 s",
                        "status.json", "--report", "--write-jev-schema", "jev_schema.approved.json",
-                       "Live trading is not available", "Task", "approval"):
+                       "Live trading is not available", "Task", "approval", "issue-session", "dashboard.launch",
+                       "#bootstrap=", "--profile brain", "--profile jev", "deploy/autonomous/secrets",
+                       "Four-role deployment"):
             self.assertIn(needle, text, needle)
 
 

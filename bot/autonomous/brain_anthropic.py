@@ -33,6 +33,8 @@ import hashlib
 import json
 import logging
 import os
+import re
+import stat
 import tempfile
 import time
 from dataclasses import asdict
@@ -43,6 +45,9 @@ from .brain import ALLOWED_ACTIONS, BrainProposal, DeterministicBrain
 from .contracts import ProviderUnavailable, content_hash
 
 MODEL_ID = "claude-opus-5-5"
+MODEL_PATTERN = re.compile(r"^claude-opus-5-5(-\d{8})?$")  # the requested model, including dated snapshot ids
+DEFAULT_FALLBACK_MODELS = ("claude-opus-4-8",)  # only with --brain-allow-fallback; configurable
+MAX_PROPOSAL_FILE_BYTES = 1_500_000  # a day file rolls over to <day>-<n>.json before exceeding this
 API_URL = "https://api.anthropic.com/v1/messages"
 ANTHROPIC_VERSION = "2023-06-01"
 FALLBACK_BETA = "server-side-fallback-2026-07-01"
@@ -185,7 +190,7 @@ class AnthropicBrain:
 
     def __init__(self, *, api_key: str, transport: Callable | None = None, timeout_s: float = DEFAULT_TIMEOUT_S,
                  max_response_bytes: int = MAX_RESPONSE_BYTES, effort: str = EFFORT, max_tokens: int = MAX_TOKENS,
-                 allow_fallback: bool = False):
+                 allow_fallback: bool = False, fallback_models: Sequence[str] = DEFAULT_FALLBACK_MODELS):
         if type(api_key) is not str or not api_key.strip():
             raise ValueError("a non-empty provider key is required")
         if not 0 < timeout_s <= 600 or not 0 < max_response_bytes <= 16_777_216 or effort not in (
@@ -195,12 +200,19 @@ class AnthropicBrain:
         self._credential = lambda: key  # never stored as a plain attribute, so vars()/repr cannot show it
         self.transport = transport or default_transport()
         self.allow_fallback = allow_fallback is True
+        if (isinstance(fallback_models, str) or any(type(m) is not str or not m.strip() for m in fallback_models)):
+            raise ValueError("fallback models must be explicit model ids")
+        self.fallback_models = tuple(fallback_models)
         self.last_call: dict | None = None
         self.timeout_s, self.max_response_bytes = timeout_s, max_response_bytes
         self.effort, self.max_tokens = effort, max_tokens
 
     def __repr__(self) -> str:
         return f"AnthropicBrain(model_id={self.model_id!r}, transport={type(self.transport).__name__})"
+
+    def accepts_model(self, served: str) -> bool:
+        """Opus 5.5 (dated ids included); another model only via an explicit fallback allowlist."""
+        return bool(MODEL_PATTERN.fullmatch(served)) or (self.allow_fallback and served in self.fallback_models)
 
     def request_for(self, payload: dict) -> dict:
         text = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
@@ -243,9 +255,8 @@ class AnthropicBrain:
         self.last_call.update(usage=_usage(response),
                               served_model=response.get("model") if type(response) is dict else None)
         try:
-            result = parse_proposal(response, allowed_refs=set(refs),
-                                    expected_model=None if self.allow_fallback else MODEL_ID)
-            self.last_call["fallback_used"] = result.model_id != MODEL_ID
+            result = parse_proposal(response, allowed_refs=set(refs), accept_model=self.accepts_model)
+            self.last_call["fallback_used"] = not MODEL_PATTERN.fullmatch(result.model_id)
         except ProviderUnavailable as exc:
             log.warning("brain output rejected job=%s reason=%s", job_id, exc)
             raise
@@ -265,7 +276,8 @@ def _usage(response: Any) -> dict | None:
     return values
 
 
-def parse_proposal(response: Any, *, allowed_refs: set[str], expected_model: str | None = MODEL_ID) -> BrainProposal:
+def parse_proposal(response: Any, *, allowed_refs: set[str],
+                   accept_model: Callable[[str], bool] = lambda m: bool(MODEL_PATTERN.fullmatch(m))) -> BrainProposal:
     """Strict validation of a Messages API response into a BrainProposal."""
     def bad(code: str):
         return ProviderUnavailable("BRAIN_OUTPUT_INVALID:" + code)
@@ -277,7 +289,7 @@ def parse_proposal(response: Any, *, allowed_refs: set[str], expected_model: str
     served = response.get("model")
     if type(served) is not str or not served:
         raise bad("MODEL")
-    if expected_model is not None and served != expected_model:
+    if not accept_model(served):
         raise bad("UNEXPECTED_MODEL")
     content = response.get("content")
     if type(content) is not list:
@@ -333,18 +345,43 @@ def key_from(environ: Mapping[str, str]) -> str | None:
     return None
 
 
+MAX_KEY_FILE_BYTES = 4_096
+
+
+def key_from_file(path) -> str | None:
+    """A file-mounted secret (e.g. /run/secrets/anthropic_api_key): a regular, non-symlink, bounded file."""
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError:
+        return None
+    info = os.fstat(descriptor)
+    if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_KEY_FILE_BYTES:
+        os.close(descriptor)
+        return None
+    with os.fdopen(descriptor, "rb") as handle:
+        raw = handle.read(MAX_KEY_FILE_BYTES + 1)
+    try:
+        value = raw.decode("utf-8").strip()
+    except UnicodeDecodeError:
+        return None
+    return value if value and len(raw) <= MAX_KEY_FILE_BYTES and "\n" not in value else None
+
+
 def build_brain(choice: str, *, environ: Mapping[str, str] | None = None, transport: Callable | None = None,
-                allow_fallback: bool = False):
-    """Return (brain, notes). Opus is used only with an explicit choice AND a key."""
+                allow_fallback: bool = False, key_file=None, fallback_models: Sequence[str] | None = None):
+    """Return (brain, notes). Opus is used only with an explicit choice AND a key.
+
+    With ``key_file`` (a file-mounted secret) the file is the only key source; environment keys are ignored."""
     if choice not in ("deterministic", "anthropic"):
         raise ValueError("brain must be deterministic or anthropic")
     if choice == "deterministic":
         return DeterministicBrain(), ()
-    key = key_from(os.environ if environ is None else environ)
+    key = key_from_file(key_file) if key_file is not None else key_from(os.environ if environ is None else environ)
     if key is None:
         log.warning("brain anthropic requested but no key is configured; using deterministic metrics only")
         return DeterministicBrain(), ("BRAIN_KEY_MISSING",)
-    return AnthropicBrain(api_key=key, transport=transport, allow_fallback=allow_fallback), ()
+    return AnthropicBrain(api_key=key, transport=transport, allow_fallback=allow_fallback,
+                          fallback_models=tuple(fallback_models) if fallback_models else DEFAULT_FALLBACK_MODELS), ()
 
 
 # ---------------------------------------------------------------- proposal store
@@ -372,17 +409,31 @@ def unavailable_entry(kind: str, *, inputs_hash: str, now_us: int, reason: str, 
                        "governance": "Deterministic metrics kept; no model proposal was produced."})
 
 
+def _render(stored: dict) -> str:
+    return json.dumps(stored, indent=2, sort_keys=True, default=str) + "\n"
+
+
 def write_proposal(data_dir: Path, entry: dict, *, day: str) -> Path:
-    """Append one entry to <data-dir>/proposals/<day>.json atomically (0600)."""
+    """Append one entry to <data-dir>/proposals/<day>.json atomically (0600).
+
+    A day file never grows past MAX_PROPOSAL_FILE_BYTES: the entry then goes to the next <day>-<n>.json."""
     directory = Path(data_dir) / "proposals"
     directory.mkdir(parents=True, exist_ok=True)
-    path = directory / f"{day}.json"
+    index = 0
+    while (directory / (f"{day}-{index + 1}.json")).exists():
+        index += 1
+    path = directory / (f"{day}.json" if index == 0 else f"{day}-{index}.json")
     stored = json.loads(path.read_text()) if path.exists() else {"version": 1, "day": day, "proposals": []}
     stored["proposals"].append(entry)
+    text = _render(stored)
+    if len(text.encode()) > MAX_PROPOSAL_FILE_BYTES and len(stored["proposals"]) > 1:
+        path = directory / f"{day}-{index + 1}.json"
+        stored = {"version": 1, "day": day, "proposals": [entry]}
+        text = _render(stored)
     descriptor, name = tempfile.mkstemp(dir=directory, prefix=".proposals-")
     try:
         with os.fdopen(descriptor, "w") as handle:
-            handle.write(json.dumps(stored, indent=2, sort_keys=True, default=str) + "\n")
+            handle.write(text)
             handle.flush()
             os.fsync(handle.fileno())
         os.chmod(name, 0o600)

@@ -392,7 +392,7 @@ def review_escalations(db_path, brain, *, data_dir, batch_size: int = 25, day: s
 
 def run_nightly(data_dir, *, brain_choice: str = "deterministic", environ=None, day: str | None = None,
                 now_us: int | None = None, replay_overrides=None, escalation_batch: int = 25,
-                allow_fallback: bool = False) -> dict:
+                allow_fallback: bool = False, out_dir=None, key_file=None, fallback_models=None) -> dict:
     """Runtime nightly metrics, a diagnostic replay (no holdout look) and one BRAIN proposal, hashed together."""
     import json
     import time
@@ -402,11 +402,13 @@ def run_nightly(data_dir, *, brain_choice: str = "deterministic", environ=None, 
     from .replay import AutonomousReplay, EvaluationRunner
     from .runtime import nightly_review
     data_dir = Path(data_dir)
+    out_dir = Path(out_dir) if out_dir is not None else data_dir  # a separate rw volume in the brain role
     db_path = data_dir / "runtime.sqlite3"
     now_us = time.time_ns() // 1000 if now_us is None else now_us
-    brain, notes = ba.build_brain(brain_choice, environ=environ, allow_fallback=allow_fallback)
+    brain, notes = ba.build_brain(brain_choice, environ=environ, allow_fallback=allow_fallback, key_file=key_file,
+                                  fallback_models=fallback_models)
     # Deterministic metrics are produced first and never depend on the provider.
-    nightly = nightly_review(db_path, data_dir / "nightly", now_us=now_us, brain=DeterministicBrain(), day=day)
+    nightly = nightly_review(db_path, out_dir / "nightly", now_us=now_us, brain=DeterministicBrain(), day=day)
     day = nightly["metrics"]["day"]
     try:
         replay_report = EvaluationRunner().diagnose(
@@ -429,7 +431,7 @@ def run_nightly(data_dir, *, brain_choice: str = "deterministic", environ=None, 
     except ProviderUnavailable as exc:
         entry = ba.unavailable_entry("nightly", inputs_hash=inputs_hash, now_us=now_us, reason=str(exc),
                                      refs=[nightly["archive_hash"]], usage=_last_usage(brain))
-    ba.write_proposal(data_dir, entry, day=day)
+    ba.write_proposal(out_dir, entry, day=day)
 
     def digest(value):
         return content_hash(json.dumps(value, sort_keys=True, default=str))
@@ -450,7 +452,7 @@ def run_nightly(data_dir, *, brain_choice: str = "deterministic", environ=None, 
                           "escalations": digest(escalations), "proposal": entry["entry_hash"]}
     artifact["hashes"]["artifact"] = digest({k: v for k, v in artifact.items() if k != "hashes"} | {
         "hashes": dict(artifact["hashes"])})
-    out = data_dir / "nightly" / f"combined-{day}.json"
+    out = out_dir / "nightly" / f"combined-{day}.json"
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(artifact, indent=2, sort_keys=True, default=str) + "\n")
     return artifact
@@ -468,6 +470,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--lookback-candles", type=int, default=None)
     parser.add_argument("--brain-allow-fallback", action="store_true",
                         help="permit server-side refusal fallback to another model (off by default; served model is recorded)")
+    parser.add_argument("--brain-fallback-model", action="append", default=None,
+                        help="served model accepted under --brain-allow-fallback (repeatable; default claude-opus-4-8)")
+    parser.add_argument("--out-dir", default=None,
+                        help="write nightly/ and proposals/ here instead of the (read-only) runtime directory")
+    parser.add_argument("--brain-key-file", default=None,
+                        help="file-mounted secret holding the provider key (e.g. /run/secrets/anthropic_api_key)")
     parser.add_argument("--review-escalations", action="store_true",
                         help="also write one proposal per batch of unresolved escalations")
     args = parser.parse_args(argv)
@@ -478,13 +486,16 @@ def main(argv: list[str] | None = None) -> int:
         from pathlib import Path
         overrides = {k: v for k, v in (("horizon_candles", args.horizon_candles),
                                        ("lookback_candles", args.lookback_candles)) if v is not None}
+        out_dir = Path(args.out_dir) if args.out_dir else Path(args.data_dir)
         artifact = run_nightly(Path(args.data_dir), brain_choice=args.brain, day=args.day,
-                               replay_overrides=overrides or None, allow_fallback=args.brain_allow_fallback)
+                               replay_overrides=overrides or None, allow_fallback=args.brain_allow_fallback,
+                               out_dir=out_dir, key_file=args.brain_key_file,
+                               fallback_models=args.brain_fallback_model)
         if args.review_escalations:
             from . import brain_anthropic as ba
-            brain, _ = ba.build_brain(args.brain, allow_fallback=args.brain_allow_fallback)
-            review_escalations(Path(args.data_dir) / "runtime.sqlite3", brain, data_dir=Path(args.data_dir),
-                               day=artifact["day"])
+            brain, _ = ba.build_brain(args.brain, allow_fallback=args.brain_allow_fallback,
+                                      key_file=args.brain_key_file, fallback_models=args.brain_fallback_model)
+            review_escalations(Path(args.data_dir) / "runtime.sqlite3", brain, data_dir=out_dir, day=artifact["day"])
         print(json.dumps({"day": artifact["day"], "brain": artifact["brain"], "proposal_status": artifact["proposal"]["status"],
                           "hashes": artifact["hashes"]}, sort_keys=True))
     return 0

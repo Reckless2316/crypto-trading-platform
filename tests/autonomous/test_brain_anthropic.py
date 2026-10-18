@@ -157,6 +157,24 @@ class FallbackAndUsageTests(Fixture):
         self.assertEqual("claude-opus-4-8", result.model_id)
         self.assertTrue(brain.last_call["fallback_used"])
 
+    def test_dated_opus_ids_are_accepted_without_fallback(self):
+        result = self.review(self.brain(message(proposal(), model="claude-opus-5-5-20261001")))
+        self.assertEqual("claude-opus-5-5-20261001", result.model_id)
+        for bad in ("claude-opus-5-5x", "claude-opus-5-5-2026", "claude-opus-5"):
+            with self.subTest(bad):
+                with self.assertRaises(ProviderUnavailable):
+                    self.review(self.brain(message(proposal(), model=bad)))
+
+    def test_fallback_accepts_only_allowlisted_served_models(self):
+        with self.assertRaises(ProviderUnavailable) as caught:
+            self.review(self.brain(message(proposal(), model="claude-sonnet-5-5"), allow_fallback=True))
+        self.assertIn("UNEXPECTED_MODEL", str(caught.exception))
+        brain = self.brain(message(proposal(), model="claude-sonnet-5-5"), allow_fallback=True,
+                           fallback_models=("claude-sonnet-5-5",))
+        self.assertEqual("claude-sonnet-5-5", self.review(brain).model_id)
+        with self.assertRaises(ValueError):
+            ba.AnthropicBrain(api_key=KEY, transport=FakeTransport(), allow_fallback=True, fallback_models=("",))
+
     def test_without_fallback_a_different_served_model_is_rejected(self):
         with self.assertRaises(ProviderUnavailable) as caught:
             self.review(self.brain(message(proposal(), model="claude-opus-4-8")))
@@ -188,6 +206,37 @@ class FallbackAndUsageTests(Fixture):
         brain, _ = ba.build_brain("anthropic", environ={"ANTHROPIC_API_KEY": KEY}, transport=FakeTransport(),
                                   allow_fallback=True)
         self.assertTrue(brain.allow_fallback)
+
+
+class KeyFileTests(Fixture):
+    def write(self, name, text, mode=0o400):
+        path = self.root / name
+        path.write_text(text)
+        os.chmod(path, mode)
+        return path
+
+    def test_file_mounted_secret_enables_the_brain_without_env(self):
+        path = self.write("anthropic_api_key", KEY + "\n")
+        brain, notes = ba.build_brain("anthropic", environ={}, key_file=path, transport=FakeTransport())
+        self.assertIsInstance(brain, ba.AnthropicBrain)
+        self.assertEqual((), notes)
+        self.assertNotIn(KEY, repr(brain))
+
+    def test_missing_empty_symlinked_or_oversized_key_files_fall_back(self):
+        empty = self.write("empty", "  \n")
+        link = self.root / "link"
+        link.symlink_to(self.write("real", KEY))
+        big = self.write("big", "x" * 5000)
+        for path in (self.root / "absent", empty, link, big, self.root):
+            with self.subTest(path=path.name):
+                brain, notes = ba.build_brain("anthropic", environ={"ANTHROPIC_API_KEY": KEY}, key_file=path)
+                self.assertIsInstance(brain, DeterministicBrain)
+                self.assertIn("BRAIN_KEY_MISSING", notes)
+
+    def test_deterministic_choice_never_reads_the_key_file(self):
+        with patch.object(ba, "key_from_file", side_effect=AssertionError("read")):
+            brain, _ = ba.build_brain("deterministic", environ={}, key_file=self.root / "x")
+        self.assertIsInstance(brain, DeterministicBrain)
 
 
 class EnablementTests(Fixture):
@@ -277,6 +326,21 @@ class ProposalStoreTests(Fixture):
         names = {n.lower() for n in dir(ba)}
         for verb in ("approve", "activate", "arm", "clear", "resolve"):
             self.assertFalse(any(n.startswith(verb) for n in names), verb)
+
+
+class ProposalRolloverTests(Fixture):
+    def test_day_file_rolls_over_before_exceeding_the_cap(self):
+        result = BrainProposal("no_change", "f" * 400, "h", (ARCHIVE,), None, "claude-opus-5-5")
+        with patch.object(ba, "MAX_PROPOSAL_FILE_BYTES", 3_000):
+            paths = [ba.write_proposal(self.root, ba.proposal_entry(result, kind="nightly", inputs_hash="b" * 64,
+                                                                     now_us=i), day="2026-10-17") for i in range(6)]
+        names = [p.name for p in paths]
+        self.assertEqual("2026-10-17.json", names[0])
+        self.assertIn("2026-10-17-1.json", names)
+        for path in set(paths):
+            self.assertLessEqual(path.stat().st_size, 3_000)
+        stored = [e["created_us"] for p in sorted(set(paths)) for e in json.loads(p.read_text())["proposals"]]
+        self.assertEqual(sorted(stored), list(range(6)))
 
 
 class EscalationReviewTests(Fixture):
@@ -370,6 +434,20 @@ class NightlyCliTests(Fixture):
         text = json.dumps(outage)
         self.assertNotIn(KEY, text)
         self.assertNotIn(KEY, (directory / "proposals" / "2026-10-17.json").read_text())
+
+    def test_out_dir_keeps_brain_writes_off_the_runtime_volume(self):
+        from bot.autonomous.nightly import run_nightly
+        directory = self.make_data_dir()
+        out = self.root / "brain-out"
+        outputs = lambda: sorted(p.name for p in directory.iterdir() if not p.name.endswith(("-shm", "-wal")))
+        before = outputs()  # SQLite's own WAL sidecars are not brain outputs
+        artifact = run_nightly(directory, brain_choice="deterministic", environ={}, day="2026-10-17",
+                               now_us=1_792_281_600_000_000, out_dir=out,
+                               replay_overrides=dict(horizon_candles=5, lookback_candles=20))
+        self.assertTrue((out / "proposals" / "2026-10-17.json").exists())
+        self.assertTrue((out / "nightly" / "combined-2026-10-17.json").exists())
+        self.assertEqual(before, outputs())
+        self.assertEqual("deterministic", artifact["brain"]["used"])
 
     def test_cli_entrypoint(self):
         from bot.autonomous.nightly import main

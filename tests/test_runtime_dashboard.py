@@ -87,6 +87,42 @@ class RuntimeDashboardTests(unittest.TestCase):
         self.assertEqual(before, after)
         self.assertEqual(405, self.client.post("/api/autonomous/proposals").status_code)
 
+    def test_proposals_dir_can_be_a_separate_read_only_mount(self):
+        other = Path(self.tmp.name) / "brain-out" / "proposals"
+        other.mkdir(parents=True)
+        (other / "2026-10-17.json").write_text(json.dumps({"proposals": [self.entry("PENDING_OPERATOR_REVIEW", 9)]}))
+        with patch.dict(os.environ, {"AUTONOMOUS_PROPOSALS_DIR": str(other)}):
+            self.assertEqual([9], [p["created_us"] for p in self.client.get("/api/autonomous/proposals").json()["pending"]])
+
+    def test_bad_files_never_500_the_endpoint(self):
+        directory = Path(self.tmp.name) / "proposals"
+        directory.mkdir()
+        (directory / "2026-10-14.json").write_text("[" * 200_000 + "]" * 200_000)  # RecursionError in json
+        (directory / "2026-10-13.json").write_text(json.dumps({"proposals": ["x", 1, {"status": 3}]}))
+        (directory / "2026-10-12.json").write_text(json.dumps([1, 2]))
+        target = Path(self.tmp.name) / "elsewhere.json"
+        target.write_text(json.dumps({"proposals": [self.entry("PENDING_OPERATOR_REVIEW", 5)]}))
+        (directory / "2026-10-11.json").symlink_to(target)
+        self.write_proposals("2026-10-17-1", [self.entry("PENDING_OPERATOR_REVIEW", 7)])
+        reply = self.client.get("/api/autonomous/proposals")
+        self.assertEqual(200, reply.status_code)
+        body = reply.json()
+        self.assertEqual([7], [p["created_us"] for p in body["pending"]])  # rollover files are read
+        self.assertIn("2026-10-14.json", body["unreadable"])
+        self.assertIn("2026-10-12.json", body["unreadable"])
+        self.assertIn("2026-10-11.json", body["unreadable"])  # symlinks are refused
+
+    def test_directory_listing_is_bounded(self):
+        directory = Path(self.tmp.name) / "proposals"
+        directory.mkdir()
+        for i in range(30):
+            (directory / f"junk-{i}.txt").write_text("x")
+        self.write_proposals("2026-10-17", [self.entry("PENDING_OPERATOR_REVIEW", 1)])
+        with patch.object(platform_app, "_PROPOSAL_SCAN_LIMIT", 10):
+            body = self.client.get("/api/autonomous/proposals").json()
+        self.assertTrue(body["scan_truncated"])
+        self.assertLessEqual(len(body["pending"]), 1)
+
     def test_no_proposals_directory_and_oversized_file(self):
         self.assertEqual([], self.client.get("/api/autonomous/proposals").json()["pending"])
         directory = Path(self.tmp.name) / "proposals"
@@ -104,6 +140,8 @@ class RuntimeDashboardTests(unittest.TestCase):
         self.assertIn("textContent", block)
         self.assertNotIn("innerHTML", block)
         self.assertIn('id="runtimeProposals"', source)
+        # A proposals failure must not blank the runtime panel: the fetch has its own try/catch.
+        self.assertIn("try{const pr=await api('/api/autonomous/proposals')", block)
 
 
 if __name__ == "__main__":

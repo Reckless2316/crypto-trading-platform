@@ -1,58 +1,76 @@
-# Autonomous PAPER runtime overlay. Use it only together with the base file:
+# Autonomous PAPER deployment overlay: four roles. Use it only together with the base file:
 #   docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.autonomous.yml --project-directory . config
-# Runbook: docs/runbooks/autonomous-paper.md
+# Runbook: docs/runbooks/autonomous-paper.md ("Four-role deployment").
 #
-# Safety contract (verified statically by tests/test_autonomous_deployment.py):
-#   - the runtime is paper-only (`--paper`, no `--arm-paper` by default) and gets NO venue/provider secrets;
-#   - it runs as the non-root image user with a read-only root filesystem, all capabilities dropped,
-#     and exactly one writable volume (the runtime data dir);
-#   - it publishes no ports and sits on its own egress-only network (public Coinbase books), not the dashboard's;
-#   - the dashboard gets that volume READ-ONLY and reads status.json via AUTONOMOUS_RUNTIME_DIR.
+# Roles (verified statically by tests/test_autonomous_deployment.py):
+#   surge-paper-runtime  AUTHORITY  ledger-mode paper runtime. Owns the runtime volume (rw: runtime.sqlite3,
+#                                   ledger.sqlite3, control/ socket + sessions + journal). No secrets.
+#   surge-reflex         REFLEX     profile `jev`, no volume, JEV_API_KEY only as the file secret jev_api_key.
+#                                   HANDOFF: refuses to start until a separate REFLEX process exists.
+#   surge-brain          BRAIN      profile `brain`, nightly job. Runtime volume READ-ONLY, its own output volume rw,
+#                                   ANTHROPIC key only as the file secret anthropic_api_key.
+#   surge-dashboard      DASHBOARD  runtime volume read-only (status, control socket, issued sessions), brain output
+#                                   read-only, its own state volume rw (nonce store, display DB). No secrets.
+#                                   Host network so uvicorn binds 127.0.0.1 on the host only (no published ports).
+# Every secret is file-mounted into exactly one role; no role receives a secret through its environment.
+# The legacy env-configured `surge` dashboard from the base file is profile-gated (`legacy-display`) off.
 # Deploying this overlay never arms paper fills and cannot arm live trading.
 #
-# HANDOFF(claude-opus-5.5 2026-10-17): the plan's four-role split (authority / reflex / brain / dashboard with
-# file-mounted, role-specific secrets) is not packaged here. This overlay packages only the credential-free
-# paper runtime that exists today. `--reflex jev` is deliberately unsupported in this container (no JEV_API_KEY);
-# it needs a separate REFLEX role with a Docker secret once Tasks 13/18 land.
+# HANDOFF(claude-opus-5.5 2026-10-18): (1) REFLEX runs in-process inside the runtime today (JevReflex reads
+# JEV_API_KEY from the runtime's environment), so the reflex role only reserves its secret and refuses to run;
+# `--reflex jev` stays unsupported in the authority container. (2) Read-only consumers open the runtime's WAL
+# database with mode=ro on a read-only volume; verify against a live authority that SQLite can use the
+# existing -shm (it cannot create one there). (3) Docker host networking must be enabled on Docker Desktop.
+
+x-hardening: &hardening
+  image: surge-paper:local
+  pull_policy: never
+  user: surge
+  working_dir: /app
+  read_only: true
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "5"
 
 services:
   surge:
+    # Legacy display dashboard from the base file: it carries env-configured venue settings, so it is not part of
+    # the role deployment. Start it only explicitly with `--profile legacy-display`.
+    profiles: ["legacy-display"]
     environment:
       AUTONOMOUS_RUNTIME_DIR: /var/lib/surge-runtime/runtime
     volumes:
       - autonomous-runtime:/var/lib/surge-runtime:ro
 
   surge-paper-runtime:
-    # Same image the base `surge` service builds; never pulled from a registry.
+    # AUTHORITY. Same image the base `surge` service builds; never pulled from a registry.
     # Build first: docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.autonomous.yml --project-directory . build surge
-    image: surge-paper:local
-    pull_policy: never
+    <<: *hardening
     container_name: surge-paper-runtime
     # A STOP-file exit is a clean exit (code 0) and must stay stopped; crashes restart.
     restart: on-failure
-    user: surge
-    working_dir: /app
     # Mirrors deploy/autonomous/surge-paper-runtime.service: clear a stale STOP, keep KILL.
     entrypoint: ["/bin/sh", "-c"]
     command:
-      - rm -f /var/lib/surge/runtime/STOP && exec python -m bot.autonomous.runtime --paper --data-dir /var/lib/surge/runtime
+      - rm -f /var/lib/surge/runtime/STOP && exec python -m bot.autonomous.runtime --paper --accounting ledger --data-dir /var/lib/surge/runtime
     environment:
       PYTHONDONTWRITEBYTECODE: "1"
       PYTHONUNBUFFERED: "1"
       HOME: /tmp
       TZ: UTC
     # /var/lib/surge exists in the image owned by `surge`, so a fresh named volume inherits that ownership.
-    # This volume is the runtime's ONLY writable path (runtime.sqlite3, ledger.sqlite3, public_calls.sqlite3,
-    # status.json, reviews/, STOP, KILL, jev_schema.*.json). It is not the dashboard's surge-data volume.
+    # The runtime's ONLY writable path: runtime.sqlite3, ledger.sqlite3, public_calls.sqlite3, status.json,
+    # control/ (0700: control.sock, sessions/, journal/), reviews/, STOP, KILL, jev_schema.*.json.
     volumes:
       - autonomous-runtime:/var/lib/surge
-    read_only: true
     tmpfs:
       - /tmp:size=16m,mode=1777
-    security_opt:
-      - no-new-privileges:true
-    cap_drop:
-      - ALL
     networks:
       - autonomous-egress
     # SIGINT runs the runtime's `finally: runtime.close()`; SQLite commits are atomic either way.
@@ -69,15 +87,89 @@ services:
       timeout: 5s
       retries: 3
       start_period: 180s
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "5"
+
+  surge-reflex:
+    # REFLEX. Opt-in only (`--profile jev`). No volume; the Jev key exists only as this role's file secret.
+    <<: *hardening
+    profiles: ["jev"]
+    container_name: surge-reflex
+    restart: "no"
+    entrypoint: ["python", "-c"]
+    command:
+      - "import sys; sys.exit('HANDOFF(claude-opus-5.5 2026-10-18): no separate REFLEX process exists yet; the runtime calls Jev in-process. This role is reserved and refuses to start.')"
+    secrets:
+      - jev_api_key
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    networks:
+      - reflex-egress
+
+  surge-brain:
+    # BRAIN. Opt-in only (`--profile brain`); run once per night (e.g. `docker compose ... --profile brain run --rm surge-brain`).
+    # Reads the runtime READ-ONLY; writes proposals and nightly artifacts only to its own volume; proposal-only.
+    <<: *hardening
+    profiles: ["brain"]
+    container_name: surge-brain
+    restart: "no"
+    entrypoint: ["python", "-m", "bot.autonomous.nightly"]
+    command: ["--data-dir", "/var/lib/surge-runtime/runtime", "--out-dir", "/var/lib/surge/brain",
+              "--brain", "anthropic", "--brain-key-file", "/run/secrets/anthropic_api_key"]
+    environment:
+      PYTHONDONTWRITEBYTECODE: "1"
+      PYTHONUNBUFFERED: "1"
+      HOME: /tmp
+      TZ: UTC
+    secrets:
+      - anthropic_api_key
+    volumes:
+      - autonomous-runtime:/var/lib/surge-runtime:ro
+      - autonomous-brain:/var/lib/surge
+    tmpfs:
+      - /tmp:size=512m,mode=1777  # the diagnostic replay rebuilds a throwaway runtime database here
+    networks:
+      - brain-egress
+
+  surge-dashboard:
+    # DASHBOARD. Authenticated forwarding to the authority's control socket; no secrets, no published ports.
+    <<: *hardening
+    container_name: surge-dashboard
+    restart: unless-stopped
+    network_mode: host
+    entrypoint: ["python", "-m", "dashboard.launch"]
+    command: ["--runtime-dir", "/var/lib/surge-runtime/runtime",
+              "--session-dir", "/var/lib/surge-runtime/runtime/control/sessions",
+              "--state-dir", "/var/lib/surge/dashboard", "--host", "127.0.0.1", "--port", "8000"]
+    environment:
+      PYTHONDONTWRITEBYTECODE: "1"
+      PYTHONUNBUFFERED: "1"
+      HOME: /tmp
+      TZ: UTC
+      SURGE_DB_PATH: /var/lib/surge/surge.sqlite3
+      AUTONOMOUS_RUNTIME_DIR: /var/lib/surge-runtime/runtime
+      AUTONOMOUS_PROPOSALS_DIR: /var/lib/surge-brain/brain/proposals
+    volumes:
+      - autonomous-runtime:/var/lib/surge-runtime:ro
+      - autonomous-brain:/var/lib/surge-brain:ro
+      - dashboard-state:/var/lib/surge
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+
+secrets:
+  # Operator-provisioned files (never committed; see deploy/autonomous/secrets/.gitignore).
+  jev_api_key:
+    file: ./deploy/autonomous/secrets/jev_api_key
+  anthropic_api_key:
+    file: ./deploy/autonomous/secrets/anthropic_api_key
 
 networks:
   autonomous-egress:
     driver: bridge
+  reflex-egress:
+    driver: bridge
+  brain-egress:
+    driver: bridge
 
 volumes:
   autonomous-runtime:
+  autonomous-brain:
+  dashboard-state:

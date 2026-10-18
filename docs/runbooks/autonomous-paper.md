@@ -223,6 +223,54 @@ Rollback: `touch STOP`, check out the previous commit or image, restore the pre-
 changed, then start. The runtime checks its metadata binding on open. A mismatch fails loudly instead of
 silently mixing cohorts.
 
+## 11. Four-role deployment
+
+The compose overlay splits the paper deployment into four roles. Each role sees only its own secret, and
+every secret is a file mounted into exactly one role. No role gets a secret through its environment.
+
+| Role | Service | Starts | Mounts | Secret |
+|---|---|---|---|---|
+| Authority | `surge-paper-runtime` (`--accounting ledger`) | always | `autonomous-runtime` rw (databases, `control/` socket, sessions, journal) | none |
+| Reflex | `surge-reflex` | `--profile jev` | none | `jev_api_key` |
+| Brain | `surge-brain` (nightly, proposal-only) | `--profile brain` | runtime **read-only**, `autonomous-brain` rw | `anthropic_api_key` |
+| Dashboard | `surge-dashboard` (`python -m dashboard.launch`) | always | runtime read-only, brain output read-only, `dashboard-state` rw | none |
+
+The legacy env-configured `surge` dashboard from the base file only starts with `--profile legacy-display`.
+
+**Secrets.** Put each key in its own file under `deploy/autonomous/secrets/` (the directory is git-ignored),
+readable by the container user, and never paste keys into chat, logs or committed files:
+
+```bash
+install -m 0440 /dev/stdin deploy/autonomous/secrets/anthropic_api_key   # paste the key, then Ctrl-D
+install -m 0440 /dev/stdin deploy/autonomous/secrets/jev_api_key
+```
+
+**Authority and dashboard.** Start the authority, then issue a dedicated operator session for the dashboard
+(sessions last at most one hour; reissue and restart the dashboard to renew). The boot id is the
+authority's (`runtime-boot` by default):
+
+```bash
+$C up -d surge-paper-runtime
+$C exec surge-paper-runtime python -m bot.autonomous.control issue-session --role operator \
+   --actor operator:you --account runtime-paper --mode paper --boot-id runtime-boot \
+   --dir /var/lib/surge/runtime/control/sessions --ttl-s 3600
+$C up -d surge-dashboard
+$C logs surge-dashboard | grep '#bootstrap='     # open that URL once; the token is single-use
+```
+
+`dashboard.launch` binds `127.0.0.1` only (host network, no published ports), refuses a missing or
+loose-permission session file, reads the control epoch with one status request at start, and prints the
+one-time `http://127.0.0.1:8000/#bootstrap=<token>` URL. The page exchanges the token for an HttpOnly
+SameSite=Strict cookie and removes it from the address bar. Host equivalent:
+`.venv/bin/python -m dashboard.launch --runtime-dir "$D" --session-file <issued file> --port 8000`.
+
+**Brain (nightly).** `$C --profile brain run --rm surge-brain` reads the runtime read-only and writes
+`brain/proposals/<day>.json` and `brain/nightly/combined-<day>.json` on its own volume. Proposals are
+PENDING operator review and are never applied. Without a key file it falls back to deterministic metrics.
+
+**Reflex.** `--profile jev` only reserves the Jev secret: a separate REFLEX process does not exist yet, so the
+service refuses to start (`HANDOFF` in the overlay). Jev still runs only as described in section 9.
+
 ## Live trading gate
 
 **Live trading is not available from this runtime, this overlay, these units or CI.** `--paper` is required

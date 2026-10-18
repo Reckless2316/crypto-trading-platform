@@ -229,6 +229,25 @@ class AuthorityGateway:
         self.nonce_store = nonce_store
         self.monotonic_ns = monotonic_ns
         self._lock = threading.Lock()
+        self.control_epoch: int | None = None  # last epoch confirmed by a completed authority reply
+
+    def probe_status(self, epoch: int) -> tuple[dict | None, str | None]:
+        """One authenticated status read (one nonce) to confirm the authority epoch. Never retries or guesses."""
+        session = next((s for s in self.sessions.values() if s.role == 'operator'), None) or next(iter(self.sessions.values()))
+        request_id = 'launch-status-' + uuid.uuid4().hex
+        try:
+            raw = self._envelope(session, request_id, 'status', epoch, {})
+        except HTTPException as exc:
+            return None, f'AUTHORITY_UNAVAILABLE:{exc.detail}'
+        try:
+            reply = self.client.request(raw)
+            self._validate_reply(reply, request_id)
+        except Exception as exc:  # unavailable socket, protocol failure or unbound reply
+            return None, 'AUTHORITY_UNAVAILABLE:' + type(exc).__name__
+        if reply['status'] == 'completed':
+            self.control_epoch = reply['control_epoch']
+            return reply, None
+        return reply, 'EPOCH_UNKNOWN:' + ','.join(reply['reason_codes'] or ['REJECTED'])
 
     def session_alive(self, session, now=None):
         now = self.monotonic_ns() if now is None else now
@@ -341,6 +360,8 @@ class AuthorityGateway:
             self._validate_reply(reply, request_id)
         except (ValueError, TypeError):
             return _unknown(request_id)
+        if reply['status'] == 'completed':
+            self.control_epoch = reply['control_epoch']
         if reply['status'] == 'rejected' and 'HANDLER_UNAVAILABLE' in reply['reason_codes']:
             receipt, code = 'unavailable', 409
         else:

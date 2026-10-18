@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import sqlite3
+import stat
 import time
 from contextlib import closing
 from datetime import datetime, timezone, timedelta
@@ -95,7 +96,7 @@ def bootstrap_session(request: Request, body: BootstrapRequest):
         raise HTTPException(503, 'Authority gateway unavailable')
     session = gateway.bootstrap(request, body.token)
     result = JSONResponse({'actor': session.actor, 'role': session.role,
-        'csrf_token': session.csrf_token})
+        'csrf_token': session.csrf_token, 'control_epoch': gateway.control_epoch})
     set_session_cookie(result, session)
     return result
 
@@ -105,7 +106,7 @@ def browser_session(request: Request):
     gateway = gateway_for(request)
     session = gateway.authenticate(request)
     result = JSONResponse({'actor': session.actor, 'role': session.role,
-        'csrf_token': session.csrf_token})
+        'csrf_token': session.csrf_token, 'control_epoch': gateway.control_epoch})
     set_session_cookie(result, session)
     return result
 
@@ -370,7 +371,8 @@ def autonomous_runtime():
 
 
 MAX_PROPOSAL_FILE_BYTES = 2_097_152
-_PROPOSAL_DAYS = 14
+_PROPOSAL_FILES = 32  # newest day files (rollover parts included) that are read
+_PROPOSAL_SCAN_LIMIT = 2_000  # directory entries examined before sorting
 _PROPOSAL_LIMIT = 50
 
 
@@ -396,23 +398,42 @@ def _ledger_projection(ledger) -> dict | None:
 
 @app.get("/api/autonomous/proposals")
 def autonomous_proposals():
-    """Pending BRAIN proposals from <runtime-dir>/proposals/*.json. Read-only; nothing here approves or applies."""
+    """Pending BRAIN proposals from <runtime-dir>/proposals/*.json. Read-only; nothing here approves or applies.
+
+    One bad file (oversized, symlinked, unparsable, wrong shape) is listed as unreadable and never fails the
+    endpoint; the directory scan is bounded before sorting."""
     import re
-    directory = _runtime_dir() / "proposals"
+    directory = Path(os.environ["AUTONOMOUS_PROPOSALS_DIR"]) if os.environ.get("AUTONOMOUS_PROPOSALS_DIR") \
+        else _runtime_dir() / "proposals"
     pending, unreadable, counts = [], [], {"pending": 0, "provider_unavailable": 0}
-    files = sorted((p for p in directory.glob("*.json") if re.fullmatch(r"\d{4}-\d{2}-\d{2}\.json", p.name)),
-                   reverse=True)[:_PROPOSAL_DAYS] if directory.is_dir() else []
-    for path in files:
+    names, truncated = [], False
+    pattern = re.compile(r"(\d{4}-\d{2}-\d{2})(?:-(\d{1,6}))?\.json")
+    try:
+        if directory.is_dir() and not directory.is_symlink():
+            with os.scandir(directory) as entries:
+                for count, entry in enumerate(entries):
+                    if count >= _PROPOSAL_SCAN_LIMIT:
+                        truncated = True
+                        break
+                    match = pattern.fullmatch(entry.name)
+                    if match:
+                        names.append(((match.group(1), int(match.group(2) or 0)), entry.name))
+    except OSError:
+        unreadable.append(directory.name)
+    for _, name in sorted(names, reverse=True)[:_PROPOSAL_FILES]:
+        path = directory / name
         try:
-            if path.stat().st_size > MAX_PROPOSAL_FILE_BYTES:
-                raise ValueError("oversized")
-            with path.open("rb") as handle:
+            descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+            with os.fdopen(descriptor, "rb") as handle:
+                info = os.fstat(handle.fileno())
+                if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_PROPOSAL_FILE_BYTES:
+                    raise ValueError("oversized or not a regular file")
                 stored = json.loads(handle.read(MAX_PROPOSAL_FILE_BYTES + 1))
             entries = stored["proposals"]
             if not isinstance(entries, list):
                 raise ValueError("invalid")
-        except (OSError, ValueError, KeyError, TypeError):
-            unreadable.append(path.name)
+        except Exception:  # includes RecursionError, ELOOP for symlinks and wrong shapes
+            unreadable.append(name)
             continue
         for entry in entries:
             if not isinstance(entry, dict):
@@ -425,7 +446,8 @@ def autonomous_proposals():
             counts["pending"] += 1
             proposal = entry["proposal"]
             usage = entry.get("usage") if isinstance(entry.get("usage"), dict) else None
-            pending.append({"day": path.stem, "kind": entry.get("kind"), "created_us": entry.get("created_us"),
+            pending.append({"day": pattern.fullmatch(name).group(1), "kind": entry.get("kind"),
+                            "created_us": entry.get("created_us"),
                             "created_utc": _utc(entry.get("created_us")), "entry_hash": entry.get("entry_hash"),
                             "model_id": proposal.get("model_id"), "action": proposal.get("action"),
                             "finding": proposal.get("finding"), "hypothesis": proposal.get("hypothesis"),
@@ -433,7 +455,8 @@ def autonomous_proposals():
                             "usage": usage and {k: usage.get(k) for k in ("input_tokens", "output_tokens")},
                             "approved": False})
     pending.sort(key=lambda p: p["created_us"] if type(p["created_us"]) is int else -1, reverse=True)
-    return {"pending": pending[:_PROPOSAL_LIMIT], "counts": counts, "unreadable": unreadable,
+    return {"pending": pending[:_PROPOSAL_LIMIT], "counts": counts, "unreadable": sorted(unreadable),
+            "scan_truncated": truncated,
             "governance": "Proposals only: operator review required; nothing here approves or applies."}
 
 
