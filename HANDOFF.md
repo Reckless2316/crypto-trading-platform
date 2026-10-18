@@ -12,7 +12,7 @@ Signed: `HANDOFF(claude-opus-5.5 2026-10-17)`. Search the tree for `HANDOFF(` to
 - `GET /api/autonomous/runtime` read model, plus `deploy/autonomous/` systemd units (not installed).
 
 ## Next for Cursor (in order)
-1. Wire JevClient behind an activated release bundle (Task 15).
+1. Jev adapter is wired (`bot/autonomous/jev_reflex.py`); next is an authenticated evaluation with the operator's key and approved schema, plus tokenizer proof.
 2. Route runtime paper orders through OrderAuthority/Ledger (Tasks 12/16).
 3. Verified MarketRules; labels that include spread and slippage.
 4. Latch clearing and kill via the authenticated control socket (Tasks 14/17).

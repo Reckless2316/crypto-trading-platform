@@ -14,12 +14,14 @@
 | `2c294cb` | Preserved untracked Codex live_venue/release/dashboard-authority WIP (NOT ACCEPTED) |
 | `a0001ca` | Public Coinbase product rules (adverse rounding), executable-price labels net of fees, per-regime cohorts |
 | `1f2b02d` | Review fixes: rules outages never block exits, dust frees the slot, short label math, schema runtime-v3 |
+| `4b98194` | Inert Jev REFLEX adapter: one batched typed call per cycle, approved-schema hash gate, fail-safe REFLEX_UNAVAILABLE holds |
+| `1eaf7ca` | Review fixes: hard wall-clock Jev deadline, streamed size bound, post-reflex book freshness, Brier by reflex |
 
-Verification: the full suite passes (`.venv/bin/python -m unittest discover -s tests`, 652 tests on Python 3.14). Two independent contrarian reviews: the first found 6 Important issues; the re-review passed all 6 and found 2 regressions, both now fixed. The live paper process is running against public Coinbase books and accumulating contiguous minute snapshots.
+Verification: the full suite passes (`.venv/bin/python -m unittest discover -s tests`, 680 tests on Python 3.14). Two independent contrarian reviews: the first found 6 Important issues; the re-review passed all 6 and found 2 regressions, both now fixed. The live paper process is running against public Coinbase books and accumulating contiguous minute snapshots.
 
 ## Loop (one cycle per minute close)
 1. **State (code):** public L2 book → mid, spread, imbalance, realized vol, momentum, inventory, drawdown. Observations after the cutoff are rejected, features require contiguous candles, and the snapshot is about 60–70 *estimated* tokens (bytes/3, not a provider tokenizer), well under the 400 limit.
-2. **REFLEX:** `OfflineReflex` (`offline-reflex-v1`, UNCALIBRATED, deterministic rules). Jev is not wired yet: `JevClient` needs an approved release bundle and schema resolver (Task 15).
+2. **REFLEX:** default `OfflineReflex` (`offline-reflex-v1`, UNCALIBRATED). Jev is `--reflex jev`: it needs `JEV_API_KEY` plus the operator copying `jev_schema.proposed.json` (from `--write-jev-schema`) to `jev_schema.approved.json`. Any failure holds entries; there is no silent fallback. Cohorts are separated by `reflex_id`. Never exercised against the real provider.
 3. **Gate (code):** `policy.entry_gate`: quality ≥ 2, confidence > 0.80 (exactly 0.80 refuses), risk_state safe, not toxic, long only.
 4. **Escalation:** confidence < 0.60 or crisis writes a durable row for BRAIN review. Crisis sets an operator-only latch. Escalation blocks entries only, and code exits always run.
 5. **Sizing:** quarter-Kelly `kelly_loss_budget` from Wilson-lower calibrated p on gate-open resolved labels. Below 100 labels p is 0.5 and size is 0. Notional is capped to position room and cash. Negative edge holds.
@@ -38,7 +40,7 @@ Verification: the full suite passes (`.venv/bin/python -m unittest discover -s t
 - **Candidates:** AAVE, HYPE, PENDLE, AERO, LDO and ONDO remain unqualified hypotheses. Float, comparable net revenue, holder concentration and executable depth are not proven. No metric is filled with an estimate. An empty eligible universe is the correct output.
 
 ## Remaining (ordered)
-1. Wire `JevClient` behind an activated release bundle (Task 15). Keep the offline reflex as the fallback.
+1. Authenticated Jev evaluation: tokenizer proof of the 400-token budget, measured latency, and calibration of Jev cohorts (operator supplies the key and approves the schema).
 2. Route runtime paper orders through `OrderAuthority`/`Ledger` so paper and live share one accounting path (Tasks 12/16).
 3. Use verified per-instrument `MarketRules`. Labels should account for spread and slippage, with per-regime cohorts.
 4. Operator latch clearing and kill via the authenticated `control.py` socket, not files (Tasks 14/17).
