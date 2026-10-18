@@ -85,10 +85,51 @@ class LiveVenueTests(unittest.TestCase):
         self.assertEqual('order-1', result.order_evidence.reference.venue_order_id)
         self.assertIs(self.venue, result.order_evidence.sources[0].issuer)
         self.assertEqual('BTC/USD', self.client.calls[0][1][0])
+        # A second dispatch of the same client order ID never reaches the venue.
+        from bot.live_coinbase_adapter import LiveTradingRejected
+        with self.assertRaises(LiveTradingRejected):
+            self.venue.submit(self.intent, None, self.market)
+        self.assertEqual(1, len(self.client.calls))
+
+    def fresh_venue(self):
+        return self.m.LiveVenue(self.transport, portfolio_id='portfolio-1',
+            market_source=lambda _: self.market, clock_us=lambda: self.now,
+            monotonic_ns=lambda: self.mono, max_pages=5, page_size=2)
+
+    def test_submit_timeout_after_acceptance_propagates_once_and_blocks_resubmit(self):
+        from bot.live_coinbase_adapter import LiveTradingRejected
         self.client.failure = TimeoutError('accepted then timed out')
         with self.assertRaises(TimeoutError):
             self.venue.submit(self.intent, None, self.market)
-        self.assertEqual(2, len(self.client.calls))
+        self.assertEqual(1, len(self.client.calls))
+        # The outcome is UNKNOWN: a retry of the same intent is refused locally.
+        self.client.failure = None
+        with self.assertRaises(LiveTradingRejected):
+            self.venue.submit(self.intent, None, self.market)
+        self.assertEqual(1, len(self.client.calls))
+
+    def test_submit_disables_sdk_retries_and_bounds_timeout_by_intent_deadline(self):
+        seen = []
+        original = FakeCoinbase.create_order
+        def create(*args):
+            seen.append((self.client.timeout, self.client.maxRetriesOnFailure))
+            return original(self.client, *args)
+        self.client.create_order = create
+        self.client.maxRetriesOnFailure = 3
+        self.venue.submit(self.intent, None, self.market)
+        timeout, retries = seen[0]
+        self.assertEqual(0, retries)
+        remaining_ms = (self.intent.proposal.deadline_mono_ns - self.mono) // 1_000_000
+        self.assertTrue(1 <= timeout <= max(1, min(10_000, remaining_ms)), timeout)
+        self.assertEqual((30_000, 3), (self.client.timeout, self.client.maxRetriesOnFailure))
+
+    def test_submit_restores_sdk_settings_after_failure(self):
+        self.client.maxRetriesOnFailure = 2
+        self.client.failure = OSError('reset after send')
+        with self.assertRaises(OSError):
+            self.fresh_venue().submit(self.intent, None, self.market)
+        self.assertEqual((30_000, 2), (self.client.timeout, self.client.maxRetriesOnFailure))
+        self.assertEqual(1, len(self.client.calls))
 
     def test_submit_mismatched_client_id_is_not_acknowledged(self):
         self.client.create_order = lambda *a: {'id': 'foreign', 'clientOrderId': 'foreign'}

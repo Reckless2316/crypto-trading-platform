@@ -19,6 +19,16 @@ Every response is issuer-bound source evidence for a future authenticated ledger
 importer. That importer must check issuer identity, source-account binding and raw
 hashes, and verify terminal quantities/fees against fills/balances/transfers.
 No record in this module authorizes reservation release or creates a journal.
+
+HANDOFF(claude-opus-5.5 2026-10-17): still missing for Task 13 acceptance --
+(1) transfers/deposits are never read, so balance reconciliation cannot be
+complete and `reconciliation_ready` is always False; (2) no source yields
+`fees_final=True`, so `reservation_releasable` can never pass from this module;
+(3) the single-dispatch guard is in-process only; the durable cross-restart
+guard is the authority's DISPATCHING/UNKNOWN ledger state (execution.py);
+(4) payload size is checked after the SDK has buffered the response, so memory
+is bounded only by the SDK/HTTP layer; (5) the execution.py/ledger importer
+that turns this evidence into journals and releases capacity is not wired.
 """
 from __future__ import annotations
 
@@ -228,6 +238,10 @@ class LiveVenue:
         self.account_id, self.portfolio_id = transport.account_id, _id(portfolio_id)
         self.market_source, self.clock_us, self.monotonic_ns = market_source, clock_us, monotonic_ns
         self.max_pages, self.page_size = max_pages, page_size
+        # Client order IDs this instance has attempted to dispatch. One attempt
+        # per ID: a later call is refused before the transport, whatever the
+        # outcome of the first (accepted, rejected or UNKNOWN).
+        self._dispatched: set[str] = set()
 
     def market_rules(self, instrument):
         rules = self.market_source(_instrument(instrument))
@@ -346,8 +360,27 @@ class LiveVenue:
     def submit(self, intent, book, market):
         # Existing authority protocol compatibility. The causal book/risk checks
         # are owned by OrderAuthority; this boundary cannot substitute a book.
-        requested = self.clock_us()
-        raw = self.transport.submit_prepared(intent, market)
+        client_order_id = getattr(intent, 'client_order_id', None)
+        deadline = getattr(getattr(intent, 'proposal', None), 'deadline_mono_ns', None)
+        if type(client_order_id) is not str or not client_order_id or type(deadline) is not int:
+            raise LiveTradingRejected('Typed prepared intent required')
+        with self.transport.client_lock:
+            if client_order_id in self._dispatched:
+                raise LiveTradingRejected('Client order ID already dispatched; reconcile, never resubmit')
+            self._dispatched.add(client_order_id)
+            # The SDK must never retry the effectful call, and its timeout is
+            # bounded by the intent deadline (<=10s). Any exception propagates:
+            # the authority records UNKNOWN and keeps the reservation.
+            old_timeout = getattr(self.client, 'timeout', 10_000)
+            old_retries = getattr(self.client, 'maxRetriesOnFailure', 0)
+            try:
+                remaining = deadline - self.monotonic_ns()
+                self.client.timeout = max(1, min(10_000, remaining // 1_000_000))
+                self.client.maxRetriesOnFailure = 0
+                requested = self.clock_us()
+                raw = self.transport.submit_prepared(intent, market)
+            finally:
+                self.client.timeout, self.client.maxRetriesOnFailure = old_timeout, old_retries
         source = self._source('create_order', raw, requested)
         reference = OrderReference(self.account_id, intent.intent_id, intent.client_order_id)
         raw_info = raw.get('info') if type(raw) is dict else None

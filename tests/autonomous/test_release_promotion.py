@@ -159,5 +159,145 @@ class ReleasePromotionTests(unittest.TestCase):
         self.rejected(self.validate(artifacts=(*self.artifacts, self.artifacts[0])), 'ARTIFACT_SET_MISMATCH')
 
 
+class ReleaseActivationTests(ReleasePromotionTests):
+    """Operator-authenticated, boundary-atomic activation that never resets history."""
+
+    HOUR = 3_600_000_000
+
+    def setUp(self):
+        super().setUp()
+        import os
+        from bot.autonomous.control import ControlSession, PeerCredentials
+        self.ControlSession, self.Peer = ControlSession, PeerCredentials
+        self.operator = ControlSession('op-session', 'operator:alice', 'operator', 'paper-test', 'paper',
+            'boot', 'token', PeerCredentials(os.getpid(), os.getuid(), os.getgid()), 10**12, {'n': 10**12})
+        self.state = self.r.ActivationState(account_id='paper-test', active=None, armed=False, reconciled=True,
+            unknown_intent_ids=(), pending_action_keys=('action-1',), in_flight_judgment_ids=('judgment-1',),
+            risk_latches=('drawdown:latched', 'review:incident-7'), history=(), boundary_in_progress=False)
+
+    def activate(self, **overrides):
+        args = dict(bundle=self.bundle, approvals=self.approvals, artifacts=self.artifacts,
+            verifier=self.verifier, now_us=self.now, state=self.state, session=self.operator,
+            boundary_us=self.HOUR)
+        args.update(overrides)
+        return self.r.plan_activation(**args)
+
+    def test_operator_activation_is_atomic_at_next_boundary_and_preserves_history(self):
+        self.bundle = replace(self.bundle, expires_at_us=self.HOUR + 900)
+        self.approvals = tuple(replace(a, bundle_hash=self.bundle.bundle_hash) for a in self.approvals)
+        self.artifacts = tuple(replace(a, expires_at_us=10**13) for a in self.artifacts)
+        good = self.verifier.verify
+        self.verifier.verify = lambda request: replace(good(request), expires_at_us=10**13)
+        plan = self.activate()
+        self.assertIsInstance(plan, self.r.ActivationPlan)
+        self.assertEqual(self.bundle.bundle_hash, plan.approved.bundle_hash)
+        self.assertEqual(self.HOUR, plan.effective_at_us)
+        self.assertEqual('operator:alice', plan.actor)
+        self.assertEqual(('judgment-1',), plan.invalidated_judgment_ids)
+        self.assertEqual(('action-1',), plan.retained_action_keys)
+        self.assertEqual(self.state.risk_latches, plan.risk_latches)
+        self.assertEqual((self.bundle.bundle_hash,), plan.history)
+        self.assertFalse(plan.rollback)
+        self.assertFalse(plan.accepts_judgment(self.bundle.bundle_hash, self.HOUR - 1))
+        self.assertTrue(plan.accepts_judgment(self.bundle.bundle_hash, self.HOUR))
+
+    def test_bundle_must_survive_until_the_activation_boundary(self):
+        self.rejected(self.activate(), 'BUNDLE_EXPIRES_BEFORE_BOUNDARY')
+
+    def test_non_operator_or_untyped_session_cannot_activate(self):
+        brain = dataclasses_replace(self.operator, role='brain', actor='brain')
+        self.rejected(self.activate(session=brain), 'OPERATOR_SESSION_REQUIRED')
+        self.rejected(self.activate(session=None), 'OPERATOR_SESSION_REQUIRED')
+        other = dataclasses_replace(self.operator, account_id='other-account')
+        self.rejected(self.activate(session=other), 'OPERATOR_SESSION_REQUIRED')
+
+    def test_activation_never_bypasses_revalidation(self):
+        self.rejected(self.activate(verifier=None), 'VERIFIER_UNAVAILABLE')
+        self.rejected(self.activate(approvals=self.approvals[:-1]), 'MISSING_APPROVALS')
+
+    def test_armed_unreconciled_pending_unknown_or_racing_candle_refuses(self):
+        for changes, code in (({'armed': True}, 'ARMED'), ({'reconciled': False}, 'UNRECONCILED'),
+                ({'unknown_intent_ids': ('intent-9',)}, 'PENDING_UNKNOWN_ORDER'),
+                ({'boundary_in_progress': True}, 'BOUNDARY_IN_PROGRESS')):
+            with self.subTest(code):
+                self.rejected(self.activate(state=replace(self.state, **changes)), code)
+
+    def test_boundary_must_be_a_future_hour_close(self):
+        for boundary in (self.now, self.HOUR + 1, 0, True):
+            with self.subTest(boundary):
+                self.rejected(self.activate(boundary_us=boundary), 'INVALID_BOUNDARY')
+
+    def test_self_approval_by_role_principal_is_refused(self):
+        for actor in ('brain', 'reflex', 'brain:nightly', 'nightly'):
+            with self.subTest(actor):
+                forged = (replace(self.approvals[0], actor=actor), *self.approvals[1:])
+                good = self.verifier.verify
+                self.verifier.verify = lambda request: replace(good(request),
+                    operator_actors=('operator:alice', actor),
+                    approval_event_hashes=tuple(content_hash(a) for a in request.approvals))
+                self.rejected(self.validate(approvals=forged), 'NON_OPERATOR_APPROVER')
+                self.verifier.verify = good
+
+    def long_lived(self, bundle):
+        bundle = replace(bundle, expires_at_us=10**12)
+        self.artifacts = tuple(replace(a, expires_at_us=10**13) for a in self.artifacts)
+        approvals = tuple(replace(a, bundle_hash=bundle.bundle_hash) for a in self.approvals)
+        good = self.verifier.verify
+        self.verifier.verify = lambda request: replace(good(request), expires_at_us=10**13,
+            approval_event_hashes=tuple(content_hash(a) for a in request.approvals),
+            compatible_artifacts=self.r.compatibility_manifest(request.bundle))
+        return bundle, approvals
+
+    def approved(self, bundle, approvals):
+        result = self.r.validate_bundle(bundle, approvals, artifacts=self.artifacts, verifier=self.verifier,
+            now_us=self.now)
+        self.assertIsInstance(result, ApprovedBundle)
+        return result
+
+    def test_forward_activation_requires_lineage_and_rollback_keeps_latches(self):
+        old, old_approvals = self.long_lived(self.bundle)
+        active = self.approved(old, old_approvals)
+        state = replace(self.state, active=active, history=(old.bundle_hash,))
+        orphan, orphan_approvals = self.long_lived(replace(self.bundle, model_id='model-v2'))
+        self.rejected(self.activate(bundle=orphan, approvals=orphan_approvals, state=state), 'LINEAGE_MISMATCH')
+        child, child_approvals = self.long_lived(replace(self.bundle, model_id='model-v2', parent_hash=old.bundle_hash))
+        plan = self.activate(bundle=child, approvals=child_approvals, state=state)
+        self.assertIsInstance(plan, self.r.ActivationPlan)
+        self.assertEqual((old.bundle_hash, child.bundle_hash), plan.history)
+        # Roll back to the still-compatible old bundle: allowed, history and latches retained.
+        after = replace(state, active=plan.approved, history=plan.history)
+        back = self.activate(bundle=old, approvals=old_approvals, state=after)
+        self.assertIsInstance(back, self.r.ActivationPlan)
+        self.assertTrue(back.rollback)
+        self.assertEqual(self.state.risk_latches, back.risk_latches)
+        self.assertEqual((old.bundle_hash, child.bundle_hash, old.bundle_hash), back.history)
+        self.rejected(self.activate(bundle=old, approvals=old_approvals, state=replace(after, active=active)),
+            'ALREADY_ACTIVE')
+
+    def test_rollback_to_expired_or_incompatible_bundle_is_refused(self):
+        old, old_approvals = self.long_lived(self.bundle)
+        child, child_approvals = self.long_lived(replace(self.bundle, model_id='model-v2', parent_hash=old.bundle_hash))
+        state = replace(self.state, active=self.approved(child, child_approvals),
+            history=(old.bundle_hash, child.bundle_hash))
+        good = self.verifier.verify
+        self.verifier.verify = lambda request: replace(good(request), compatible_artifacts=())
+        self.rejected(self.activate(bundle=old, approvals=old_approvals, state=state), 'INCOMPATIBLE_ARTIFACTS')
+        self.verifier.verify = good
+        self.rejected(self.activate(bundle=old, approvals=old_approvals, state=state, now_us=10**12),
+            'BUNDLE_EXPIRED')
+
+    def test_expired_or_missing_active_bundle_blocks_entries(self):
+        old, approvals = self.long_lived(self.bundle)
+        active = self.approved(old, approvals)
+        self.assertTrue(self.r.entries_allowed(active, 10**12 - 1))
+        self.assertFalse(self.r.entries_allowed(active, 10**12))
+        self.assertFalse(self.r.entries_allowed(None, 0))
+        self.assertFalse(self.r.entries_allowed(old, 0))
+
+
+def dataclasses_replace(value, **changes):
+    return replace(value, **changes)
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -214,3 +214,46 @@ class DashboardAuthorityTests(unittest.TestCase):
         self.assertFalse(thread.is_alive())
         self.assertFalse(errors,errors)
         self.assertEqual([1],results)
+
+
+class GatewaySafetyTests(DashboardAuthorityTests):
+    """Acceptance-review regressions (2026-10-17)."""
+
+    def test_status_polling_cannot_exhaust_the_kill_capability(self):
+        few = dataclasses.replace(self.control_session, nonces={'n0': 10_000_000_000, 'n1': 10_000_000_000})
+        self.install(browser=dataclasses.replace(self.browser, control=few))
+        codes = [self.client.get('/api/control/status', headers={'X-Control-Epoch': '1'}).status_code
+            for _ in range(3)]
+        self.assertEqual([200, 503, 503], codes)
+        killed = self.client.post('/api/control/kill', headers=self.headers)
+        self.assertEqual(200, killed.status_code, killed.text)
+        self.assertEqual(['status', 'kill'], [call['kind'] for call in self.calls])
+
+    def test_post_send_client_protocol_failure_is_unknown_not_rejected(self):
+        owner = self
+        class TruncatedClient:
+            def request(self, raw):
+                owner.calls.append(raw)
+                raise ControlRejected('TRUNCATED_FRAME')
+        self.install(client=TruncatedClient())
+        result = self.client.post('/api/control/kill', headers=self.headers)
+        self.assertEqual(202, result.status_code, result.text)
+        self.assertEqual('pending', result.json()['status'])
+        self.assertIn('AUTHORITY_OUTCOME_UNKNOWN', result.json()['reason_codes'])
+        self.assertFalse(result.json()['local_inhibited'])
+
+    def test_wrong_server_peer_is_unavailable_before_send(self):
+        class WrongPeer:
+            def request(self, raw):
+                raise ControlRejected('WRONG_SERVER_PEER')
+        self.install(client=WrongPeer())
+        self.assertEqual(503, self.client.post('/api/control/kill', headers=self.headers).status_code)
+
+    def test_unexpected_client_error_is_unknown_not_server_error(self):
+        class Broken:
+            def request(self, raw):
+                raise RuntimeError('client bug after send')
+        self.install(client=Broken())
+        result = self.client.post('/api/control/kill', headers=self.headers)
+        self.assertEqual(202, result.status_code, result.text)
+        self.assertFalse(result.json()['local_inhibited'])
