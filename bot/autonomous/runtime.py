@@ -12,15 +12,20 @@ the prior 0.5, Kelly is zero, and no entry is sized (``CALIBRATION_INSUFFICIENT`
 An explicit ``--explore-fraction`` permits tiny labeled exploration entries
 (hard ceiling 0.1% of NAV) so paper outcomes can accumulate.
 
-# HANDOFF(claude-opus-5.5 2026-10-17): remaining for this runtime ->
+# HANDOFF(claude-opus-5.5 2026-10-17, review fixes applied): remaining for this runtime ->
 #   1. Wire the real JevClient once an approved release bundle + schema resolver exist
 #      (Task 15); today JEV_API_KEY only records `jev_configured_unwired` and stays offline.
 #   2. Route paper orders through OrderAuthority/Ledger (Task 12/16) instead of this
 #      runtime's own append-only fill table, so paper and live share one accounting path.
 #   3. Exchange tick/lot rules are approximated (lot 1e-8, fee bound estimate 0.6%);
 #      replace with verified MarketRules per instrument.
-#   4. Labels use mids only; add spread/slippage-aware exit labels and per-regime cohorts.
-#   5. Dashboard read of status.json (Task 17) and operator clear-latch via authenticated control.
+#   4. Labels use mids at exactly close+horizon (gaps are UNRESOLVABLE); add spread/slippage-aware
+#      exit labels and per-regime cohorts. positions()/cash() rescan fills each cycle (fine at paper
+#      volumes; snapshot them if fills grow large).
+#   5. Dashboard read of status.json (Task 17); operator clear-latch / resolve-escalation are local
+#      methods and still need the authenticated control path.
+#   6. A database created before `runtime-v2` meta adopts the current config on first open; it is not
+#      re-validated against the config that produced its historical rows.
 """
 from __future__ import annotations
 
@@ -30,7 +35,9 @@ import math
 import os
 import sqlite3
 import statistics
+import sys
 import time
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
@@ -47,6 +54,8 @@ from .state import book_metrics, require_token_budget
 
 REFLEX_ID = "offline-reflex-v1"
 SNAPSHOT_VERSION = "paper-snapshot-v1"
+SCHEMA_VERSION = "runtime-v2"
+_DAY_US = 86_400 * 1_000_000
 LOT = Decimal("0.00000001")
 MICRO_USD = Decimal("0.000001")
 # Hard ceilings: configuration may tighten, never loosen.
@@ -77,6 +86,8 @@ class RuntimeConfig:
     explore_fraction: float = 0.0
     min_labels: int = 100
     max_book_age_us: int = 10_000_000
+    close_tolerance_us: int = 10_000_000
+    brier_window: int = 2_000
     paper_armed: bool = False
 
     def __post_init__(self):
@@ -176,6 +187,7 @@ class OfflineReflex:
 
 
 _SCHEMA = """
+CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
 CREATE TABLE IF NOT EXISTS snapshots(instrument TEXT, candle_close_us INTEGER, event_us INTEGER, received_us INTEGER,
   cutoff_us INTEGER, mid REAL, best_bid REAL, best_ask REAL, wire TEXT, token_estimate INTEGER, snapshot_hash TEXT,
   PRIMARY KEY(instrument, candle_close_us));
@@ -187,12 +199,24 @@ CREATE TABLE IF NOT EXISTS fills(fill_id TEXT PRIMARY KEY, decision_id TEXT, ins
 CREATE TABLE IF NOT EXISTS equity_marks(mark_id INTEGER PRIMARY KEY AUTOINCREMENT, at_us INTEGER, equity_usd TEXT,
   cash_usd TEXT, high_water_usd TEXT, day_open_usd TEXT, day TEXT);
 CREATE TABLE IF NOT EXISTS labels(decision_id TEXT PRIMARY KEY, instrument TEXT, direction TEXT, confidence REAL,
-  entry_mid REAL, exit_mid REAL, net_return REAL, hit INTEGER, labeled_us INTEGER);
+  entry_mid REAL, exit_mid REAL, net_return REAL, hit INTEGER, labeled_us INTEGER, status TEXT DEFAULT 'resolved');
 CREATE TABLE IF NOT EXISTS escalations(escalation_id TEXT PRIMARY KEY, decision_id TEXT, code TEXT, payload TEXT,
   status TEXT, created_us INTEGER);
+CREATE TABLE IF NOT EXISTS escalation_resolutions(escalation_id TEXT PRIMARY KEY, note TEXT, resolved_us INTEGER);
 CREATE TABLE IF NOT EXISTS latches(event_id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT, action TEXT, reason TEXT, at_us INTEGER);
 """
-_APPEND_ONLY = ("snapshots", "decisions", "fills", "equity_marks", "labels", "escalations", "latches")
+_INDEXES = """
+CREATE INDEX IF NOT EXISTS decisions_close ON decisions(candle_close_us);
+CREATE INDEX IF NOT EXISTS decisions_instrument ON decisions(instrument, candle_close_us);
+CREATE INDEX IF NOT EXISTS decisions_created ON decisions(created_us);
+CREATE INDEX IF NOT EXISTS labels_labeled ON labels(labeled_us);
+CREATE INDEX IF NOT EXISTS labels_instrument ON labels(instrument, direction);
+CREATE INDEX IF NOT EXISTS fills_instrument ON fills(instrument, created_us);
+CREATE INDEX IF NOT EXISTS fills_created ON fills(created_us);
+CREATE INDEX IF NOT EXISTS escalations_created ON escalations(created_us);
+"""
+_APPEND_ONLY = ("meta", "snapshots", "decisions", "fills", "equity_marks", "labels", "escalations",
+                "escalation_resolutions", "latches")
 
 
 def open_db(path: Path) -> sqlite3.Connection:
@@ -201,7 +225,11 @@ def open_db(path: Path) -> sqlite3.Connection:
     db.row_factory = sqlite3.Row
     db.execute("PRAGMA journal_mode=WAL")
     db.execute("PRAGMA synchronous=FULL")
+    db.execute("PRAGMA busy_timeout=5000")
     db.executescript(_SCHEMA)
+    if "status" not in {r["name"] for r in db.execute("PRAGMA table_info(labels)")}:
+        db.execute("ALTER TABLE labels ADD COLUMN status TEXT DEFAULT 'resolved'")  # pre-review database
+    db.executescript(_INDEXES)
     for table in _APPEND_ONLY:
         for op in ("UPDATE", "DELETE"):
             db.execute(f"CREATE TRIGGER IF NOT EXISTS {table}_no_{op.lower()} BEFORE {op} ON {table} "
@@ -263,16 +291,47 @@ class PaperRuntime:
                  clock_us: Callable[[], int] | None = None, reflex: ReflexPort | None = None):
         self.config = config
         self.clock_us = clock_us or (lambda: time.time_ns() // 1000)
+        config.data_dir.mkdir(parents=True, exist_ok=True)
+        self.db = open_db(config.data_dir / "runtime.sqlite3")
+        try:
+            self._bind_meta()
+        except Exception:
+            self.db.close()
+            raise
         self.book_source = book_source or _public_book_source(config.data_dir)
         self.reflex = reflex or OfflineReflex()
         self.jev_note = "jev_configured_unwired" if os.environ.get("JEV_API_KEY") else "jev_not_configured"
-        config.data_dir.mkdir(parents=True, exist_ok=True)
-        self.db = open_db(config.data_dir / "runtime.sqlite3")
         if self.db.execute("SELECT COUNT(*) FROM equity_marks").fetchone()[0] == 0:
             now = self.clock_us()
             cash = str(config.starting_cash_usd)
             self.db.execute("INSERT INTO equity_marks(at_us,equity_usd,cash_usd,high_water_usd,day_open_usd,day) VALUES (?,?,?,?,?,?)",
                             (now, cash, cash, cash, cash, _day(now)))
+        unlabeled = self.db.execute("SELECT MIN(d.candle_close_us) FROM decisions d LEFT JOIN labels l USING(decision_id) "
+                                    "WHERE l.decision_id IS NULL").fetchone()[0]
+        self._label_floor_us = unlabeled if unlabeled is not None else 0
+
+    def _bind_meta(self) -> None:
+        """Accounting depends on starting cash and candle cadence; a restart may not silently change them."""
+        expected = {"schema": SCHEMA_VERSION, "starting_cash_usd": str(self.config.starting_cash_usd),
+                    "candle_seconds": str(self.config.candle_seconds)}
+        stored = {r["key"]: r["value"] for r in self.db.execute("SELECT key, value FROM meta")}
+        if not stored:
+            for key, value in expected.items():
+                self.db.execute("INSERT INTO meta VALUES (?,?)", (key, value))
+            return
+        wrong = sorted(k for k, v in expected.items() if stored.get(k) != v)
+        if wrong:
+            raise ValueError("config mismatch with stored runtime meta: " + ", ".join(wrong))
+
+    @contextmanager
+    def _tx(self):
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            yield
+        except BaseException:
+            self.db.execute("ROLLBACK")
+            raise
+        self.db.execute("COMMIT")
 
     # ---------- accounting (derived from append-only rows) ----------
     def positions(self) -> dict[str, Decimal]:
@@ -306,6 +365,10 @@ class PaperRuntime:
         """Operator-only local action; the REFLEX has no path to this method."""
         self.db.execute("INSERT INTO latches(kind,action,reason,at_us) VALUES (?,?,?,?)", (kind, "clear", reason, self.clock_us()))
 
+    def resolve_escalation(self, escalation_id: str, note: str) -> None:
+        """BRAIN/operator acknowledgment; the escalation row itself stays immutable."""
+        self.db.execute("INSERT INTO escalation_resolutions VALUES (?,?,?)", (escalation_id, note, self.clock_us()))
+
     def mark(self, bids_by: dict[str, float], now: int) -> dict:
         cash, held = self.cash(), self.positions()
         prices = {}
@@ -338,20 +401,29 @@ class PaperRuntime:
         return book, parse_event_us(book.get("exchange_time")), received
 
     def snapshot(self, instrument, book, event_us, received_us, cutoff_us, account) -> Snapshot:
+        """``candle_close_us`` is the true close: the candle boundary at or before the event, which must lie within
+        ``close_tolerance_us`` after it. Features use only contiguous earlier closes received by the cutoff."""
         if event_us > cutoff_us or received_us > cutoff_us:
             raise Unavailable("FUTURE_OBSERVATION")
         if cutoff_us - event_us > self.config.max_book_age_us:
             raise Unavailable("STALE_BOOK")
+        step = self.config.candle_seconds * 1_000_000
+        close = event_us // step * step
+        if event_us - close > self.config.close_tolerance_us:
+            raise Unavailable("AWAY_FROM_CLOSE")
         bids, asks = _levels(book.get("bids")), _levels(book.get("asks"))
         try:
             mid, spread, imbalance = book_metrics(bids, asks)
         except ValueError as exc:
             raise Unavailable("INVALID_BOOK") from exc
-        step = self.config.candle_seconds * 1_000_000
-        close = event_us // step * step
-        prior = [r["mid"] for r in self.db.execute(
-            "SELECT mid FROM snapshots WHERE instrument=? AND candle_close_us<? AND received_us<=? "
-            "ORDER BY candle_close_us DESC LIMIT ?", (instrument, close, cutoff_us, self.config.lookback_candles))][::-1]
+        prior = []
+        for r in self.db.execute("SELECT candle_close_us, mid FROM snapshots WHERE instrument=? AND candle_close_us<? "
+                                 "AND candle_close_us>=? AND received_us<=? ORDER BY candle_close_us DESC",
+                                 (instrument, close, close - self.config.lookback_candles * step, cutoff_us)):
+            if r["candle_close_us"] != close - (len(prior) + 1) * step:
+                break  # gap: older rows are not contiguous with this close
+            prior.append(r["mid"])
+        prior.reverse()
         mids = prior + [mid]
         returns = [1e4 * math.log(b / a) for a, b in zip(mids, mids[1:])]
         vol = statistics.pstdev(returns) if len(returns) >= 2 else 0.0
@@ -366,27 +438,42 @@ class PaperRuntime:
 
     # ---------- calibration ----------
     def calibrated_edge(self, instrument: str, reflex_id: str) -> tuple[Decimal, Decimal, Decimal, int]:
-        """Wilson-lower hit rate and mean net payoffs for resolved long labels; prior 0.5 when unsupported."""
+        """Wilson-lower hit rate and mean net payoffs over resolved long labels of gate-open decisions.
+
+        Below ``min_labels`` the prior 0.5 with symmetric payoff is returned (Kelly zero). A supported cohort
+        with no wins returns p=0; with no losses the loss per dollar is floored at the round-trip fee."""
         rows = self.db.execute("SELECT l.hit, l.net_return FROM labels l JOIN decisions d USING(decision_id) "
-                               "WHERE l.instrument=? AND l.direction='long' AND d.reflex_id=?", (instrument, reflex_id)).fetchall()
+                               "WHERE l.instrument=? AND l.direction='long' AND l.status='resolved' AND d.reflex_id=? "
+                               "AND d.gate_open=1", (instrument, reflex_id)).fetchall()
         n = len(rows)
+        if n < self.config.min_labels:
+            return Decimal("0.5"), Decimal(1), Decimal(1), n
+        cost = 2 * self.config.fee_rate
         wins = [r["net_return"] for r in rows if r["hit"]]
         losses = [-r["net_return"] for r in rows if not r["hit"] and r["net_return"] < 0]
-        if n < self.config.min_labels or not wins or not losses:
-            return Decimal("0.5"), Decimal(1), Decimal(1), n
-        p = Decimal(str(wilson_lower(len(wins), n)))
-        return p, Decimal(str(statistics.fmean(wins))), Decimal(str(statistics.fmean(losses))), n
+        if not wins:
+            return Decimal(0), cost, cost, n
+        loss = Decimal(str(statistics.fmean(losses))) if losses else cost
+        return Decimal(str(wilson_lower(len(wins), n))), Decimal(str(statistics.fmean(wins))), max(loss, cost), n
 
     def label_matured(self, now: int) -> int:
+        """Label each decision from the snapshot at exactly close+horizon; a missing close is UNRESOLVABLE."""
         step = self.config.candle_seconds * 1_000_000
         horizon = self.config.horizon_candles * step
         cost = 2 * float(self.config.fee_rate)
-        count = 0
-        for d in self.db.execute("SELECT * FROM decisions WHERE decision_id NOT IN (SELECT decision_id FROM labels) "
-                                 "AND candle_close_us+?<=?", (horizon, now)).fetchall():
-            later = self.db.execute("SELECT mid FROM snapshots WHERE instrument=? AND candle_close_us>=? AND received_us<=? "
-                                    "ORDER BY candle_close_us LIMIT 1", (d["instrument"], d["candle_close_us"] + horizon, now)).fetchone()
+        count, pending = 0, []
+        for d in self.db.execute("SELECT d.* FROM decisions d LEFT JOIN labels l USING(decision_id) WHERE l.decision_id IS NULL "
+                                 "AND d.candle_close_us>=? AND d.candle_close_us+?<=?", (self._label_floor_us, horizon, now)).fetchall():
+            target = d["candle_close_us"] + horizon
+            later = self.db.execute("SELECT mid FROM snapshots WHERE instrument=? AND candle_close_us>=? AND candle_close_us<? "
+                                    "AND received_us<=?", (d["instrument"], target, target + step, now)).fetchone()
             if later is None:
+                if now < target + step + self.config.close_tolerance_us:
+                    pending.append(d["candle_close_us"])
+                    continue
+                self.db.execute("INSERT INTO labels VALUES (?,?,?,?,?,?,?,?,?,?)", (d["decision_id"], d["instrument"], d["direction"],
+                                d["confidence"], d["mid"], None, None, None, now, "unresolvable"))
+                count += 1
                 continue
             gross = later["mid"] / d["mid"] - 1
             if d["direction"] == "long":
@@ -395,13 +482,17 @@ class PaperRuntime:
                 net, hit = -gross - cost, -gross - cost > 0
             else:
                 net, hit = -abs(gross), abs(gross) < cost
-            self.db.execute("INSERT INTO labels VALUES (?,?,?,?,?,?,?,?,?)", (d["decision_id"], d["instrument"], d["direction"],
-                            d["confidence"], d["mid"], later["mid"], net, int(hit), now))
+            self.db.execute("INSERT INTO labels VALUES (?,?,?,?,?,?,?,?,?,?)", (d["decision_id"], d["instrument"], d["direction"],
+                            d["confidence"], d["mid"], later["mid"], net, int(hit), now, "resolved"))
             count += 1
+        self._label_floor_us = min(pending) if pending else max(self._label_floor_us, now - horizon - step)
         return count
 
-    def brier(self) -> tuple[float | None, int]:
-        rows = self.db.execute("SELECT confidence, hit FROM labels").fetchall()
+    def brier(self, kind: str = "all") -> tuple[float | None, int]:
+        """Binary Brier of the predicted choice over the last ``brier_window`` resolved labels."""
+        where = {"all": "", "directional": "AND direction IN ('long','short')", "neutral": "AND direction='neutral'"}[kind]
+        rows = self.db.execute(f"SELECT confidence, hit FROM labels WHERE status='resolved' {where} "
+                               "ORDER BY labeled_us DESC LIMIT ?", (self.config.brier_window,)).fetchall()
         if not rows:
             return None, 0
         return binary_brier(tuple(float(r["confidence"]) for r in rows), tuple(int(r["hit"]) for r in rows)), len(rows)
@@ -438,17 +529,22 @@ class PaperRuntime:
                 errors[instrument] = type(exc).__name__ if not isinstance(exc, Unavailable) else str(exc)
         cutoff = self.clock_us()
         bids = {i: max(_levels(b.get("bids")) or [(0.0, 0.0)])[0] for i, (b, _, _) in observed.items()}
-        account = self.mark({i: p for i, p in bids.items() if p > 0}, cutoff)
+        with self._tx():
+            account = self.mark({i: p for i, p in bids.items() if p > 0}, cutoff)
         account["bid"] = {i: Decimal(str(p)) for i, p in bids.items()}
         results = {i: {"status": "hold", "reasons": [e]} for i, e in errors.items()}
         for instrument, (book, event_us, received_us) in observed.items():
             try:
-                results[instrument] = self._decide(instrument, book, event_us, received_us, cutoff, account)
+                with self._tx():  # snapshot, decision, escalations and fill commit together or not at all
+                    results[instrument] = self._decide(instrument, book, event_us, received_us, cutoff, account)
             except Unavailable as exc:
                 results[instrument] = {"status": "hold", "reasons": [str(exc)]}
-        labeled = self.label_matured(cutoff)
-        status = self.write_status(cutoff, results, labeled)
-        return status
+            except Exception as exc:
+                results[instrument] = {"status": "hold", "reasons": ["DECISION_ERROR:" + type(exc).__name__]}
+            account["cash"], account["positions"] = self.cash(), self.positions()
+        with self._tx():
+            labeled = self.label_matured(cutoff)
+        return self.write_status(cutoff, results, labeled)
 
     def _decide(self, instrument, book, event_us, received_us, cutoff, account) -> dict:
         snap = self.snapshot(instrument, book, event_us, received_us, cutoff, account)
@@ -464,7 +560,6 @@ class PaperRuntime:
             return {"status": "warmup", "reasons": ["WARMUP"], "history": snap.history, "snapshot": json.loads(snap.wire())}
         judgment = self.reflex.judge(snap)
         decision_id = content_hash((instrument, snap.candle_close_us, judgment.reflex_id))
-        reasons, action = [], "hold"
         gate = entry_gate(judgment.setup_quality, judgment.direction_confidence, judgment.risk_state,
                           judgment.toxic_flow, judgment.direction)
         escalate = []
@@ -474,36 +569,32 @@ class PaperRuntime:
         if judgment.direction_confidence < 0.60:
             escalate.append("LOW_CONFIDENCE")
         held = account["positions"].get(instrument, Decimal(0))
+        reasons, action = list(escalate), "hold"
         fill, exploration = None, False
-        if escalate:
-            reasons += escalate
-        elif (self.config.data_dir / "KILL").exists():
+        if (self.config.data_dir / "KILL").exists():
             reasons.append("KILL_SWITCH")  # armed kill file: no order path is entered at all
-        elif held > 0 and self._should_exit(instrument, judgment, snap.candle_close_us):
-            blocked = self.risk_check("sell", instrument, Decimal(0), account)
-            if blocked:
+        elif held > 0:
+            # Exits are evaluated independently of escalation; escalation only blocks entries.
+            exit_reason = self._exit_reason(instrument, judgment, snap.candle_close_us, account)
+            if exit_reason is None:
+                if not escalate:
+                    reasons.append("ENTRY_SLOT_OCCUPIED")  # one entry per instrument until its exit
+            elif blocked := self.risk_check("sell", instrument, Decimal(0), account):
                 reasons += blocked
             else:
                 limit = Decimal(str(best_bid)) * (1 - self.config.max_slippage_bps / Decimal(10_000))
                 fill = paper_fill(bids, "sell", None, held, limit, self.config.fee_rate)
-                action, reasons = ("sell", ["EXIT"]) if fill else ("hold", ["EXIT_UNFILLED"])
+                action = "sell" if fill else "hold"
+                reasons += ["EXIT", exit_reason] if fill else ["EXIT_UNFILLED", exit_reason]
+        elif escalate:
+            pass
         elif not gate:
             reasons.append("ENTRY_GATE_REFUSED")
-        elif held > 0:
-            reasons.append("ENTRY_SLOT_OCCUPIED")  # one entry per instrument until its exit
         else:
-            p, win, loss, n = self.calibrated_edge(instrument, judgment.reflex_id)
-            budget = kelly_loss_budget(account["equity"], p, win, loss)
-            notional = (budget / loss).quantize(MICRO_USD, rounding=ROUND_FLOOR) if budget > 0 else Decimal(0)
-            if notional <= 0:
-                reasons.append("CALIBRATION_INSUFFICIENT")
-                if self.config.explore_fraction > 0:
-                    notional = (account["equity"] * Decimal(str(self.config.explore_fraction))).quantize(MICRO_USD, rounding=ROUND_FLOOR)
-                    exploration = True
-                    reasons.append("EXPLORATION")
+            notional, exploration, sizing = self._entry_notional(instrument, judgment, account)
+            reasons += sizing
             if notional > 0:
-                blocked = self.risk_check("buy", instrument, notional, account)
-                if blocked:
+                if blocked := self.risk_check("buy", instrument, notional, account):
                     reasons += blocked
                 else:
                     limit = Decimal(str(best_ask)) * (1 + self.config.max_slippage_bps / Decimal(10_000))
@@ -525,13 +616,41 @@ class PaperRuntime:
         return {"status": action, "reasons": reasons, "decision_id": decision_id, "judgment": _judgment_dict(judgment),
                 "gate_open": gate, "snapshot": json.loads(snap.wire()), "token_estimate": snap.token_estimate()}
 
-    def _should_exit(self, instrument, judgment: Judgment, close_us: int) -> bool:
-        last_buy = self.db.execute("SELECT f.created_us, d.candle_close_us FROM fills f JOIN decisions d USING(decision_id) "
+    def _entry_notional(self, instrument, judgment: Judgment, account) -> tuple[Decimal, bool, list[str]]:
+        """Quarter-Kelly notional capped (never refused) by position room and cash; explore only while unsupported."""
+        p, win, loss, n = self.calibrated_edge(instrument, judgment.reflex_id)
+        if n < self.config.min_labels:
+            if self.config.explore_fraction <= 0:
+                return Decimal(0), False, ["CALIBRATION_INSUFFICIENT"]
+            explore = (account["equity"] * Decimal(str(self.config.explore_fraction))).quantize(MICRO_USD, rounding=ROUND_FLOOR)
+            return explore, True, ["CALIBRATION_INSUFFICIENT", "EXPLORATION"]
+        budget = kelly_loss_budget(account["equity"], p, win, loss)
+        if budget <= 0:
+            return Decimal(0), False, ["NEGATIVE_EDGE"]
+        kelly = budget / loss
+        held_value = account["positions"].get(instrument, Decimal(0)) * account.get("bid", {}).get(instrument, Decimal(0))
+        room = min(Decimal(str(self.config.max_position_fraction)) * account["equity"] - held_value,
+                   account["cash"] / (1 + self.config.fee_rate))
+        notional = min(kelly, room).quantize(MICRO_USD, rounding=ROUND_FLOOR)
+        if notional <= 0:
+            return Decimal(0), False, ["MAX_POSITION"]
+        return notional, False, ["SIZE_CAPPED"] if notional < kelly else []
+
+    def _exit_reason(self, instrument, judgment: Judgment, close_us: int, account) -> str | None:
+        last_buy = self.db.execute("SELECT d.candle_close_us FROM fills f JOIN decisions d USING(decision_id) "
                                    "WHERE f.instrument=? AND f.side='buy' ORDER BY f.created_us DESC LIMIT 1", (instrument,)).fetchone()
         horizon = self.config.horizon_candles * self.config.candle_seconds * 1_000_000
-        time_stop = last_buy is not None and close_us - last_buy["candle_close_us"] >= horizon
-        return (time_stop or judgment.risk_state is AdvisoryRisk.REDUCE
-                or (judgment.direction is Direction.SHORT and judgment.direction_confidence > 0.80))
+        if last_buy is not None and close_us - last_buy["candle_close_us"] >= horizon:
+            return "TIME_STOP"
+        if "DRAWDOWN_LATCH" in self.latched() or account["drawdown"] >= self.config.max_drawdown:
+            return "DRAWDOWN"
+        if judgment.regime is Regime.CRISIS:
+            return "CRISIS"
+        if judgment.risk_state is AdvisoryRisk.REDUCE:
+            return "REDUCE"
+        if judgment.direction is Direction.SHORT and judgment.direction_confidence > 0.80:
+            return "SIGNAL_SHORT"
+        return None
 
     def write_status(self, now: int, results: dict, labeled: int) -> dict:
         mark = self._last_mark()
@@ -541,8 +660,13 @@ class PaperRuntime:
                   "reflex_calibrated": False, "jev": self.jev_note, "at_us": now,
                   "equity_usd": mark["equity_usd"], "cash_usd": mark["cash_usd"], "high_water_usd": mark["high_water_usd"],
                   "day_open_usd": mark["day_open_usd"], "positions": {k: str(v) for k, v in self.positions().items()},
-                  "latches": sorted(self.latched()), "brier": brier, "resolved_labels": resolved, "labeled_this_cycle": labeled,
-                  "pending_escalations": self.db.execute("SELECT COUNT(*) FROM escalations").fetchone()[0],
+                  "latches": sorted(self.latched()), "brier": brier, "brier_window_labels": resolved,
+                  "brier_directional": self.brier("directional")[0], "brier_neutral": self.brier("neutral")[0],
+                  "resolved_labels": self.db.execute("SELECT COUNT(*) FROM labels WHERE status='resolved'").fetchone()[0],
+                  "unresolvable_labels": self.db.execute("SELECT COUNT(*) FROM labels WHERE status='unresolvable'").fetchone()[0],
+                  "labeled_this_cycle": labeled,
+                  "pending_escalations": self.db.execute("SELECT COUNT(*) FROM escalations e LEFT JOIN escalation_resolutions r "
+                                                         "USING(escalation_id) WHERE r.escalation_id IS NULL").fetchone()[0],
                   "fills": self.db.execute("SELECT COUNT(*) FROM fills").fetchone()[0], "instruments": results}
         path = self.config.data_dir / "status.json"
         tmp = path.with_suffix(".tmp")
@@ -551,34 +675,50 @@ class PaperRuntime:
         return status
 
     def serve(self, stop: Callable[[], bool], sleep: Callable[[float], None] = time.sleep, offset_s: float = 1.0) -> int:
-        """Run one cycle shortly after each candle close until ``stop()``."""
-        cycles = 0
+        """Run one cycle shortly after each candle close until ``stop()``. A failed cycle is logged, never fatal."""
+        cycles = attempts = 0
         step = self.config.candle_seconds
         while not stop():
             now_s = self.clock_us() / 1e6
-            sleep(max(0.0, step - now_s % step + offset_s) if cycles else 0.0)
+            sleep(max(0.0, step - now_s % step + offset_s) if attempts else 0.0)
             if stop():
                 break
-            self.cycle()
-            cycles += 1
+            attempts += 1
+            try:
+                self.cycle()
+                cycles += 1
+            except Exception as exc:
+                if self.db.in_transaction:
+                    self.db.execute("ROLLBACK")
+                print(json.dumps({"cycle_error": type(exc).__name__, "detail": str(exc)[:200], "at_us": self.clock_us()}),
+                      file=sys.stderr, flush=True)
         return cycles
 
     def close(self):
         self.db.close()
 
 
-def nightly_review(db_path: Path, out_dir: Path, *, now_us: int | None = None, brain=None) -> dict:
-    """Read every fill and miss, measure Brier and buckets, and emit a PROPOSAL (never auto-applied)."""
+def nightly_review(db_path: Path, out_dir: Path, *, now_us: int | None = None, brain=None, fill_cap: int = 10_000) -> dict:
+    """Read the review day's fills and misses, measure Brier and buckets, and emit a PROPOSAL (never auto-applied)."""
     now_us = now_us if now_us is not None else time.time_ns() // 1000
+    day = _day(now_us)
+    start = int(datetime.strptime(day, "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp()) * 1_000_000
+    window = (start, start + _DAY_US)
     db = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
     db.row_factory = sqlite3.Row
     try:
-        fills = [dict(r) for r in db.execute("SELECT * FROM fills ORDER BY created_us")]
-        decisions = [dict(r) for r in db.execute("SELECT * FROM decisions ORDER BY created_us")]
-        labels = [dict(r) for r in db.execute("SELECT * FROM labels")]
-        escalations = db.execute("SELECT code, COUNT(*) n FROM escalations GROUP BY code").fetchall()
+        fills = [dict(r) for r in db.execute("SELECT * FROM fills WHERE created_us>=? AND created_us<? ORDER BY created_us LIMIT ?",
+                                             (*window, fill_cap + 1))]
+        decisions = [dict(r) for r in db.execute("SELECT * FROM decisions WHERE created_us>=? AND created_us<? ORDER BY created_us",
+                                                 window)]
+        labels = [dict(r) for r in db.execute("SELECT * FROM labels WHERE labeled_us>=? AND labeled_us<?", window)]
+        escalations = db.execute("SELECT code, COUNT(*) n FROM escalations WHERE created_us>=? AND created_us<? GROUP BY code",
+                                 window).fetchall()
     finally:
         db.close()
+    truncated = len(fills) > fill_cap
+    fills = fills[:fill_cap]
+    resolved = [l for l in labels if l["status"] == "resolved"]
     misses = [d for d in decisions if d["gate_open"] and d["action"] == "hold"]
     reasons: dict[str, int] = {}
     for d in decisions:
@@ -586,27 +726,34 @@ def nightly_review(db_path: Path, out_dir: Path, *, now_us: int | None = None, b
             reasons[code] = reasons.get(code, 0) + 1
     buckets = []
     for lo in (0.5, 0.6, 0.7, 0.8, 0.9):
-        rows = [l for l in labels if lo <= l["confidence"] < lo + 0.1 or (lo == 0.9 and l["confidence"] == 1.0)]
+        rows = [l for l in resolved if lo <= l["confidence"] < lo + 0.1 or (lo == 0.9 and l["confidence"] == 1.0)]
         if rows:
             buckets.append({"bucket": f"{lo:.1f}-{lo + 0.1:.1f}", "n": len(rows),
                             "mean_confidence": statistics.fmean(l["confidence"] for l in rows),
                             "hit_rate": statistics.fmean(l["hit"] for l in rows)})
-    brier = binary_brier(tuple(float(l["confidence"]) for l in labels), tuple(int(l["hit"]) for l in labels)) if labels else None
-    metrics = {"decisions": len(decisions), "fills": len(fills), "misses": len(misses), "reason_counts": reasons,
-               "resolved_labels": len(labels), "brier": brier, "buckets": buckets,
+
+    def score(rows):
+        return binary_brier(tuple(float(l["confidence"]) for l in rows), tuple(int(l["hit"]) for l in rows)) if rows else None
+
+    directional = [l for l in resolved if l["direction"] in ("long", "short")]
+    metrics = {"day": day, "decisions": len(decisions), "decision_ids_sample": [d["decision_id"] for d in decisions[:20]],
+               "fills": len(fills), "fills_truncated": truncated, "misses": len(misses), "reason_counts": reasons,
+               "resolved_labels": len(resolved), "unresolvable_labels": len(labels) - len(resolved),
+               "brier": score(resolved), "brier_directional": score(directional),
+               "brier_neutral": score([l for l in resolved if l["direction"] == "neutral"]), "buckets": buckets,
                "escalations": {r["code"]: r["n"] for r in escalations}}
     archive_hash = content_hash(json.dumps(metrics, sort_keys=True, default=str))
-    proposal = (brain or DeterministicBrain()).review(job_id="nightly-" + _day(now_us), archive_hash=archive_hash, metrics=metrics)
+    proposal = (brain or DeterministicBrain()).review(job_id="nightly-" + day, archive_hash=archive_hash, metrics=metrics)
     report = {"generated_us": now_us, "archive_hash": archive_hash, "metrics": metrics,
-              "fills": fills, "misses": [{k: m[k] for k in ("decision_id", "instrument", "reasons", "confidence")} for m in misses],
+              "fills": fills, "misses": [{k: m[k] for k in ("decision_id", "instrument", "reasons", "confidence")} for m in misses[:fill_cap]],
               "proposal": asdict(proposal), "applied": False,
               "governance": "PROPOSAL ONLY: a schema change ships only through the AgenKit review gate with operator approval."}
     out_dir.mkdir(parents=True, exist_ok=True)
-    day = _day(now_us)
     (out_dir / f"nightly-{day}.json").write_text(json.dumps(report, indent=2, default=str))
     overconfident = [b for b in buckets if b["n"] >= 20 and b["mean_confidence"] - b["hit_rate"] > 0.1]
     lines = [f"# Schema proposal {day} (PROPOSAL ONLY, not applied)", "", f"BRAIN: {proposal.model_id} -> {proposal.action}",
-             f"Finding: {proposal.finding}", f"Brier: {brier} over {len(labels)} resolved labels", ""]
+             f"Finding: {proposal.finding}", f"Brier: {metrics['brier']} over {len(resolved)} resolved labels "
+             f"(directional {metrics['brier_directional']}, neutral {metrics['brier_neutral']})", ""]
     lines += [f"- Bucket {b['bucket']} overconfident: mean {b['mean_confidence']:.3f} vs hit {b['hit_rate']:.3f}; "
               "consider tightening the direction rubric or the 0.80 entry gate." for b in overconfident] or ["- No bucket shows supported overconfidence."]
     (out_dir / f"schema-proposal-{day}.md").write_text("\n".join(lines) + "\n")

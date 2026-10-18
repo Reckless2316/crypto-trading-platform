@@ -53,7 +53,7 @@ class Fixed:
 GOOD = Judgment(Regime.TRENDING, Direction.LONG, 0.85, False, 2, AdvisoryRisk.SAFE, "fixed-test")
 
 
-class RuntimeTests(unittest.TestCase):
+class RuntimeCase(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
@@ -78,6 +78,9 @@ class RuntimeTests(unittest.TestCase):
             out = rt.cycle()
         return out
 
+
+
+class RuntimeTests(RuntimeCase):
     def test_future_and_stale_observations_are_rejected(self):
         rt = self.runtime()
         account = rt.mark({}, self.clock.us)
@@ -269,10 +272,207 @@ class RuntimeTests(unittest.TestCase):
                 self.assertEqual(0, main(["--paper", "--once", "--data-dir", str(self.dir)]))
         status = json.loads(out.getvalue())
         self.assertEqual({"BTC-USD", "ETH-USD"}, set(status["instruments"]))
-        self.assertEqual(0, status["fills"])
+        self.assertEqual(("paper", False, False, 0), (status["mode"], status["live"], status["armed_paper"], status["fills"]))
+        self.assertEqual(status, json.loads((self.dir / "status.json").read_text()))
+        self.assertEqual({"warmup"}, {r["status"] for r in status["instruments"].values()})
+        self.assertEqual(2, books.calls)  # one public book read per instrument, no other source
         db = open_db(self.dir / "runtime.sqlite3")
         self.addCleanup(db.close)
-        self.assertEqual(2, db.execute("SELECT COUNT(*) FROM snapshots").fetchone()[0])
+        rows = db.execute("SELECT instrument, candle_close_us, event_us, token_estimate FROM snapshots").fetchall()
+        self.assertEqual({"BTC-USD", "ETH-USD"}, {r["instrument"] for r in rows})
+        self.assertTrue(all(r["candle_close_us"] % 60_000_000 == 0 and r["event_us"] >= r["candle_close_us"]
+                            and r["token_estimate"] < 400 for r in rows))
+        self.assertEqual("60", dict(db.execute("SELECT key, value FROM meta").fetchall())["candle_seconds"])
+        with mock.patch("bot.autonomous.runtime._public_book_source", return_value=books), \
+                self.assertRaisesRegex(ValueError, "config mismatch"):
+            main(["--paper", "--once", "--data-dir", str(self.dir), "--candle-seconds", "300"])
+
+
+def seed_labels(rt, hits, misses, magnitude=0.015, gate_open=1, instrument="AAVE-USD", reflex_id="fixed-test"):
+    """Resolved long labels behind gate-open decisions, far in the past so they never collide with live candles."""
+    for k in range(hits + misses):
+        decision_id = "seed-%d-%d" % (gate_open, k)
+        hit = k < hits
+        rt.db.execute("INSERT INTO decisions VALUES (?,?,?,?,0,'trending','long',0.85,0,2,'safe',?,'hold','[]',100,0)",
+                      (decision_id, instrument, k * 60_000_000, reflex_id, gate_open))
+        rt.db.execute("INSERT INTO labels(decision_id,instrument,direction,confidence,entry_mid,exit_mid,net_return,hit,labeled_us,status) "
+                      "VALUES (?,?,?,?,?,?,?,?,?,?)", (decision_id, instrument, "long", 0.85, 100.0, 100.0,
+                      magnitude if hit else -magnitude, int(hit), 0, "resolved"))
+
+
+class ReviewFindingTests(RuntimeCase):
+    def test_calibrated_kelly_caps_at_position_limit_instead_of_refusing(self):
+        rt = self.runtime(GOOD)
+        seed_labels(rt, 72, 48)
+        result = self.advance(rt, 21)["instruments"]["AAVE-USD"]
+        self.assertEqual("buy", result["status"], result["reasons"])
+        self.assertIn("SIZE_CAPPED", result["reasons"])
+        fill = rt.db.execute("SELECT * FROM fills").fetchone()
+        self.assertEqual(0, fill["exploration"])
+        self.assertTrue(D("499") < D(fill["notional_usd"]) <= D("500"), fill["notional_usd"])
+
+    def test_negative_calibrated_edge_holds_and_never_explores(self):
+        rt = self.runtime(GOOD, explore_fraction=0.001)
+        seed_labels(rt, 48, 72)
+        result = self.advance(rt, 21)["instruments"]["AAVE-USD"]
+        self.assertEqual("hold", result["status"])
+        self.assertIn("NEGATIVE_EDGE", result["reasons"])
+        self.assertNotIn("EXPLORATION", result["reasons"])
+        self.assertEqual(0, rt.db.execute("SELECT COUNT(*) FROM fills").fetchone()[0])
+
+    def test_cohort_counts_only_gate_open_decisions(self):
+        rt = self.runtime(GOOD)
+        seed_labels(rt, 72, 48, gate_open=0)
+        self.assertIn("CALIBRATION_INSUFFICIENT", self.advance(rt, 21)["instruments"]["AAVE-USD"]["reasons"])
+
+    def test_low_confidence_escalation_does_not_suppress_time_stop(self):
+        rt = self.runtime(GOOD, explore_fraction=0.001, horizon_candles=3)
+        self.assertEqual("buy", self.advance(rt, 21)["instruments"]["AAVE-USD"]["status"])
+        rt.reflex = Fixed(replace(GOOD, direction_confidence=0.55))
+        self.advance(rt, 2)
+        result = self.advance(rt, 1)["instruments"]["AAVE-USD"]
+        self.assertEqual("sell", result["status"], result["reasons"])
+        self.assertIn("LOW_CONFIDENCE", result["reasons"])
+        self.assertEqual({}, rt.positions())
+
+    def test_crisis_exits_an_open_position(self):
+        rt = self.runtime(GOOD, explore_fraction=0.001)
+        self.assertEqual("buy", self.advance(rt, 21)["instruments"]["AAVE-USD"]["status"])
+        rt.reflex = Fixed(replace(GOOD, regime=Regime.CRISIS))
+        result = self.advance(rt, 1)["instruments"]["AAVE-USD"]
+        self.assertEqual("sell", result["status"], result["reasons"])
+        self.assertIn("BRAIN_CRISIS", result["reasons"])
+
+    def test_drawdown_latch_exits_an_open_position(self):
+        rt = self.runtime(GOOD, explore_fraction=0.001)
+        self.assertEqual("buy", self.advance(rt, 21)["instruments"]["AAVE-USD"]["status"])
+        rt.db.execute("INSERT INTO latches(kind,action,reason,at_us) VALUES ('DRAWDOWN_LATCH','set','test',0)")
+        self.assertEqual("sell", self.advance(rt, 1)["instruments"]["AAVE-USD"]["status"])
+
+    def test_reflex_exception_is_contained_and_atomic(self):
+        class Boom:
+            reflex_id = "boom"
+            def judge(self, snapshot):
+                raise RuntimeError("provider exploded")
+        rt = self.runtime(GOOD)
+        self.advance(rt, 20)
+        rt.reflex = Boom()
+        self.clock.us += 60_000_000
+        before = rt.db.execute("SELECT COUNT(*) FROM snapshots").fetchone()[0]
+        result = rt.cycle()["instruments"]["AAVE-USD"]
+        self.assertEqual(["DECISION_ERROR:RuntimeError"], result["reasons"])
+        self.assertEqual(before, rt.db.execute("SELECT COUNT(*) FROM snapshots").fetchone()[0])
+        self.assertFalse(rt.db.in_transaction)
+        rt.reflex = Fixed(GOOD)
+        retried = rt.cycle()["instruments"]["AAVE-USD"]  # same candle: no DUPLICATE_CANDLE lock-out
+        self.assertNotIn("DUPLICATE_CANDLE", retried["reasons"])
+        self.assertIn("decision_id", retried)
+
+    def test_serve_survives_a_cycle_exception(self):
+        rt = self.runtime(GOOD)
+        calls = {"n": 0}
+        def flaky():
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("transient")
+            return {}
+        rt.cycle = flaky
+        self.assertEqual(2, rt.serve(lambda: calls["n"] >= 3, sleep=lambda s: None))
+        self.assertEqual(3, calls["n"])
+
+    def test_label_window_is_bounded_and_gaps_are_unresolvable(self):
+        rt = self.runtime(GOOD, horizon_candles=3)
+        self.advance(rt, 21)
+        self.clock.us += 10 * 60_000_000  # outage: no snapshot inside [close+h, close+h+step)
+        self.advance(rt, 1)
+        rows = rt.db.execute("SELECT status, hit FROM labels").fetchall()
+        self.assertEqual([("unresolvable", None)], [tuple(r) for r in rows])
+        self.assertIsNone(rt.brier()[0])
+
+    def test_features_require_contiguous_candles(self):
+        rt = self.runtime(GOOD)
+        self.advance(rt, 25)
+        self.clock.us += 5 * 60_000_000
+        result = self.advance(rt, 1)["instruments"]["AAVE-USD"]
+        self.assertEqual("warmup", result["status"])
+        self.assertEqual(0, result["history"])
+
+    def test_observation_must_sit_at_a_true_candle_close(self):
+        rt = self.runtime()
+        self.clock.us += 30_000_000
+        result = rt.cycle()["instruments"]["AAVE-USD"]
+        self.assertEqual(["AWAY_FROM_CLOSE"], result["reasons"])
+        self.clock.us += 31_000_000
+        rt.cycle()
+        close = rt.db.execute("SELECT candle_close_us, event_us FROM snapshots").fetchone()
+        self.assertEqual(0, close["candle_close_us"] % 60_000_000)
+        self.assertTrue(0 <= close["event_us"] - close["candle_close_us"] <= rt.config.close_tolerance_us)
+
+    def test_brier_split_and_unresolved_escalations(self):
+        rt = self.runtime(replace(GOOD, direction_confidence=0.5), horizon_candles=3)
+        self.advance(rt, 25)
+        status = json.loads((self.dir / "status.json").read_text())
+        self.assertIn("brier_directional", status)
+        self.assertIn("brier_neutral", status)
+        self.assertEqual(status["brier_directional"], 0.25)
+        self.assertIsNone(status["brier_neutral"])
+        pending = status["pending_escalations"]
+        self.assertGreater(pending, 0)
+        first = rt.db.execute("SELECT escalation_id FROM escalations LIMIT 1").fetchone()[0]
+        rt.resolve_escalation(first, "brain reviewed")
+        self.assertEqual(pending - 1, rt.write_status(self.clock.us, {}, 0)["pending_escalations"])
+
+    def test_restart_with_mismatched_config_is_refused(self):
+        self.runtime().close()
+        with self.assertRaisesRegex(ValueError, "config mismatch"):
+            PaperRuntime(RuntimeConfig(data_dir=self.dir, instruments=("AAVE-USD",), starting_cash_usd=D("5000")),
+                         book_source=lambda p: {}, clock_us=self.clock)
+        with self.assertRaisesRegex(ValueError, "config mismatch"):
+            PaperRuntime(RuntimeConfig(data_dir=self.dir, instruments=("AAVE-USD",), candle_seconds=300),
+                         book_source=lambda p: {}, clock_us=self.clock)
+
+    def test_every_table_refuses_update_and_delete(self):
+        import sqlite3
+        from bot.autonomous.runtime import _APPEND_ONLY
+        rt = self.runtime(GOOD, explore_fraction=0.001, horizon_candles=3)
+        self.advance(rt, 26)
+        rt.db.execute("INSERT INTO latches(kind,action,reason,at_us) VALUES ('X','set','t',0)")
+        rt.db.execute("INSERT INTO escalations VALUES ('e','d','LOW_CONFIDENCE','{}','pending_brain',0)")
+        rt.resolve_escalation("e", "reviewed")
+        for table in _APPEND_ONLY:
+            self.assertGreater(rt.db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0], 0, table)
+            for sql in (f"UPDATE {table} SET rowid=rowid", f"DELETE FROM {table}"):
+                with self.subTest(sql), self.assertRaisesRegex(sqlite3.DatabaseError, "append-only"):
+                    rt.db.execute(sql)
+
+    def test_snapshot_wire_is_exact_and_budget_enforced(self):
+        from unittest import mock
+        rt = self.runtime()
+        self.advance(rt, 1)
+        snap = rt.snapshot("AAVE-USD", {"bids": [[99.99, 1]], "asks": [[100.01, 1]]}, self.clock.us - 500_000,
+                           self.clock.us - 100_000, self.clock.us, rt.mark({}, self.clock.us))
+        wire = json.loads(snap.wire())
+        self.assertEqual({"v", "i", "c", "mid", "spr", "imb", "rv", "mom", "t", "n", "inv", "dd", "dl"}, set(wire))
+        self.assertEqual(-(-len(snap.wire().encode()) // 3), snap.token_estimate())
+        with mock.patch.object(Snapshot, "token_estimate", return_value=400), self.assertRaises(ValueError):
+            rt.snapshot("AAVE-USD", {"bids": [[99.99, 1]], "asks": [[100.01, 1]]}, self.clock.us - 500_000,
+                        self.clock.us - 100_000, self.clock.us, rt.mark({}, self.clock.us))
+
+    def test_nightly_review_is_bounded_to_its_day(self):
+        rt = self.runtime(GOOD, explore_fraction=0.001, horizon_candles=3)
+        seed_labels(rt, 1, 1)  # epoch-day rows must not enter today's review
+        self.advance(rt, 30, drift=0.004)
+        report = nightly_review(self.dir / "runtime.sqlite3", self.dir / "reviews", now_us=self.clock.us, fill_cap=1)
+        self.assertNotIn("seed-1-0", [m["decision_id"] for m in report["misses"]])
+        self.assertTrue(all(not d.startswith("seed") for d in report["metrics"]["decision_ids_sample"]))
+        self.assertEqual(1, len(report["fills"]))
+        self.assertTrue(report["metrics"]["fills_truncated"])
+
+    def test_hot_queries_are_indexed(self):
+        rt = self.runtime()
+        names = {r[0] for r in rt.db.execute("SELECT name FROM sqlite_master WHERE type='index'")}
+        for index in ("decisions_close", "labels_labeled", "fills_instrument", "escalations_created"):
+            self.assertIn(index, names)
 
 
 if __name__ == "__main__":
