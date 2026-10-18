@@ -41,6 +41,24 @@ class FakeBooks:
                 "bids": [[mid - half, 50.0], [mid - 2 * half, 50.0]], "asks": [[mid + half, 50.0], [mid + 2 * half, 50.0]]}
 
 
+def online_rules(**changes):
+    rules = {"id": "AAVE-USD", "base_increment": "0.00000001", "quote_increment": "0.01", "min_market_funds": "1",
+             "status": "online", "trading_disabled": False, "post_only": False, "limit_only": False, "cancel_only": False}
+    rules.update(changes)
+    return rules
+
+
+class FakeRules:
+    def __init__(self, **changes):
+        self.changes, self.calls, self.fail = changes, 0, False
+
+    def __call__(self, product):
+        self.calls += 1
+        if self.fail:
+            raise ConnectionError("rules outage")
+        return dict(online_rules(**self.changes), id=product)
+
+
 class Fixed:
     reflex_id = "fixed-test"
 
@@ -62,12 +80,13 @@ class RuntimeCase(unittest.TestCase):
         self.clock = Clock(START_US + 1_000_000)
         self.price = {"v": 100.0}
 
-    def runtime(self, judgment=None, **config):
+    def runtime(self, judgment=None, rules=None, **config):
         config.setdefault("instruments", ("AAVE-USD",))
         config.setdefault("paper_armed", True)
         books = FakeBooks(self.clock, {"AAVE-USD": lambda: self.price["v"]})
+        self.rules = rules or FakeRules()
         rt = PaperRuntime(RuntimeConfig(data_dir=self.dir, **config), book_source=books, clock_us=self.clock,
-                          reflex=Fixed(judgment) if judgment else None)
+                          reflex=Fixed(judgment) if judgment else None, rules_source=self.rules)
         self.addCleanup(rt.close)
         return rt
 
@@ -266,7 +285,9 @@ class RuntimeTests(RuntimeCase):
         from contextlib import redirect_stdout
         from unittest import mock
         books = FakeBooks(self.clock, {"BTC-USD": 60000.0, "ETH-USD": 3000.0})
+        rules = FakeRules()
         with mock.patch("bot.autonomous.runtime._public_book_source", return_value=books), \
+                mock.patch("bot.autonomous.runtime._public_rules_source", return_value=rules), \
                 mock.patch("bot.autonomous.runtime.time.time_ns", return_value=self.clock.us * 1000):
             out = io.StringIO()
             with redirect_stdout(out):
@@ -276,7 +297,8 @@ class RuntimeTests(RuntimeCase):
         self.assertEqual(("paper", False, False, 0), (status["mode"], status["live"], status["armed_paper"], status["fills"]))
         self.assertEqual(status, json.loads((self.dir / "status.json").read_text()))
         self.assertEqual({"warmup"}, {r["status"] for r in status["instruments"].values()})
-        self.assertEqual(2, books.calls)  # one public book read per instrument, no other source
+        self.assertEqual(2, books.calls)  # one public book read per instrument
+        self.assertEqual(2, rules.calls)  # one public product-details read per instrument
         db = open_db(self.dir / "runtime.sqlite3")
         self.addCleanup(db.close)
         rows = db.execute("SELECT instrument, candle_close_us, event_us, token_estimate FROM snapshots").fetchall()
@@ -285,22 +307,28 @@ class RuntimeTests(RuntimeCase):
                             and r["token_estimate"] < 400 for r in rows))
         self.assertEqual("60", dict(db.execute("SELECT key, value FROM meta").fetchall())["candle_seconds"])
         with mock.patch("bot.autonomous.runtime._public_book_source", return_value=books), \
+                mock.patch("bot.autonomous.runtime._public_rules_source", return_value=rules), \
                 self.assertRaisesRegex(ValueError, "config mismatch"):
             main(["--paper", "--once", "--data-dir", str(self.dir), "--candle-seconds", "300"])
 
 
-def seed_labels(rt, hits, misses, magnitude=0.015, gate_open=1, instrument="AAVE-USD", reflex_id="fixed-test"):
-    """Resolved long labels behind gate-open decisions, far in the past so they never collide with live candles."""
+def seed_labels(rt, hits, misses, magnitude=0.015, gate_open=1, instrument="AAVE-USD", reflex_id="fixed-test",
+                regime="trending", mid_magnitude=None, prefix="seed"):
+    """Resolved long labels behind gate-open decisions, far in the past so they never collide with live candles.
+
+    ``magnitude`` is the executable (cost-aware) return; ``mid_magnitude`` the mid return, defaulting to the same."""
     for k in range(hits + misses):
-        decision_id = "seed-%d-%d" % (gate_open, k)
+        decision_id = "%s-%d-%d" % (prefix, gate_open, k)
         hit = k < hits
         rt.db.execute("INSERT INTO decisions(decision_id,instrument,candle_close_us,reflex_id,calibrated,regime,direction,confidence,"
                       "toxic,quality,risk_state,gate_open,action,reasons,mid,created_us) "
-                      "VALUES (?,?,?,?,0,'trending','long',0.85,0,2,'safe',?,'hold','[]',100,0)",
-                      (decision_id, instrument, k * 60_000_000, reflex_id, gate_open))
-        rt.db.execute("INSERT INTO labels(decision_id,instrument,direction,confidence,entry_mid,exit_mid,net_return,hit,labeled_us,status) "
-                      "VALUES (?,?,?,?,?,?,?,?,?,?)", (decision_id, instrument, "long", 0.85, 100.0, 100.0,
-                      magnitude if hit else -magnitude, int(hit), 0, "resolved"))
+                      "VALUES (?,?,?,?,0,?,'long',0.85,0,2,'safe',?,'hold','[]',100,0)",
+                      (decision_id, instrument, k * 60_000_000, reflex_id, regime, gate_open))
+        mid = magnitude if mid_magnitude is None else mid_magnitude
+        rt.db.execute("INSERT INTO labels(decision_id,instrument,direction,confidence,entry_mid,exit_mid,net_return,hit,labeled_us,"
+                      "status,mid_return,exec_return,regime) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                      (decision_id, instrument, "long", 0.85, 100.0, 100.0, magnitude if hit else -magnitude, int(hit), 0,
+                       "resolved", mid if hit else -mid, magnitude if hit else -magnitude, regime))
 
 
 class ReviewFindingTests(RuntimeCase):
@@ -583,6 +611,112 @@ class SecondReviewTests(RuntimeCase):
             self.assertIn("INDEX", plan.upper(), plan)
         plan = " ".join(r[3] for r in rt.db.execute("EXPLAIN QUERY PLAN " + rt.PENDING_ESCALATIONS_SQL, (0,)))
         self.assertIn("escalations_created", plan)
+
+
+class MarketRulesAndCostLabelTests(RuntimeCase):
+    def test_public_product_details_fetch_parses_rules(self):
+        from data.public_metrics import fetch_coinbase_product
+        class Response:
+            status_code, content = 200, b"{}"
+            def raise_for_status(self): pass
+            def json(self): return online_rules(base_increment="0.001", quote_increment="0.01", status="online")
+        seen = {}
+        class Log:
+            def record(self, **kw): seen.update(kw)
+        def getter(url, **kw):
+            seen["url"] = url
+            return Response()
+        rules = fetch_coinbase_product(Log(), "AAVE-USD", getter=getter)
+        self.assertEqual("https://api.exchange.coinbase.com/products/AAVE-USD", seen["url"])
+        self.assertEqual(("0.001", "0.01", "online", False), (rules["base_increment"], rules["quote_increment"],
+                                                              rules["status"], rules["trading_disabled"]))
+        self.assertFalse(rules["dispatched"])
+        with self.assertRaises(ValueError):
+            fetch_coinbase_product(Log(), "AAVE/USD", getter=getter)
+
+    def test_rules_are_cached_with_ttl(self):
+        rt = self.runtime(market_rules_ttl_us=5 * 60_000_000)
+        self.advance(rt, 4)
+        self.assertEqual(1, self.rules.calls)
+        self.advance(rt, 2)
+        self.assertEqual(2, self.rules.calls)
+
+    def test_unavailable_markets_hold(self):
+        for changes in (dict(status="delisted"), dict(trading_disabled=True), dict(cancel_only=True), dict(post_only=True)):
+            with self.subTest(changes):
+                self.tmp = tempfile.TemporaryDirectory(); self.addCleanup(self.tmp.cleanup); self.dir = Path(self.tmp.name)
+                rt = self.runtime(GOOD, rules=FakeRules(**changes), explore_fraction=0.001)
+                result = self.advance(rt, 22)["instruments"]["AAVE-USD"]
+                self.assertEqual(["MARKET_UNAVAILABLE"], result["reasons"])
+                self.assertEqual(0, rt.db.execute("SELECT COUNT(*) FROM fills").fetchone()[0])
+
+    def test_rules_outage_without_fresh_cache_holds(self):
+        rules = FakeRules()
+        rules.fail = True
+        rt = self.runtime(GOOD, rules=rules, explore_fraction=0.001)
+        self.assertEqual(["MARKET_RULES_UNAVAILABLE"], self.advance(rt, 22)["instruments"]["AAVE-USD"]["reasons"])
+
+    def test_fill_rounds_to_base_increment_tick_and_min_funds(self):
+        from bot.autonomous.runtime import MarketRules
+        rules = MarketRules.parse(online_rules(base_increment="0.001", quote_increment="0.05", min_market_funds="10"), 0)
+        asks = [(100.0, 0.3337), (100.05, 10.0)]
+        qty, avg, notional, fee = paper_fill(asks, "buy", D("50.30"), None, D("100.07"), D("0.006"), rules)
+        self.assertEqual(qty, qty.quantize(D("0.001")))
+        self.assertEqual(0, fee % D("0.05"))  # fee rounds up to a multiple of the quote increment
+        self.assertLessEqual(notional + fee, D("50.30"))
+        self.assertEqual(D("100.05"), rules.round_limit(D("100.07"), "buy"))  # buy limit rounds down
+        self.assertEqual(D("100.10"), rules.round_limit(D("100.07"), "sell"))  # sell limit rounds up
+        self.assertIsNone(paper_fill(asks, "buy", D("9"), None, D("100.05"), D("0.006"), rules))  # below min funds
+
+    def test_entry_size_floors_to_quote_increment(self):
+        self.price["v"] = 1000.0  # a whole-dollar tick must not round the buy limit below the ask
+        rt = self.runtime(GOOD, rules=FakeRules(quote_increment="1"))
+        seed_labels(rt, 72, 48)
+        self.advance(rt, 21)
+        fill = rt.db.execute("SELECT * FROM fills").fetchone()
+        self.assertTrue(D("499") <= D(fill["notional_usd"]) <= D("500"))
+        self.assertEqual(D(fill["fee_usd"]), D(fill["fee_usd"]).quantize(D("1")))
+
+    def test_labels_use_executable_prices_and_store_both_returns(self):
+        rt = self.runtime(GOOD, horizon_candles=3)
+        rt.book_source.spread = 0.0018  # 18 bp spread: the mid is flat but a round trip loses the spread
+        self.advance(rt, 25)
+        row = rt.db.execute("SELECT * FROM labels WHERE status='resolved' LIMIT 1").fetchone()
+        self.assertAlmostEqual(0.0, row["mid_return"], places=9)
+        self.assertAlmostEqual(0.9991 / 1.0009 - 1 - 0.012, row["exec_return"], places=9)
+        self.assertEqual(0, row["hit"])
+        self.assertEqual("trending", row["regime"])
+
+    def test_calibration_uses_executable_not_mid_returns(self):
+        rt = self.runtime(GOOD, explore_fraction=0.001)
+        # Mid returns look like a 60% winner; after spread and fees every label lost.
+        seed_labels(rt, 0, 120, magnitude=0.003, mid_magnitude=0.015)
+        result = self.advance(rt, 21)["instruments"]["AAVE-USD"]
+        self.assertIn("NEGATIVE_EDGE", result["reasons"])
+
+    def test_calibration_cohort_is_per_regime(self):
+        rt = self.runtime(GOOD)
+        seed_labels(rt, 72, 48, regime="mean_reverting")
+        self.assertIn("CALIBRATION_INSUFFICIENT", self.advance(rt, 21)["instruments"]["AAVE-USD"]["reasons"])
+
+    def test_legacy_database_migrates_cleanly(self):
+        import sqlite3
+        db = sqlite3.connect(self.dir / "runtime.sqlite3")
+        db.executescript("""
+            CREATE TABLE labels(decision_id TEXT PRIMARY KEY, instrument TEXT, direction TEXT, confidence REAL,
+              entry_mid REAL, exit_mid REAL, net_return REAL, hit INTEGER, labeled_us INTEGER);
+            CREATE TABLE decisions(decision_id TEXT PRIMARY KEY, instrument TEXT, candle_close_us INTEGER, reflex_id TEXT,
+              calibrated INTEGER, regime TEXT, direction TEXT, confidence REAL, toxic INTEGER, quality INTEGER, risk_state TEXT,
+              gate_open INTEGER, action TEXT, reasons TEXT, mid REAL, created_us INTEGER);
+            INSERT INTO labels VALUES ('old','AAVE-USD','long',0.85,100,101,0.01,1,0);
+        """)
+        db.close()
+        rt = self.runtime(GOOD)
+        columns = {r["name"] for r in rt.db.execute("PRAGMA table_info(labels)")}
+        self.assertTrue({"status", "mid_return", "exec_return", "regime"} <= columns)
+        self.assertIn("phase", {r["name"] for r in rt.db.execute("PRAGMA table_info(decisions)")})
+        old = rt.db.execute("SELECT * FROM labels WHERE decision_id='old'").fetchone()
+        self.assertIsNone(old["exec_return"])  # legacy mid-only labels never feed executable calibration
 
 
 if __name__ == "__main__":

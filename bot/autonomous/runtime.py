@@ -17,10 +17,12 @@ An explicit ``--explore-fraction`` permits tiny labeled exploration entries
 #      (Task 15); today JEV_API_KEY only records `jev_configured_unwired` and stays offline.
 #   2. Route paper orders through OrderAuthority/Ledger (Task 12/16) instead of this
 #      runtime's own append-only fill table, so paper and live share one accounting path.
-#   3. Exchange tick/lot rules are approximated (lot 1e-8, fee bound estimate 0.6%);
-#      replace with verified MarketRules per instrument.
-#   4. Labels use mids at exactly close+horizon (gaps are UNRESOLVABLE); add spread/slippage-aware
-#      exit labels and per-regime cohorts. positions()/cash() rescan fills each cycle (fine at paper
+#   3. DONE: public Coinbase product details (increments, min funds, status) drive rounding and tradability
+#      (TTL cache). The fee bound stays an ESTIMATE (0.6% taker); account-specific fee tiers need
+#      authenticated evidence (Task 13) before any live use.
+#   4. DONE: labels are executable (entry best ask, exit best bid, net round-trip fees) with per-regime
+#      cohorts; still top-of-book only — walk depth for the typical notional, and add a slippage stress.
+#      positions()/cash() rescan fills each cycle (fine at paper
 #      volumes; snapshot them if fills grow large).
 #   5. Dashboard read of status.json (Task 17); operator clear-latch / resolve-escalation are local
 #      methods and still need the authenticated control path.
@@ -91,6 +93,7 @@ class RuntimeConfig:
     min_labels: int = 100
     max_book_age_us: int = 10_000_000
     close_tolerance_us: int = 10_000_000
+    market_rules_ttl_us: int = 3_600_000_000
     brier_window: int = 2_000
     paper_armed: bool = False
 
@@ -190,6 +193,55 @@ class OfflineReflex:
         return Judgment(regime, direction, round(confidence, 6), toxic, int(quality), risk, self.reflex_id)
 
 
+@dataclass(frozen=True)
+class MarketRules:
+    """Public Coinbase product details. Increments are exchange-published; tradability is code-checked."""
+    instrument: str
+    base_increment: Decimal
+    quote_increment: Decimal
+    min_market_funds: Decimal
+    status: str
+    trading_disabled: bool
+    post_only: bool
+    limit_only: bool
+    cancel_only: bool
+    fetched_us: int
+
+    @classmethod
+    def parse(cls, raw: dict, fetched_us: int) -> "MarketRules":
+        try:
+            increments = [Decimal(str(raw[k])) for k in ("base_increment", "quote_increment", "min_market_funds")]
+        except Exception as exc:
+            raise Unavailable("MARKET_RULES_UNAVAILABLE") from exc
+        flags = [raw.get(k, False) for k in ("trading_disabled", "post_only", "limit_only", "cancel_only")]
+        if (any(not x.is_finite() or x < 0 for x in increments) or increments[0] <= 0 or increments[1] <= 0
+                or any(type(f) is not bool for f in flags) or not isinstance(raw.get("status"), str)):
+            raise Unavailable("MARKET_RULES_UNAVAILABLE")
+        return cls(str(raw.get("id")), *increments, raw["status"], *flags, fetched_us)
+
+    @property
+    def tradable(self) -> bool:
+        # limit_only is compatible with IOC limit orders; post_only cannot take liquidity; cancel_only cannot trade.
+        return self.status == "online" and not (self.trading_disabled or self.post_only or self.cancel_only)
+
+    @staticmethod
+    def _step(value: Decimal, step: Decimal, rounding) -> Decimal:
+        return (value / step).to_integral_value(rounding=rounding) * step
+
+    def round_limit(self, price: Decimal, side: str) -> Decimal:
+        """Adverse to authorization: a buy limit rounds down to the tick, a sell limit rounds up."""
+        return self._step(price, self.quote_increment, ROUND_FLOOR if side == "buy" else ROUND_CEILING)
+
+    def floor_qty(self, qty: Decimal) -> Decimal:
+        return self._step(qty, self.base_increment, ROUND_FLOOR)
+
+    def floor_quote(self, usd: Decimal) -> Decimal:
+        return self._step(usd, self.quote_increment, ROUND_FLOOR)
+
+    def ceil_fee(self, usd: Decimal) -> Decimal:
+        return self._step(usd, self.quote_increment, ROUND_CEILING)
+
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
 CREATE TABLE IF NOT EXISTS snapshots(instrument TEXT, candle_close_us INTEGER, event_us INTEGER, received_us INTEGER,
@@ -203,7 +255,8 @@ CREATE TABLE IF NOT EXISTS fills(fill_id TEXT PRIMARY KEY, decision_id TEXT, ins
 CREATE TABLE IF NOT EXISTS equity_marks(mark_id INTEGER PRIMARY KEY AUTOINCREMENT, at_us INTEGER, equity_usd TEXT,
   cash_usd TEXT, high_water_usd TEXT, day_open_usd TEXT, day TEXT);
 CREATE TABLE IF NOT EXISTS labels(decision_id TEXT PRIMARY KEY, instrument TEXT, direction TEXT, confidence REAL,
-  entry_mid REAL, exit_mid REAL, net_return REAL, hit INTEGER, labeled_us INTEGER, status TEXT DEFAULT 'resolved');
+  entry_mid REAL, exit_mid REAL, net_return REAL, hit INTEGER, labeled_us INTEGER, status TEXT DEFAULT 'resolved',
+  mid_return REAL, exec_return REAL, regime TEXT);
 CREATE TABLE IF NOT EXISTS escalations(escalation_id TEXT PRIMARY KEY, decision_id TEXT, code TEXT, payload TEXT,
   status TEXT, created_us INTEGER);
 CREATE TABLE IF NOT EXISTS escalation_resolutions(escalation_id TEXT PRIMARY KEY, note TEXT, resolved_us INTEGER);
@@ -216,6 +269,7 @@ CREATE INDEX IF NOT EXISTS decisions_created ON decisions(created_us);
 CREATE INDEX IF NOT EXISTS labels_labeled ON labels(labeled_us);
 CREATE INDEX IF NOT EXISTS labels_instrument ON labels(instrument, direction);
 CREATE INDEX IF NOT EXISTS labels_status ON labels(status);
+CREATE INDEX IF NOT EXISTS labels_cohort ON labels(instrument, direction, regime);
 CREATE INDEX IF NOT EXISTS fills_instrument ON fills(instrument, created_us);
 CREATE INDEX IF NOT EXISTS fills_created ON fills(created_us);
 CREATE INDEX IF NOT EXISTS escalations_created ON escalations(created_us);
@@ -232,10 +286,13 @@ def open_db(path: Path) -> sqlite3.Connection:
     db.execute("PRAGMA synchronous=FULL")
     db.execute("PRAGMA busy_timeout=5000")
     db.executescript(_SCHEMA)
-    if "status" not in {r["name"] for r in db.execute("PRAGMA table_info(labels)")}:
-        db.execute("ALTER TABLE labels ADD COLUMN status TEXT DEFAULT 'resolved'")  # pre-review database
-    if "phase" not in {r["name"] for r in db.execute("PRAGMA table_info(decisions)")}:
-        db.execute("ALTER TABLE decisions ADD COLUMN phase TEXT DEFAULT 'live'")
+    # Additive migrations for databases written by earlier runtime versions. Legacy labels keep NULL executable
+    # returns and regimes, so they can never enter cost-aware, per-regime calibration.
+    for table, column, decl in (("labels", "status", "TEXT DEFAULT 'resolved'"), ("labels", "mid_return", "REAL"),
+                                ("labels", "exec_return", "REAL"), ("labels", "regime", "TEXT"),
+                                ("decisions", "phase", "TEXT DEFAULT 'live'")):
+        if column not in {r["name"] for r in db.execute(f"PRAGMA table_info({table})")}:
+            db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
     db.executescript(_INDEXES)
     for table in _APPEND_ONLY:
         for op in ("UPDATE", "DELETE"):
@@ -264,12 +321,16 @@ def _levels(rows) -> list[tuple[float, float]]:
     return out
 
 
-def paper_fill(levels, side: str, budget_usd: Decimal | None, qty: Decimal | None, limit: Decimal, fee_rate: Decimal):
-    """Adverse IOC paper fill. Walk levels to the limit; round qty down to the lot and fee up to µUSD.
+def paper_fill(levels, side: str, budget_usd: Decimal | None, qty: Decimal | None, limit: Decimal, fee_rate: Decimal,
+               rules: MarketRules | None = None):
+    """Adverse IOC paper fill. Walk levels to the limit; round qty down to the base increment and the fee up to the
+    quote increment (µUSD without rules). Fills below the venue's minimum funds do not happen.
 
     Buys spend at most ``budget_usd`` including fee. Sells sell at most ``qty``.
     Returns (qty, avg_price, notional, fee) or None when nothing fills.
     """
+    lot = rules.base_increment if rules else LOT
+    fee_step = rules.quote_increment if rules else MICRO_USD
     filled = notional = Decimal(0)
     ordered = sorted(levels, key=lambda l: l[0], reverse=(side == "sell"))
     for price_f, size_f in ordered:
@@ -277,18 +338,18 @@ def paper_fill(levels, side: str, budget_usd: Decimal | None, qty: Decimal | Non
         if (side == "buy" and price > limit) or (side == "sell" and price < limit):
             break
         if side == "buy":
-            room = (budget_usd - MICRO_USD - notional * (1 + fee_rate)) / (price * (1 + fee_rate))  # µUSD margin for fee ceil
+            room = (budget_usd - fee_step - notional * (1 + fee_rate)) / (price * (1 + fee_rate))  # margin for fee ceil
         else:
             room = qty - filled
-        take = min(size, room).quantize(LOT, rounding=ROUND_FLOOR)
+        take = MarketRules._step(min(size, room), lot, ROUND_FLOOR)
         if take <= 0:
             break
         filled += take
         notional += take * price
     if filled <= 0:
         return None
-    fee = (notional * fee_rate).quantize(MICRO_USD, rounding=ROUND_CEILING)
-    if side == "buy" and notional + fee > budget_usd:
+    fee = MarketRules._step(notional * fee_rate, fee_step, ROUND_CEILING)
+    if (side == "buy" and notional + fee > budget_usd) or (rules and notional < rules.min_market_funds):
         return None
     return filled, (notional / filled), notional, fee
 
@@ -301,7 +362,8 @@ class PaperRuntime:
                                "AND d.instrument=? AND e.created_us>? AND r.escalation_id IS NULL LIMIT 1")
 
     def __init__(self, config: RuntimeConfig, *, book_source: Callable[[str], dict] | None = None,
-                 clock_us: Callable[[], int] | None = None, reflex: ReflexPort | None = None):
+                 clock_us: Callable[[], int] | None = None, reflex: ReflexPort | None = None,
+                 rules_source: Callable[[str], dict] | None = None):
         self.config = config
         self.clock_us = clock_us or (lambda: time.time_ns() // 1000)
         config.data_dir.mkdir(parents=True, exist_ok=True)
@@ -312,6 +374,8 @@ class PaperRuntime:
             self.db.close()
             raise
         self.book_source = book_source or _public_book_source(config.data_dir)
+        self.rules_source = rules_source or _public_rules_source(config.data_dir)
+        self._rules: dict[str, MarketRules] = {}
         self.reflex = reflex or OfflineReflex()
         self.jev_note = "jev_configured_unwired" if os.environ.get("JEV_API_KEY") else "jev_not_configured"
         if self.db.execute("SELECT COUNT(*) FROM equity_marks").fetchone()[0] == 0:
@@ -414,6 +478,18 @@ class PaperRuntime:
         received = self.clock_us()
         return book, parse_event_us(book.get("exchange_time")), received
 
+    def market_rules(self, instrument: str, now: int) -> MarketRules:
+        """Cached public product details; a failed refresh never extends a cache past its TTL."""
+        cached = self._rules.get(instrument)
+        if cached is not None and now - cached.fetched_us < self.config.market_rules_ttl_us:
+            return cached
+        try:
+            rules = MarketRules.parse(self.rules_source(instrument), now)
+        except Exception as exc:
+            raise Unavailable("MARKET_RULES_UNAVAILABLE") from exc
+        self._rules[instrument] = rules
+        return rules
+
     def snapshot(self, instrument, book, event_us, received_us, cutoff_us, account) -> Snapshot:
         """``candle_close_us`` is the true close: the candle boundary nearest the event, which must lie within
         ``close_tolerance_us`` of it. Features use only contiguous earlier closes received by the cutoff."""
@@ -452,27 +528,35 @@ class PaperRuntime:
         return snap
 
     # ---------- calibration ----------
-    def calibrated_edge(self, instrument: str, reflex_id: str, now_us: int) -> tuple[Decimal, Decimal, Decimal, int]:
+    def calibrated_edge(self, instrument: str, reflex_id: str, now_us: int, regime: str) -> tuple[Decimal, Decimal, Decimal, int]:
         """Wilson-lower hit rate and mean net payoffs over resolved long labels of gate-open decisions.
 
         Below ``min_labels`` the prior 0.5 with symmetric payoff is returned (Kelly zero). A supported cohort
         with no wins returns p=0; with no losses the loss per dollar is floored at the round-trip fee."""
-        rows = self.db.execute("SELECT l.hit, l.net_return FROM labels l JOIN decisions d USING(decision_id) "
-                               "WHERE l.instrument=? AND l.direction='long' AND l.status='resolved' AND d.reflex_id=? "
-                               "AND d.gate_open=1 AND d.phase='live' AND l.labeled_us<=?", (instrument, reflex_id, now_us)).fetchall()
+        rows = self.db.execute("SELECT l.hit, l.exec_return FROM labels l JOIN decisions d USING(decision_id) "
+                               "WHERE l.instrument=? AND l.direction='long' AND l.regime=? AND l.status='resolved' "
+                               "AND l.exec_return IS NOT NULL AND d.reflex_id=? AND d.gate_open=1 AND d.phase='live' "
+                               "AND l.labeled_us<=?", (instrument, regime, reflex_id, now_us)).fetchall()
         n = len(rows)
         if n < self.config.min_labels:
             return Decimal("0.5"), Decimal(1), Decimal(1), n
         cost = 2 * self.config.fee_rate
-        wins = [r["net_return"] for r in rows if r["hit"]]
-        losses = [-r["net_return"] for r in rows if not r["hit"] and r["net_return"] < 0]
+        wins = [r["exec_return"] for r in rows if r["hit"]]
+        losses = [-r["exec_return"] for r in rows if not r["hit"] and r["exec_return"] < 0]
         if not wins:
             return Decimal(0), cost, cost, n
         loss = Decimal(str(statistics.fmean(losses))) if losses else cost
         return Decimal(str(wilson_lower(len(wins), n))), Decimal(str(statistics.fmean(wins))), max(loss, cost), n
 
+    _LABEL_INSERT = ("INSERT INTO labels(decision_id,instrument,direction,confidence,entry_mid,exit_mid,net_return,hit,"
+                     "labeled_us,status,mid_return,exec_return,regime) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)")
+
     def label_matured(self, now: int) -> int:
-        """Label each decision from the snapshot at exactly close+horizon; a missing close is UNRESOLVABLE."""
+        """Label each decision from the snapshot at exactly close+horizon; a missing close is UNRESOLVABLE.
+
+        Directional outcomes are executable: a long enters at the decision close's best ask and exits at the
+        horizon close's best bid, net of the round-trip fee bound (a short mirrors this). The mid return is stored
+        alongside for diagnostics only; calibration and sizing read ``exec_return``."""
         step = self.config.candle_seconds * 1_000_000
         horizon = self.config.horizon_candles * step
         cost = 2 * float(self.config.fee_rate)
@@ -480,25 +564,29 @@ class PaperRuntime:
         for d in self.db.execute("SELECT d.* FROM decisions d LEFT JOIN labels l USING(decision_id) WHERE l.decision_id IS NULL "
                                  "AND d.phase='live' AND d.candle_close_us>=? AND d.candle_close_us+?<=?", (self._label_floor_us, horizon, now)).fetchall():
             target = d["candle_close_us"] + horizon
-            later = self.db.execute("SELECT mid FROM snapshots WHERE instrument=? AND candle_close_us>=? AND candle_close_us<? "
-                                    "AND received_us<=?", (d["instrument"], target, target + step, now)).fetchone()
-            if later is None:
-                if now < target + step + self.config.close_tolerance_us:
+            later = self.db.execute("SELECT mid, best_bid, best_ask FROM snapshots WHERE instrument=? AND candle_close_us>=? "
+                                    "AND candle_close_us<? AND received_us<=?", (d["instrument"], target, target + step, now)).fetchone()
+            entry = self.db.execute("SELECT best_bid, best_ask FROM snapshots WHERE instrument=? AND candle_close_us=?",
+                                    (d["instrument"], d["candle_close_us"])).fetchone()
+            if later is None or entry is None:
+                if later is None and now < target + step + self.config.close_tolerance_us:
                     pending.append(d["candle_close_us"])
                     continue
-                self.db.execute("INSERT INTO labels VALUES (?,?,?,?,?,?,?,?,?,?)", (d["decision_id"], d["instrument"], d["direction"],
-                                d["confidence"], d["mid"], None, None, None, now, "unresolvable"))
+                self.db.execute(self._LABEL_INSERT, (d["decision_id"], d["instrument"], d["direction"], d["confidence"], d["mid"],
+                                None, None, None, now, "unresolvable", None, None, d["regime"]))
                 count += 1
                 continue
-            gross = later["mid"] / d["mid"] - 1
+            mid_return = later["mid"] / d["mid"] - 1
             if d["direction"] == "long":
-                net, hit = gross - cost, gross - cost > 0
+                exec_return = later["best_bid"] / entry["best_ask"] - 1 - cost
+                net, hit = exec_return, exec_return > 0
             elif d["direction"] == "short":
-                net, hit = -gross - cost, -gross - cost > 0
-            else:
-                net, hit = -abs(gross), abs(gross) < cost
-            self.db.execute("INSERT INTO labels VALUES (?,?,?,?,?,?,?,?,?,?)", (d["decision_id"], d["instrument"], d["direction"],
-                            d["confidence"], d["mid"], later["mid"], net, int(hit), now, "resolved"))
+                exec_return = entry["best_bid"] / later["best_ask"] - 1 - cost
+                net, hit = exec_return, exec_return > 0
+            else:  # neutral is not a trade: it is right when the move stays inside the round-trip cost
+                exec_return, net, hit = None, -abs(mid_return), abs(mid_return) < cost
+            self.db.execute(self._LABEL_INSERT, (d["decision_id"], d["instrument"], d["direction"], d["confidence"], d["mid"],
+                            later["mid"], net, int(hit), now, "resolved", mid_return, exec_return, d["regime"]))
             count += 1
         self._label_floor_us = min(pending) if pending else max(self._label_floor_us, now - horizon - step)
         return count
@@ -571,6 +659,14 @@ class PaperRuntime:
                             content_hash(snap.wire())))
         except sqlite3.IntegrityError:
             raise Unavailable("DUPLICATE_CANDLE")
+        # The snapshot is kept for feature continuity even when no order could be placed.
+        try:
+            rules = self.market_rules(instrument, cutoff)
+        except Unavailable as exc:
+            return {"status": "hold", "reasons": [str(exc)], "snapshot": json.loads(snap.wire())}
+        if not rules.tradable:
+            return {"status": "hold", "reasons": ["MARKET_UNAVAILABLE"], "market_status": rules.status,
+                    "snapshot": json.loads(snap.wire())}
         warm = snap.history < MIN_HISTORY
         held = account["positions"].get(instrument, Decimal(0))
         judgment = self.reflex.judge(snap)
@@ -599,8 +695,8 @@ class PaperRuntime:
             elif blocked := self.risk_check("sell", instrument, Decimal(0), account):
                 reasons += blocked
             else:
-                limit = Decimal(str(best_bid)) * (1 - self.config.max_slippage_bps / Decimal(10_000))
-                fill = paper_fill(bids, "sell", None, held, limit, self.config.fee_rate)
+                limit = rules.round_limit(Decimal(str(best_bid)) * (1 - self.config.max_slippage_bps / Decimal(10_000)), "sell")
+                fill = paper_fill(bids, "sell", None, rules.floor_qty(held), limit, self.config.fee_rate, rules)
                 action = "sell" if fill else "hold"
                 reasons += ["EXIT", exit_reason] if fill else ["EXIT_UNFILLED", exit_reason]
         elif escalate or warm:
@@ -608,14 +704,14 @@ class PaperRuntime:
         elif not gate:
             reasons.append("ENTRY_GATE_REFUSED")
         else:
-            notional, exploration, sizing = self._entry_notional(instrument, judgment, account)
+            notional, exploration, sizing = self._entry_notional(instrument, judgment, account, rules)
             reasons += sizing
             if notional > 0:
                 if blocked := self.risk_check("buy", instrument, notional, account):
                     reasons += blocked
                 else:
-                    limit = Decimal(str(best_ask)) * (1 + self.config.max_slippage_bps / Decimal(10_000))
-                    fill = paper_fill(asks, "buy", notional * (1 + self.config.fee_rate), None, limit, self.config.fee_rate)
+                    limit = rules.round_limit(Decimal(str(best_ask)) * (1 + self.config.max_slippage_bps / Decimal(10_000)), "buy")
+                    fill = paper_fill(asks, "buy", notional * (1 + self.config.fee_rate), None, limit, self.config.fee_rate, rules)
                     action = "buy" if fill else "hold"
                     if not fill:
                         reasons.append("ENTRY_UNFILLED")
@@ -636,13 +732,13 @@ class PaperRuntime:
                 "judgment": _judgment_dict(judgment), "history": snap.history,
                 "gate_open": gate and not warm, "snapshot": json.loads(snap.wire()), "token_estimate": snap.token_estimate()}
 
-    def _entry_notional(self, instrument, judgment: Judgment, account) -> tuple[Decimal, bool, list[str]]:
+    def _entry_notional(self, instrument, judgment: Judgment, account, rules: MarketRules) -> tuple[Decimal, bool, list[str]]:
         """Quarter-Kelly notional capped (never refused) by position room and cash; explore only while unsupported."""
-        p, win, loss, n = self.calibrated_edge(instrument, judgment.reflex_id, self.clock_us())
+        p, win, loss, n = self.calibrated_edge(instrument, judgment.reflex_id, self.clock_us(), judgment.regime.value)
         if n < self.config.min_labels:
             if self.config.explore_fraction <= 0:
                 return Decimal(0), False, ["CALIBRATION_INSUFFICIENT"]
-            explore = (account["equity"] * Decimal(str(self.config.explore_fraction))).quantize(MICRO_USD, rounding=ROUND_FLOOR)
+            explore = rules.floor_quote(account["equity"] * Decimal(str(self.config.explore_fraction)))
             return explore, True, ["CALIBRATION_INSUFFICIENT", "EXPLORATION"]
         budget = kelly_loss_budget(account["equity"], p, win, loss)
         if budget <= 0:
@@ -651,7 +747,7 @@ class PaperRuntime:
         held_value = account["positions"].get(instrument, Decimal(0)) * account.get("bid", {}).get(instrument, Decimal(0))
         room = min(Decimal(str(self.config.max_position_fraction)) * account["equity"] - held_value,
                    account["cash"] / (1 + self.config.fee_rate))
-        notional = min(kelly, room).quantize(MICRO_USD, rounding=ROUND_FLOOR)
+        notional = rules.floor_quote(min(kelly, room))
         if notional <= 0:
             return Decimal(0), False, ["MAX_POSITION"]
         return notional, False, ["SIZE_CAPPED"] if notional < kelly else []
@@ -792,6 +888,13 @@ def _judgment_dict(j: Judgment) -> dict:
 
 def _day(now_us: int) -> str:
     return datetime.fromtimestamp(now_us / 1e6, tz=timezone.utc).strftime("%Y-%m-%d")
+
+
+def _public_rules_source(data_dir: Path) -> Callable[[str], dict]:
+    from data.call_log import DataCallLog
+    from data.public_metrics import fetch_coinbase_product
+    log = DataCallLog(data_dir / "public_calls.sqlite3")
+    return lambda product: fetch_coinbase_product(log, product)
 
 
 def _public_book_source(data_dir: Path) -> Callable[[str], dict]:
