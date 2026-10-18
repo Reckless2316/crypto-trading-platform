@@ -7,9 +7,15 @@ Signed: `HANDOFF(claude-opus-5.5 2026-10-17)`. Search the tree for `HANDOFF(` to
 - History: `.agenkit/sdd/progress.md` (newest entries at the top), `master-context.md` (Task 13–22 gap table), `docs/checkpoints/`.
 - Still uncommitted, operator-owned: `dashboard/`, `deploy/deploy.sh`, `bot/live_coinbase_adapter.py`, `tests/test_live_adapter.py`, `tests/test_platform_api.py`. Preserve them; review before committing.
 
-## In progress (Claude session)
-1. `bot/autonomous/runtime.py`: the end-to-end PAPER loop. Public books → causal snapshot (<400 tokens) → REFLEX (Jev, or the labeled offline reflex) → code gate → quarter-Kelly sizing → hard risk/kill file → adverse paper fill → labels/Brier → `status.json`. Run it with `python -m bot.autonomous.runtime --paper --once`.
-2. Next: point the dashboard at the runtime's `status.json` read model (Task 17, read-only), then the nightly cron entry.
+## Done (Claude session), see `docs/checkpoints/2026-10-17-claude-paper-runtime.md`
+- `bot/autonomous/runtime.py`: the paper loop, reviewed twice; all findings fixed. Running locally, unarmed, on `data/autonomous/runtime/`.
+- `GET /api/autonomous/runtime` read model, plus `deploy/autonomous/` systemd units (not installed).
+
+## Next for Cursor (in order)
+1. Wire JevClient behind an activated release bundle (Task 15).
+2. Route runtime paper orders through OrderAuthority/Ledger (Tasks 12/16).
+3. Verified MarketRules; labels that include spread and slippage.
+4. Latch clearing and kill via the authenticated control socket (Tasks 14/17).
 
 ## Hard rules (do not relax)
 - No live orders or arming. Live progression requires Tasks 13/14/15/20/21 and explicit operator approval (Task 22).
