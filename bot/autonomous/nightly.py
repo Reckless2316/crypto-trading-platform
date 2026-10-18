@@ -349,6 +349,11 @@ def _unresolved_escalations(db_path) -> list[dict]:
     return out
 
 
+def _last_usage(brain):
+    call = getattr(brain, "last_call", None)
+    return call.get("usage") if isinstance(call, dict) else None
+
+
 def review_escalations(db_path, brain, *, data_dir, batch_size: int = 25, day: str | None = None,
                        now_us: int | None = None) -> list[dict]:
     """Ask BRAIN about each batch of unresolved escalations and append a proposal per batch.
@@ -375,17 +380,19 @@ def review_escalations(db_path, brain, *, data_dir, batch_size: int = 25, day: s
         extra = {"escalations": batch} if isinstance(brain, ba.AnthropicBrain) else {}
         try:
             result = brain.review(job_id=job_id, archive_hash=archive_hash, metrics=metrics, **extra)
-            entry = ba.proposal_entry(result, kind="escalation_batch", inputs_hash=archive_hash, now_us=now_us, refs=refs)
+            entry = ba.proposal_entry(result, kind="escalation_batch", inputs_hash=archive_hash, now_us=now_us, refs=refs,
+                                      usage=_last_usage(brain))
         except ProviderUnavailable as exc:
             entry = ba.unavailable_entry("escalation_batch", inputs_hash=archive_hash, now_us=now_us,
-                                         reason=str(exc), refs=refs)
+                                         reason=str(exc), refs=refs, usage=_last_usage(brain))
         ba.write_proposal(data_dir, entry, day=day)
         entries.append(entry)
     return entries
 
 
 def run_nightly(data_dir, *, brain_choice: str = "deterministic", environ=None, day: str | None = None,
-                now_us: int | None = None, replay_overrides=None, escalation_batch: int = 25) -> dict:
+                now_us: int | None = None, replay_overrides=None, escalation_batch: int = 25,
+                allow_fallback: bool = False) -> dict:
     """Runtime nightly metrics, a diagnostic replay (no holdout look) and one BRAIN proposal, hashed together."""
     import json
     import time
@@ -397,7 +404,7 @@ def run_nightly(data_dir, *, brain_choice: str = "deterministic", environ=None, 
     data_dir = Path(data_dir)
     db_path = data_dir / "runtime.sqlite3"
     now_us = time.time_ns() // 1000 if now_us is None else now_us
-    brain, notes = ba.build_brain(brain_choice, environ=environ)
+    brain, notes = ba.build_brain(brain_choice, environ=environ, allow_fallback=allow_fallback)
     # Deterministic metrics are produced first and never depend on the provider.
     nightly = nightly_review(db_path, data_dir / "nightly", now_us=now_us, brain=DeterministicBrain(), day=day)
     day = nightly["metrics"]["day"]
@@ -418,10 +425,10 @@ def run_nightly(data_dir, *, brain_choice: str = "deterministic", environ=None, 
         else:
             result = brain.review(job_id=job_id, archive_hash=nightly["archive_hash"], metrics=nightly["metrics"])
         entry = ba.proposal_entry(result, kind="nightly", inputs_hash=inputs_hash, now_us=now_us,
-                                  refs=[nightly["archive_hash"]])
+                                  refs=[nightly["archive_hash"]], usage=_last_usage(brain))
     except ProviderUnavailable as exc:
         entry = ba.unavailable_entry("nightly", inputs_hash=inputs_hash, now_us=now_us, reason=str(exc),
-                                     refs=[nightly["archive_hash"]])
+                                     refs=[nightly["archive_hash"]], usage=_last_usage(brain))
     ba.write_proposal(data_dir, entry, day=day)
 
     def digest(value):
@@ -430,7 +437,9 @@ def run_nightly(data_dir, *, brain_choice: str = "deterministic", environ=None, 
     artifact = {"version": "nightly-combined-v1", "day": day, "generated_us": now_us, "approved": False,
                 "applied": False,
                 "brain": {"choice": brain_choice, "used": "anthropic" if isinstance(brain, ba.AnthropicBrain) else "deterministic",
-                          "model_id": getattr(brain, "model_id", None), "notes": list(notes)},
+                          "model_id": getattr(brain, "model_id", None), "notes": list(notes),
+                          "allow_fallback": bool(getattr(brain, "allow_fallback", False)),
+                          "last_call": getattr(brain, "last_call", None)},
                 "nightly": {"archive_hash": nightly["archive_hash"], "metrics": nightly["metrics"]},
                 "replay": {"holdout_evaluated": False, "error": replay_error, "report": replay_report},
                 "escalations": {"unresolved": len(escalations), "sent": min(len(escalations), escalation_batch)
@@ -457,6 +466,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--day", default=None, help="UTC day YYYY-MM-DD (default: yesterday)")
     parser.add_argument("--horizon-candles", type=int, default=None)
     parser.add_argument("--lookback-candles", type=int, default=None)
+    parser.add_argument("--brain-allow-fallback", action="store_true",
+                        help="permit server-side refusal fallback to another model (off by default; served model is recorded)")
     parser.add_argument("--review-escalations", action="store_true",
                         help="also write one proposal per batch of unresolved escalations")
     args = parser.parse_args(argv)
@@ -468,10 +479,10 @@ def main(argv: list[str] | None = None) -> int:
         overrides = {k: v for k, v in (("horizon_candles", args.horizon_candles),
                                        ("lookback_candles", args.lookback_candles)) if v is not None}
         artifact = run_nightly(Path(args.data_dir), brain_choice=args.brain, day=args.day,
-                               replay_overrides=overrides or None)
+                               replay_overrides=overrides or None, allow_fallback=args.brain_allow_fallback)
         if args.review_escalations:
             from . import brain_anthropic as ba
-            brain, _ = ba.build_brain(args.brain)
+            brain, _ = ba.build_brain(args.brain, allow_fallback=args.brain_allow_fallback)
             review_escalations(Path(args.data_dir) / "runtime.sqlite3", brain, data_dir=Path(args.data_dir),
                                day=artifact["day"])
         print(json.dumps({"day": artifact["day"], "brain": artifact["brain"], "proposal_status": artifact["proposal"]["status"],

@@ -16,10 +16,11 @@ KEY = "sk-ant-test-SECRET-never-print-0123456789"
 ARCHIVE = "a" * 64
 
 
-def message(payload, *, stop="end_turn", model="claude-opus-5-5", raw_text=None):
+def message(payload, *, stop="end_turn", model="claude-opus-5-5", raw_text=None, usage=None):
     text = raw_text if raw_text is not None else json.dumps(payload)
     return {"id": "msg_1", "type": "message", "role": "assistant", "model": model, "stop_reason": stop,
-            "content": [{"type": "thinking", "thinking": ""}, {"type": "text", "text": text}]}
+            "content": [{"type": "thinking", "thinking": ""}, {"type": "text", "text": text}],
+            "usage": usage if usage is not None else {"input_tokens": 1200, "output_tokens": 340}}
 
 
 def proposal(**changes):
@@ -50,9 +51,9 @@ class Fixture(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
 
-    def brain(self, *responses):
+    def brain(self, *responses, **kw):
         self.transport = FakeTransport(*responses)
-        return ba.AnthropicBrain(api_key=KEY, transport=self.transport)
+        return ba.AnthropicBrain(api_key=KEY, transport=self.transport, **kw)
 
     def review(self, brain, **kw):
         args = dict(job_id="nightly-2026-10-17", archive_hash=ARCHIVE, metrics={"brier": 0.2},
@@ -78,7 +79,8 @@ class AnthropicBrainTests(Fixture):
         self.assertFalse(request["output_config"]["format"]["schema"]["additionalProperties"])
         self.assertEqual(["no_change", "propose_schema"],
                          request["output_config"]["format"]["schema"]["properties"]["action"]["enum"])
-        self.assertEqual("default", request["fallbacks"])
+        self.assertNotIn("fallbacks", request)  # off by default: no other model may answer as BRAIN
+        self.assertEqual({"model", "max_tokens", "system", "messages", "output_config"}, set(request))
         self.assertNotIn("thinking", request)  # Opus 5.5: thinking is always on; effort is the control
         self.assertIn("effort", request["output_config"])
         body = json.dumps(request)
@@ -147,6 +149,47 @@ class AnthropicBrainTests(Fixture):
         self.assertEqual([], self.transport.requests)
 
 
+class FallbackAndUsageTests(Fixture):
+    def test_fallback_is_opt_in_and_recorded(self):
+        brain = self.brain(message(proposal(), model="claude-opus-4-8"), allow_fallback=True)
+        result = self.review(brain)
+        self.assertEqual("default", self.transport.requests[0]["request"]["fallbacks"])
+        self.assertEqual("claude-opus-4-8", result.model_id)
+        self.assertTrue(brain.last_call["fallback_used"])
+
+    def test_without_fallback_a_different_served_model_is_rejected(self):
+        with self.assertRaises(ProviderUnavailable) as caught:
+            self.review(self.brain(message(proposal(), model="claude-opus-4-8")))
+        self.assertIn("UNEXPECTED_MODEL", str(caught.exception))
+
+    def test_usage_is_recorded_in_proposals_including_rejected_outputs(self):
+        brain = self.brain(message(proposal()), message(proposal(action="approve"), usage={"input_tokens": 10,
+                                                                                            "output_tokens": 3}))
+        result = self.review(brain)
+        self.assertEqual({"input_tokens": 1200, "output_tokens": 340}, brain.last_call["usage"])
+        entry = ba.proposal_entry(result, kind="nightly", inputs_hash="b" * 64, now_us=1, usage=brain.last_call["usage"])
+        self.assertEqual(340, entry["usage"]["output_tokens"])
+        with self.assertRaises(ProviderUnavailable):
+            self.review(brain)
+        self.assertEqual({"input_tokens": 10, "output_tokens": 3}, brain.last_call["usage"])
+        missing = self.brain(message(proposal(), usage={"input_tokens": "x"}))
+        self.review(missing)
+        self.assertIsNone(missing.last_call["usage"])
+
+    def test_timeout_leaves_no_usage(self):
+        brain = self.brain(TimeoutError())
+        with self.assertRaises(ProviderUnavailable):
+            self.review(brain)
+        self.assertIsNone(brain.last_call["usage"])
+
+    def test_build_brain_passes_the_explicit_fallback_flag(self):
+        brain, _ = ba.build_brain("anthropic", environ={"ANTHROPIC_API_KEY": KEY}, transport=FakeTransport())
+        self.assertFalse(brain.allow_fallback)
+        brain, _ = ba.build_brain("anthropic", environ={"ANTHROPIC_API_KEY": KEY}, transport=FakeTransport(),
+                                  allow_fallback=True)
+        self.assertTrue(brain.allow_fallback)
+
+
 class EnablementTests(Fixture):
     def test_needs_both_the_key_and_the_explicit_flag(self):
         brain, notes = ba.build_brain("anthropic", environ={})
@@ -198,7 +241,13 @@ class HttpxTransportTests(unittest.TestCase):
         self.assertEqual("https://api.anthropic.com/v1/messages", str(request.url))
         self.assertEqual(KEY, request.headers["x-api-key"])
         self.assertEqual("2023-06-01", request.headers["anthropic-version"])
-        self.assertIn("server-side-fallback-2026-07-01", request.headers["anthropic-beta"])
+        self.assertNotIn("anthropic-beta", request.headers)
+
+    def test_fallback_beta_header_only_with_fallback_requested(self):
+        mock, seen = self.handler()
+        ba.HttpxTransport(http_transport=mock)({"model": "claude-opus-5-5", "fallbacks": "default"}, api_key=KEY,
+                                               timeout_s=5, max_bytes=1_000_000)
+        self.assertEqual("server-side-fallback-2026-07-01", seen["request"].headers["anthropic-beta"])
 
     def test_oversized_and_error_responses_raise_without_the_key(self):
         for mock, _ in (self.handler(body=b"x" * 5000), self.handler(length=10_000_000),
@@ -271,13 +320,23 @@ class EscalationReviewTests(Fixture):
         entries = review_escalations(path, self.brain(TimeoutError(), TimeoutError()), data_dir=self.root / "runtime",
                                      batch_size=2, day="2026-10-17", now_us=300)
         self.assertEqual(["PROVIDER_UNAVAILABLE", "PROVIDER_UNAVAILABLE"], [e["status"] for e in entries])
+        self.assertTrue(all(e["usage"] is None for e in entries))
+
+    def test_batch_proposals_carry_usage(self):
+        from bot.autonomous.nightly import review_escalations
+        path = self.make_runtime_db()
+        responses = [message(proposal(action="no_change", schema_diff=None, evidence_refs=["esc-1"])),
+                     message(proposal(action="no_change", schema_diff=None, evidence_refs=["esc-3"]))]
+        entries = review_escalations(path, self.brain(*responses), data_dir=self.root / "runtime", batch_size=2,
+                                     day="2026-10-17", now_us=300)
+        self.assertEqual([1200, 1200], [e["usage"]["input_tokens"] for e in entries])
 
 
 class NightlyCliTests(Fixture):
     def make_data_dir(self):
         from tests.autonomous.test_replay import record, trending
         directory = self.root / "runtime"
-        start = 1_792_022_400_000_000  # 2026-10-17T00:00:00Z
+        start = 1_792_195_200_000_000  # 2026-10-17T00:00:00Z
         record(directory, trending(90), start=start)
         return directory
 
@@ -285,7 +344,7 @@ class NightlyCliTests(Fixture):
         from bot.autonomous.nightly import run_nightly
         directory = self.make_data_dir()
         artifact = run_nightly(directory, brain_choice="deterministic", environ={}, day="2026-10-17",
-                               now_us=1_792_108_800_000_000, replay_overrides=dict(horizon_candles=5, lookback_candles=20))
+                               now_us=1_792_281_600_000_000, replay_overrides=dict(horizon_candles=5, lookback_candles=20))
         self.assertEqual("deterministic", artifact["brain"]["choice"])
         hashes = artifact["hashes"]
         for name in ("nightly_report", "replay_report", "escalations", "proposal", "artifact"):
@@ -299,12 +358,13 @@ class NightlyCliTests(Fixture):
     def test_anthropic_without_key_falls_back_and_outage_keeps_metrics(self):
         from bot.autonomous.nightly import run_nightly
         directory = self.make_data_dir()
-        kw = dict(day="2026-10-17", now_us=1_792_108_800_000_000, replay_overrides=dict(horizon_candles=5, lookback_candles=20))
+        kw = dict(day="2026-10-17", now_us=1_792_281_600_000_000, replay_overrides=dict(horizon_candles=5, lookback_candles=20))
         no_key = run_nightly(directory, brain_choice="anthropic", environ={}, **kw)
         self.assertIn("BRAIN_KEY_MISSING", no_key["brain"]["notes"])
         self.assertEqual("deterministic", no_key["brain"]["used"])
         with patch.object(ba, "default_transport", lambda: FakeTransport(TimeoutError())):
             outage = run_nightly(directory, brain_choice="anthropic", environ={"ANTHROPIC_API_KEY": KEY}, **kw)
+        self.assertFalse(outage["brain"]["allow_fallback"])
         self.assertEqual("PROVIDER_UNAVAILABLE", outage["proposal"]["status"])
         self.assertIsNotNone(outage["nightly"]["metrics"])
         text = json.dumps(outage)

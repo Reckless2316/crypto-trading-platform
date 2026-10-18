@@ -355,7 +355,7 @@ def status():
 def autonomous_runtime():
     """Read-only projection of the paper runtime's status.json. Never arms, kills or submits."""
     # HANDOFF(claude-opus-5.5 2026-10-17): operator latch clear/kill must go through bot.autonomous.control, not here.
-    path = Path(os.environ.get("AUTONOMOUS_RUNTIME_DIR", ROOT / "data" / "autonomous" / "runtime")) / "status.json"
+    path = _runtime_dir() / "status.json"
     if not path.exists():
         return {"available": False, "detail": "Paper runtime has not written status yet. Start: python -m bot.autonomous.runtime --paper"}
     try:
@@ -365,7 +365,76 @@ def autonomous_runtime():
     age_s = None
     if isinstance(payload.get("at_us"), int):
         age_s = round(time.time() - payload["at_us"] / 1_000_000, 1)
-    return {"available": True, "age_seconds": age_s, "stale": age_s is None or age_s > 180, "status": payload}
+    return {"available": True, "age_seconds": age_s, "stale": age_s is None or age_s > 180, "status": payload,
+            "ledger": _ledger_projection(payload.get("ledger"))}
+
+
+MAX_PROPOSAL_FILE_BYTES = 2_097_152
+_PROPOSAL_DAYS = 14
+_PROPOSAL_LIMIT = 50
+
+
+def _runtime_dir() -> Path:
+    return Path(os.environ.get("AUTONOMOUS_RUNTIME_DIR", ROOT / "data" / "autonomous" / "runtime"))
+
+
+def _utc(us) -> str | None:
+    if type(us) is not int or us < 0:
+        return None
+    return datetime.fromtimestamp(us / 1_000_000, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _ledger_projection(ledger) -> dict | None:
+    """Ledger readiness from status.json (e.g. LEDGER_AWAITING_MIDNIGHT_MARK with next_eligible_us)."""
+    if not isinstance(ledger, dict):
+        return None
+    state = ledger.get("state") if isinstance(ledger.get("state"), str) else None
+    nxt = ledger.get("next_eligible_us") if type(ledger.get("next_eligible_us")) is int else None
+    return {"state": state, "ready": ledger.get("ready") is True, "next_eligible_us": nxt,
+            "next_eligible_utc": _utc(nxt)}
+
+
+@app.get("/api/autonomous/proposals")
+def autonomous_proposals():
+    """Pending BRAIN proposals from <runtime-dir>/proposals/*.json. Read-only; nothing here approves or applies."""
+    import re
+    directory = _runtime_dir() / "proposals"
+    pending, unreadable, counts = [], [], {"pending": 0, "provider_unavailable": 0}
+    files = sorted((p for p in directory.glob("*.json") if re.fullmatch(r"\d{4}-\d{2}-\d{2}\.json", p.name)),
+                   reverse=True)[:_PROPOSAL_DAYS] if directory.is_dir() else []
+    for path in files:
+        try:
+            if path.stat().st_size > MAX_PROPOSAL_FILE_BYTES:
+                raise ValueError("oversized")
+            with path.open("rb") as handle:
+                stored = json.loads(handle.read(MAX_PROPOSAL_FILE_BYTES + 1))
+            entries = stored["proposals"]
+            if not isinstance(entries, list):
+                raise ValueError("invalid")
+        except (OSError, ValueError, KeyError, TypeError):
+            unreadable.append(path.name)
+            continue
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            if entry.get("status") == "PROVIDER_UNAVAILABLE":
+                counts["provider_unavailable"] += 1
+                continue
+            if entry.get("status") != "PENDING_OPERATOR_REVIEW" or not isinstance(entry.get("proposal"), dict):
+                continue
+            counts["pending"] += 1
+            proposal = entry["proposal"]
+            usage = entry.get("usage") if isinstance(entry.get("usage"), dict) else None
+            pending.append({"day": path.stem, "kind": entry.get("kind"), "created_us": entry.get("created_us"),
+                            "created_utc": _utc(entry.get("created_us")), "entry_hash": entry.get("entry_hash"),
+                            "model_id": proposal.get("model_id"), "action": proposal.get("action"),
+                            "finding": proposal.get("finding"), "hypothesis": proposal.get("hypothesis"),
+                            "evidence_refs": proposal.get("evidence_refs"), "schema_diff": proposal.get("schema_diff"),
+                            "usage": usage and {k: usage.get(k) for k in ("input_tokens", "output_tokens")},
+                            "approved": False})
+    pending.sort(key=lambda p: p["created_us"] if type(p["created_us"]) is int else -1, reverse=True)
+    return {"pending": pending[:_PROPOSAL_LIMIT], "counts": counts, "unreadable": unreadable,
+            "governance": "Proposals only: operator review required; nothing here approves or applies."}
 
 
 @app.get("/api/strategies")

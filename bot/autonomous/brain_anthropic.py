@@ -15,9 +15,13 @@ refusal, truncation or invalid output raises ProviderUnavailable, and the caller
 keeps the deterministic metrics. Proposals are appended to
 `<data-dir>/proposals/<date>.json` as PENDING_OPERATOR_REVIEW and are never applied.
 
-Request settings: thinking is always on for Opus 5.5 (the parameter is omitted and
-effort is set explicitly); server-side refusal fallbacks are enabled
-(`fallbacks: "default"`), so the served model is recorded from the response.
+Request fields (each checked against the claude-api skill docs): model, max_tokens,
+system, messages, and output_config {effort, format: json_schema}. Thinking is always
+on for Opus 5.5, so the parameter is omitted and effort is set explicitly. Server-side
+refusal fallbacks (`fallbacks: "default"` + `anthropic-beta: server-side-fallback-2026-07-01`)
+are OFF by default and only sent with an explicit `--brain-allow-fallback`; without it a
+response served by any other model is rejected. Token usage from `usage` is recorded
+on every call that returned a response.
 
 HANDOFF(claude-opus-5.5 2026-10-18): not yet verified against the live API (tests
 use fake transports only); the SDK path is untested here because `anthropic` is not
@@ -107,8 +111,9 @@ class HttpxTransport:
 
     def __call__(self, request: dict, *, api_key: str, timeout_s: float, max_bytes: int) -> dict:
         import httpx
-        headers = {"x-api-key": api_key, "anthropic-version": ANTHROPIC_VERSION, "anthropic-beta": FALLBACK_BETA,
-                   "content-type": "application/json"}
+        headers = {"x-api-key": api_key, "anthropic-version": ANTHROPIC_VERSION, "content-type": "application/json"}
+        if "fallbacks" in request:
+            headers["anthropic-beta"] = FALLBACK_BETA
         timeout = httpx.Timeout(timeout_s, connect=min(CONNECT_TIMEOUT_S, timeout_s))
         deadline = time.monotonic() + timeout_s
         try:
@@ -145,7 +150,10 @@ class SdkTransport:
         import anthropic
         client = anthropic.Anthropic(api_key=api_key, timeout=timeout_s, max_retries=0)
         try:
-            response = client.beta.messages.create(betas=[FALLBACK_BETA], **request)
+            if "fallbacks" in request:
+                response = client.beta.messages.create(betas=[FALLBACK_BETA], **request)
+            else:
+                response = client.messages.create(**request)
         except anthropic.APITimeoutError:
             raise TransportError("TIMEOUT") from None
         except anthropic.APIStatusError as exc:
@@ -176,7 +184,8 @@ class AnthropicBrain:
     model_id = MODEL_ID
 
     def __init__(self, *, api_key: str, transport: Callable | None = None, timeout_s: float = DEFAULT_TIMEOUT_S,
-                 max_response_bytes: int = MAX_RESPONSE_BYTES, effort: str = EFFORT, max_tokens: int = MAX_TOKENS):
+                 max_response_bytes: int = MAX_RESPONSE_BYTES, effort: str = EFFORT, max_tokens: int = MAX_TOKENS,
+                 allow_fallback: bool = False):
         if type(api_key) is not str or not api_key.strip():
             raise ValueError("a non-empty provider key is required")
         if not 0 < timeout_s <= 600 or not 0 < max_response_bytes <= 16_777_216 or effort not in (
@@ -185,6 +194,8 @@ class AnthropicBrain:
         key = api_key.strip()
         self._credential = lambda: key  # never stored as a plain attribute, so vars()/repr cannot show it
         self.transport = transport or default_transport()
+        self.allow_fallback = allow_fallback is True
+        self.last_call: dict | None = None
         self.timeout_s, self.max_response_bytes = timeout_s, max_response_bytes
         self.effort, self.max_tokens = effort, max_tokens
 
@@ -195,10 +206,12 @@ class AnthropicBrain:
         text = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
         if len(text.encode()) > MAX_INPUT_BYTES:
             raise ProviderUnavailable("BRAIN_INPUT_TOO_LARGE")
-        return {"model": MODEL_ID, "max_tokens": self.max_tokens, "system": SYSTEM_PROMPT,
-                "messages": [{"role": "user", "content": text}],
-                "output_config": {"effort": self.effort, "format": {"type": "json_schema", "schema": OUTPUT_SCHEMA}},
-                "fallbacks": "default"}
+        request = {"model": MODEL_ID, "max_tokens": self.max_tokens, "system": SYSTEM_PROMPT,
+                   "messages": [{"role": "user", "content": text}],
+                   "output_config": {"effort": self.effort, "format": {"type": "json_schema", "schema": OUTPUT_SCHEMA}}}
+        if self.allow_fallback:
+            request["fallbacks"] = "default"
+        return request
 
     def review(self, *, job_id: str, archive_hash: str, metrics: dict, escalations: Sequence[Mapping] = (),
                replay_report: Mapping | None = None) -> BrainProposal:
@@ -211,6 +224,8 @@ class AnthropicBrain:
                        *([replay["ref"]] if replay and replay.get("ref") else [])})
         payload = {"job_id": job_id, "archive_hash": archive_hash, "refs": refs, "metrics": metrics,
                    "escalations": escalations, "replay_report": replay}
+        self.last_call = {"usage": None, "served_model": None, "fallback_allowed": self.allow_fallback,
+                          "fallback_used": False}
         request = self.request_for(payload)
         started = time.monotonic()
         try:
@@ -225,8 +240,12 @@ class AnthropicBrain:
         except Exception as exc:  # never propagate provider text, which could echo credentials
             log.warning("brain provider unavailable job=%s reason=%s", job_id, type(exc).__name__)
             raise ProviderUnavailable(f"BRAIN_PROVIDER_ERROR:{type(exc).__name__}") from None
+        self.last_call.update(usage=_usage(response),
+                              served_model=response.get("model") if type(response) is dict else None)
         try:
-            result = parse_proposal(response, allowed_refs=set(refs))
+            result = parse_proposal(response, allowed_refs=set(refs),
+                                    expected_model=None if self.allow_fallback else MODEL_ID)
+            self.last_call["fallback_used"] = result.model_id != MODEL_ID
         except ProviderUnavailable as exc:
             log.warning("brain output rejected job=%s reason=%s", job_id, exc)
             raise
@@ -235,7 +254,18 @@ class AnthropicBrain:
         return result
 
 
-def parse_proposal(response: Any, *, allowed_refs: set[str]) -> BrainProposal:
+def _usage(response: Any) -> dict | None:
+    """Provider token usage (input/output) when present and well-typed; otherwise None."""
+    usage = response.get("usage") if type(response) is dict else None
+    if type(usage) is not dict:
+        return None
+    values = {k: usage.get(k) for k in ("input_tokens", "output_tokens")}
+    if any(type(v) is not int or v < 0 for v in values.values()):
+        return None
+    return values
+
+
+def parse_proposal(response: Any, *, allowed_refs: set[str], expected_model: str | None = MODEL_ID) -> BrainProposal:
     """Strict validation of a Messages API response into a BrainProposal."""
     def bad(code: str):
         return ProviderUnavailable("BRAIN_OUTPUT_INVALID:" + code)
@@ -247,6 +277,8 @@ def parse_proposal(response: Any, *, allowed_refs: set[str]) -> BrainProposal:
     served = response.get("model")
     if type(served) is not str or not served:
         raise bad("MODEL")
+    if expected_model is not None and served != expected_model:
+        raise bad("UNEXPECTED_MODEL")
     content = response.get("content")
     if type(content) is not list:
         raise bad("CONTENT")
@@ -301,7 +333,8 @@ def key_from(environ: Mapping[str, str]) -> str | None:
     return None
 
 
-def build_brain(choice: str, *, environ: Mapping[str, str] | None = None, transport: Callable | None = None):
+def build_brain(choice: str, *, environ: Mapping[str, str] | None = None, transport: Callable | None = None,
+                allow_fallback: bool = False):
     """Return (brain, notes). Opus is used only with an explicit choice AND a key."""
     if choice not in ("deterministic", "anthropic"):
         raise ValueError("brain must be deterministic or anthropic")
@@ -311,7 +344,7 @@ def build_brain(choice: str, *, environ: Mapping[str, str] | None = None, transp
     if key is None:
         log.warning("brain anthropic requested but no key is configured; using deterministic metrics only")
         return DeterministicBrain(), ("BRAIN_KEY_MISSING",)
-    return AnthropicBrain(api_key=key, transport=transport), ()
+    return AnthropicBrain(api_key=key, transport=transport, allow_fallback=allow_fallback), ()
 
 
 # ---------------------------------------------------------------- proposal store
@@ -321,16 +354,20 @@ def _with_hash(entry: dict) -> dict:
     return {**body, "entry_hash": content_hash(json.dumps(body, sort_keys=True, default=str))}
 
 
-def proposal_entry(result: BrainProposal, *, kind: str, inputs_hash: str, now_us: int, refs: Sequence[str] = ()) -> dict:
+def proposal_entry(result: BrainProposal, *, kind: str, inputs_hash: str, now_us: int, refs: Sequence[str] = (),
+                   usage: Mapping | None = None) -> dict:
     return _with_hash({"kind": kind, "status": PENDING, "approved": False, "applied": False,
                        "created_us": now_us, "inputs_hash": inputs_hash, "subject_refs": list(refs),
+                       "usage": dict(usage) if usage else None,
                        "proposal": asdict(result),
                        "governance": "PROPOSAL ONLY: an operator must review; BRAIN cannot approve, activate, arm or clear."})
 
 
-def unavailable_entry(kind: str, *, inputs_hash: str, now_us: int, reason: str, refs: Sequence[str] = ()) -> dict:
+def unavailable_entry(kind: str, *, inputs_hash: str, now_us: int, reason: str, refs: Sequence[str] = (),
+                      usage: Mapping | None = None) -> dict:
     return _with_hash({"kind": kind, "status": UNAVAILABLE, "approved": False, "applied": False,
                        "created_us": now_us, "inputs_hash": inputs_hash, "subject_refs": list(refs),
+                       "usage": dict(usage) if usage else None,
                        "proposal": None, "reason": reason,
                        "governance": "Deterministic metrics kept; no model proposal was produced."})
 
