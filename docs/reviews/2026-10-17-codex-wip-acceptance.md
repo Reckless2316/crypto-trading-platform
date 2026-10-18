@@ -33,13 +33,51 @@ Minor findings (not fixed):
 - Fill window checks use `trade_time`, while Coinbase filters on sequence time. The result is conservative but can mark batches incomplete.
 - `ReleaseActivationTests` inherits the base tests, so those run twice.
 
+## Follow-up pass (2026-10-18): Task 13 transfers, fee finality and bounds; Task 17 forwarding
+
+Scope: `bot/autonomous/live_venue.py`, `bot/live_coinbase_adapter.py`, `dashboard/backend/authority_client.py`, `dashboard/backend/app.py`, `dashboard/frontend/index.html` and their tests. Every change was written test-first against fakes; no exchange call or secret read took place.
+
+### Task 13
+
+- **Transfers.** `read_transfers` reads Coinbase v2 per-wallet transactions newest first, with bounded pages (≤100 per page and `max_pages` in total) and the read budget (≤3 attempts within ≤10 s or the caller's deadline). It stops at the window start and refuses unordered history. Each transfer is checked against its wallet currency and amount sign. Fills are skipped (the fills endpoint covers them); every other type is `FOREIGN_ACTIVITY` and makes the batch incomplete. Results are deduplicated by account+venue+transaction ID, and a changed payload becomes a conflict. Non-final statuses clear `all_final`.
+- **Balance reconciliation.** `reconcile_balances` computes, per asset, opening + fills (base ± qty, USD ∓ quote − fee) + effective transfers, and compares it exactly with observed available+hold. It is ready only when all inputs are complete, final, conflict-free, issued by this venue, cover the same window and match exactly. Unexpected holdings show up as differences.
+- **Fee finality.** `fee_finality(order, fills)` passes only when all of the following hold. `releasable` then delegates to `reservation_releasable`.
+  - The order is complete, settled and terminal, and reports a total fee.
+  - The fill batch is complete and has no conflict for this order.
+  - The fill read started after the terminal observation, which rules out a missed late fill.
+  - The fill window covers the order's creation.
+  - Every fill carries a USD fee.
+  - Fill quantities and fees sum exactly to the order's values.
+  - All evidence was issued by this venue.
+- **Streamed bound.** `ManagedBoundedTransport` wraps the client's HTTP session in `BoundedSession`. Responses are requested with `stream=True`. A declared Content-Length over 1 MiB is refused before reading; otherwise reading stops within one chunk of the cap and the connection closes. Verified against real CCXT 4.5.88 `fetch` with a fake HTTP session. The overflow raises `ResponseTooLarge`, which is not a network error, so neither CCXT nor `LiveVenue` retries it (`SOURCE_PAYLOAD_SIZE`). Reads and submit fail closed (`UNBOUNDED_TRANSPORT`) if the session has been replaced.
+- **Legacy market path.** It previously ran for any account built without `managed=True`. Now `place_market_order` refuses unless the account was built with explicit `legacy_opt_in=True` (Important, fixed). `managed` and `legacy_opt_in` are read-only and mutually exclusive. Any client registered by a `ManagedBoundedTransport` is unreachable from a legacy account even with opt-in. Nothing in the repo opts in.
+
+### Task 17
+
+- **Forwarding.** arm (`/api/control/arm`, `/api/live/arm`), disarm (`/api/control/disarm`, `/api/live/disarm`) and flatten (`reduce`) now go through `AuthorityGateway.forward` to the control protocol. Live routes need a live-mode control session (`MODE_UNAVAILABLE` otherwise), and live arm needs the exact acknowledgement. Arm needs a 64-hex release hash.
+- **Typed receipts.** Every response now carries one of `completed` (200), `pending` (202), `unknown` (202, `AUTHORITY_OUTCOME_UNKNOWN`), `rejected` (409, the authority's actual reason, e.g. `COMMAND_FORBIDDEN` for flatten under hard kill) or `unavailable` (409). `unavailable` covers both an authority `HANDLER_UNAVAILABLE` and routes with no control command (orders, live orders, automation, strategy execute). Nothing is mutated locally.
+- **Durable nonces.** `DurableNonceStore` is a 0600 file in a 0700 directory owned by this user. It refuses unsafe permissions and is written atomically with fsync. It records consumed nonces, request identities and used bootstrap tokens; it never stores the control token or the raw envelope. Each nonce is claimed durably before the send. After a web restart a retry of the same request ID rebuilds the identical envelope, and a new request ID never reuses a nonce. The gateway refuses to start without a store.
+- **Session setup.** `POST /api/session/bootstrap` exchanges a one-time, launcher-printed token (stored as a sha256 hash and bound to a provisioned session) for the HttpOnly SameSite=Strict cookie. It is Origin-bound and single-use across restarts.
+- **Origin/CSRF on every POST.** Managed mutations keep operator role + session Origin + session CSRF. All other POST routes now require a loopback (or explicitly configured) Host, `Origin` equal to the server's own origin, and `X-CSRF-Token` equal to the per-process token (`GET /api/csrf`, Host-checked) or the session token. A test enumerates every POST route. The frontend `api()` helper now sends CSRF, request-ID and epoch headers and shows receipts.
+- **Read-only diagnostics.** Every `/tmp` reader was already `mode=ro`. The remaining writable reader (`/api/market/book-observations`) now opens read-only, and a static test asserts that every `sqlite3.connect` in app.py outside `db()` uses `mode=ro` with `uri=True`. Note: `bot/autonomous/worker.py` `load_book_tops`/`load_eth_tops` (called by app routes) still open `data/autonomous/book_observations.sqlite3` writable but never write. That file was outside this pass's ownership.
+
 ## Still blocking acceptance (HANDOFF markers in code)
 
-- **Task 13:** transfers are never read and `reconciliation_ready` is always False. No source yields `fees_final=True`. The dispatch guard is in-process only; across restarts the guard is the authority's DISPATCHING/UNKNOWN state. The payload size bound applies after the SDK has buffered the response. Not done: wiring into execution.py/ledger importer (journals, corrections, compensating entries, releasing reservations), the "failed balance match" and "late fill after terminal" reconciliation, and the `tests/test_live_adapter.py` / execution-recovery GREEN scenarios. The legacy `place_market_order` managed-account rejection was not reviewed (it is in live_coinbase_adapter.py, outside this scope).
-- **Task 15:** the ledger release registry, a durable atomic commit of `ActivationPlan` and the control `activate_release` handler are missing. Migration of conversational approvals into Ship evidence is also outstanding. The only verifier is in test fixtures; no production verifier exists.
-- **Task 17:** only status and kill are forwarded. Not done: flatten/reduce permits (including "flatten under hard kill returns the actual rejection"), orders, arm and session bootstrap/provisioning (all in app.py, owned by the lead). Nonces are not persisted across web restarts and per-boot issuance is required.
+- **Task 13:**
+  - The execution.py/ledger importer is missing. It must journal this evidence (corrections and compensating entries for conflicts), supply authoritative opening balances, and release reservations only when fee finality and balance reconciliation both pass.
+  - Startup/periodic reconciliation of every UNKNOWN intent is missing.
+  - There is no production `VenueCapabilityVerifier`.
+  - The dispatch guard is in-process only; across restarts the authority's ledger state must do that job.
+  - Coinbase v2 transaction type coverage comes from documentation and must be confirmed against real history before live (unknown types fail closed).
+  - The streaming bound covers only the sync requests session.
+- **Task 15:** unchanged from the first pass. There is no ledger release registry, no durable atomic commit of `ActivationPlan`, no `activate_release` handler and no production verifier. Migration of conversational approvals is also outstanding.
+- **Task 17:**
+  - The control protocol has no session issuance or epoch discovery (control.py is outside this scope). A stale-epoch status is rejected without returning the current epoch, so the UI starts at epoch 0.
+  - Real arm/disarm/reduce handlers are not implemented in the authority, so these routes currently return `unavailable`.
+  - Launcher wiring that constructs `AuthorityGateway` with sessions, the store and bootstrap tokens is missing.
+  - `worker.py` readers should open read-only.
 
 ## Verification
 
-- Targeted: `tests.autonomous.test_live_venue`, `test_release_promotion`, `test_dashboard_authority`, `tests.test_platform_api`, `tests.test_live_adapter`: 116 tests OK.
-- Full suite: 724 tests. The only failures are 4 tests in the **untracked, concurrently edited** `tests/autonomous/test_runtime_authority.py` (`RuntimeConfig(accounting=...)` is not yet supported by runtime.py, which another agent owns). None of them import the modules reviewed here. Before these changes the suite was 680/680 green; that file did not exist then.
+- First pass: targeted suites OK. The only failures were 4 tests in the then-untracked, concurrently edited `tests/autonomous/test_runtime_authority.py`.
+- Follow-up pass (2026-10-18): full suite `.venv/bin/python -m unittest discover -s tests`: 843 tests, OK (1 skipped).

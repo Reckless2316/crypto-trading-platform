@@ -74,9 +74,27 @@ class LiveAdapterTests(unittest.TestCase):
         self.assertEqual(config.api_secret, "cb-secret")
         self.assertTrue(config.enabled and config.armed)
 
-    def test_order_requires_risk_approval_and_uses_sized_amount(self):
+    def test_legacy_market_order_refuses_without_explicit_opt_in(self):
         exchange = MockExchange()
         account = LiveCoinbaseAccount(enabled_config(), user_armed=True, client=exchange)
+        with self.assertRaises(LiveTradingRejected):
+            account.place_market_order("BTC/USDT", "buy", 100, 20_000,
+                risk_check=lambda _: self.fail("risk callback reached without opt-in"))
+        self.assertEqual([], exchange.created)
+
+    def test_legacy_opt_in_and_managed_are_exclusive_and_managed_is_read_only(self):
+        with self.assertRaises(LiveTradingDisabled):
+            LiveCoinbaseAccount(enabled_config(), user_armed=True, client=MockExchange(),
+                managed=True, legacy_opt_in=True)
+        account = LiveCoinbaseAccount(enabled_config(), user_armed=True, client=MockExchange(), managed=True)
+        with self.assertRaises(AttributeError):
+            account.managed = False
+        with self.assertRaises(AttributeError):
+            account.legacy_opt_in = True
+
+    def test_order_requires_risk_approval_and_uses_sized_amount(self):
+        exchange = MockExchange()
+        account = LiveCoinbaseAccount(enabled_config(), user_armed=True, client=exchange, legacy_opt_in=True)
         with self.assertRaises(LiveTradingRejected):
             account.place_market_order("BTC/USDT", "buy", 100, 20_000)
         with self.assertRaises(LiveTradingRejected):
@@ -209,6 +227,15 @@ class ManagedTransportTests(unittest.TestCase):
             self.transport().submit_prepared(self.intent, self.market)
         self.assertEqual('0.01001', self.exchange.created[0][3])
 
+    def test_client_owned_by_managed_transport_is_unreachable_from_legacy(self):
+        self.transport()
+        account = LiveCoinbaseAccount(enabled_config(), user_armed=True,
+            client=self.exchange, legacy_opt_in=True)
+        with self.assertRaises(LiveTradingRejected):
+            account.place_market_order('BTC/USD', 'buy', 10, 100,
+                risk_check=lambda _: self.fail('managed client reached legacy risk callback'))
+        self.assertEqual([], self.exchange.created)
+
     def test_managed_legacy_market_primitive_rejects_before_risk_or_create(self):
         account = LiveCoinbaseAccount(enabled_config(), user_armed=True,
             client=self.exchange, managed=True)
@@ -258,3 +285,85 @@ class ManagedTransportTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class BoundedSessionTests(unittest.TestCase):
+    """Response bodies are bounded while streaming, before they are fully buffered."""
+
+    def response(self, body, *, length=None, chunked=False):
+        import io
+        import requests
+        test = self
+        class CountingRaw(io.BytesIO):
+            def read(self, size=-1):
+                data = super().read(size)
+                test.read_bytes += len(data)
+                return data
+        self.read_bytes = 0
+        response = requests.Response()
+        response.status_code = 200
+        response.raw = CountingRaw(body)
+        response.headers['Content-Type'] = 'application/json'
+        if length is not None:
+            response.headers['Content-Length'] = str(length)
+        self.closed = False
+        original = response.close
+        def close():
+            self.closed = True
+            original()
+        response.close = close
+        return response
+
+    def inner(self, response):
+        test = self
+        class Inner:
+            def __init__(self):
+                self.cookies, self.headers = {}, {}
+            def request(self, *args, **kwargs):
+                test.kwargs = kwargs
+                return response
+        return Inner()
+
+    def test_small_body_is_readable_and_streamed(self):
+        from bot.live_coinbase_adapter import BoundedSession
+        session = BoundedSession(self.inner(self.response(b'{"ok":true}')), max_bytes=1024)
+        response = session.request('GET', 'https://example.invalid', timeout=1)
+        self.assertTrue(self.kwargs['stream'])
+        self.assertEqual('{"ok":true}', response.text)
+
+    def test_oversized_body_stops_reading_near_the_bound(self):
+        from bot.live_coinbase_adapter import BoundedSession, ResponseTooLarge
+        session = BoundedSession(self.inner(self.response(b'x' * 5_000_000)), max_bytes=100_000, chunk_size=8192)
+        with self.assertRaises(ResponseTooLarge):
+            session.request('GET', 'https://example.invalid')
+        self.assertLessEqual(self.read_bytes, 100_000 + 8192)
+        self.assertTrue(self.closed)
+
+    def test_declared_oversized_length_is_refused_before_reading(self):
+        from bot.live_coinbase_adapter import BoundedSession, ResponseTooLarge
+        session = BoundedSession(self.inner(self.response(b'x' * 10, length=10_000_000)), max_bytes=1000)
+        with self.assertRaises(ResponseTooLarge):
+            session.request('GET', 'https://example.invalid')
+        self.assertEqual(0, self.read_bytes)
+
+    def test_managed_transport_installs_bound_into_real_ccxt_fetch(self):
+        import ccxt
+        from bot.live_coinbase_adapter import BoundedSession, ManagedBoundedTransport, ResponseTooLarge
+        client = ccxt.coinbase()  # no credentials; the HTTP session below is a fake
+        client.session = self.inner(self.response(b'[' + b'1,' * 1_000_000 + b'1]'))
+        transport = ManagedBoundedTransport(client=client, account_id='managed-1', capability_verifier=None,
+            clock_us=lambda: 1, monotonic_ns=lambda: 1)
+        self.assertIs(BoundedSession, type(client.session))
+        self.assertIs(transport.client, client)
+        with self.assertRaises(ResponseTooLarge):
+            client.fetch('https://example.invalid/api')
+        self.assertLessEqual(self.read_bytes, transport.max_response_bytes + 65_536)
+
+    def test_ccxt_fetch_still_decodes_bounded_json(self):
+        import ccxt
+        from bot.live_coinbase_adapter import ManagedBoundedTransport
+        client = ccxt.coinbase()
+        client.session = self.inner(self.response(b'{"data":[1,2]}'))
+        ManagedBoundedTransport(client=client, account_id='managed-1', capability_verifier=None,
+            clock_us=lambda: 1, monotonic_ns=lambda: 1)
+        self.assertEqual({'data': [1, 2]}, client.fetch('https://example.invalid/api'))

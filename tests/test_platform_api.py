@@ -28,8 +28,14 @@ class PlatformApiTests(unittest.TestCase):
         # TestClient is deliberately not entered as a context manager, so the
         # startup collector task cannot make a network request during tests.
         self.client = TestClient(platform_app.app)
+        # Non-managed POSTs need loopback/configured Host, same Origin and CSRF.
+        self.previous_hosts = getattr(platform_app.app.state, "allowed_hosts", None)
+        platform_app.app.state.allowed_hosts = frozenset({"testserver"})
+        token = self.client.get("/api/csrf").json()["csrf_token"]
+        self.client.headers.update({"Origin": "http://testserver", "X-CSRF-Token": token})
 
     def tearDown(self):
+        platform_app.app.state.allowed_hosts = self.previous_hosts
         self.client.close()
         platform_app.DB_FILE = self.original_db_path
         self.temp_dir.cleanup()
@@ -135,6 +141,11 @@ class PlatformApiTests(unittest.TestCase):
         with closing(platform_app.db()) as con:
             self.assertEqual(con.execute("SELECT COUNT(*) FROM live_orders").fetchone()[0], 0)
 
+
+    def test_display_posts_without_csrf_are_refused_before_work(self):
+        with patch("dashboard.backend.app.fetch_listed_markets", side_effect=AssertionError("fetched")):
+            response = self.client.post("/api/market/listings", headers={"X-CSRF-Token": "wrong"})
+        self.assertEqual(response.status_code, 403)
 
     def test_listings_stay_ineligible(self):
         payload = {"source_url": "https://api.coingecko.com/api/v3/coins/markets",

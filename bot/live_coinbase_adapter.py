@@ -1,14 +1,23 @@
 """Legacy opt-in account and an inert, injected managed transport boundary.
 
 The adapter is intentionally separate from the paper account and is not wired into
-the dashboard. Legacy submissions require a risk callback; managed transport
-requires an authority-prepared intent and independently verified capabilities.
+the dashboard. The legacy market primitive refuses unless the account was built
+with explicit ``legacy_opt_in=True``; it is unreachable for managed accounts and for
+any client owned by a ManagedBoundedTransport. Managed transport requires an
+authority-prepared intent, independently verified capabilities, and bounds every
+HTTP response body while streaming.
+
+HANDOFF(claude-opus-5.5 2026-10-18): nothing in the repository constructs a
+legacy account with opt-in; deleting the legacy primitive entirely should be
+decided at Ship. The streaming bound wraps CCXT's synchronous requests session
+only; an async CCXT client is not supported and must not be injected.
 """
 from __future__ import annotations
 
 import os
 import re
 import threading
+import weakref
 from abc import ABC, abstractmethod
 from fractions import Fraction
 from dataclasses import dataclass
@@ -50,6 +59,82 @@ class LiveConfig:
         )
 
 
+# Clients exclusively owned by a ManagedBoundedTransport. A legacy account can
+# never reach such a client, whatever flags it was constructed with.
+_MANAGED_CLIENTS: "weakref.WeakSet[Any]" = weakref.WeakSet()
+_MANAGED_CLIENT_IDS: set[int] = set()  # fallback for objects without weakref support
+
+
+def _is_managed_client(client: Any) -> bool:
+    try:
+        return client in _MANAGED_CLIENTS
+    except TypeError:
+        return id(client) in _MANAGED_CLIENT_IDS
+
+
+def _register_managed_client(client: Any) -> None:
+    try:
+        _MANAGED_CLIENTS.add(client)
+    except TypeError:
+        _MANAGED_CLIENT_IDS.add(id(client))
+
+
+class ResponseTooLarge(ValueError):
+    """A venue response exceeded the bound while streaming; its body was not buffered.
+
+    Deliberately not a requests/CCXT network error, so no layer retries it.
+    """
+
+
+class BoundedSession:
+    """Wraps an HTTP session so every response body is read with a hard byte cap.
+
+    The inner request is made with ``stream=True``. A declared Content-Length above
+    the cap is refused before reading; otherwise the body is read in chunks and
+    the read stops (and the connection closes) as soon as the cap is exceeded.
+    """
+
+    def __init__(self, inner: Any, *, max_bytes: int, chunk_size: int = 65_536):
+        if type(max_bytes) is not int or max_bytes <= 0 or type(chunk_size) is not int or chunk_size <= 0:
+            raise ValueError('positive byte bounds required')
+        if isinstance(inner, BoundedSession):
+            inner = inner.inner
+        self.inner, self.max_bytes, self.chunk_size = inner, max_bytes, chunk_size
+
+    @property
+    def cookies(self):
+        return self.inner.cookies
+
+    def request(self, method, url, **kwargs):
+        kwargs['stream'] = True
+        response = self.inner.request(method, url, **kwargs)
+        try:
+            declared = response.headers.get('Content-Length')
+            if declared is not None:
+                try:
+                    if int(declared) > self.max_bytes:
+                        raise ResponseTooLarge('declared response length exceeds bound')
+                except ValueError as exc:
+                    if isinstance(exc, ResponseTooLarge):
+                        raise
+                    raise ResponseTooLarge('invalid declared response length') from exc
+            body = bytearray()
+            for chunk in response.iter_content(chunk_size=self.chunk_size):
+                body.extend(chunk)
+                if len(body) > self.max_bytes:
+                    raise ResponseTooLarge('response body exceeds bound')
+        except BaseException:
+            response.close()
+            raise
+        response._content = bytes(body)
+        response._content_consumed = True
+        response.close()
+        return response
+
+    def __getattr__(self, name):
+        return getattr(self.inner, name)
+
+
 def _ccxt_client(config: LiveConfig) -> Any:
     """Create a CCXT client lazily; the caller must pass all safety checks first."""
     try:
@@ -83,8 +168,11 @@ class LiveCoinbaseAccount:
         client: Any | None = None,
         client_factory: Callable[[LiveConfig], Any] = _ccxt_client,
         managed: bool = False,
+        legacy_opt_in: bool = False,
     ) -> None:
-        self.managed = managed
+        if type(managed) is not bool or type(legacy_opt_in) is not bool or managed and legacy_opt_in:
+            raise LiveTradingDisabled("A managed account cannot opt into the legacy market primitive")
+        self._managed, self._legacy_opt_in = managed, legacy_opt_in
         self.config = config or LiveConfig.from_env()
         if not self.config.enabled or not self.config.armed or not user_armed:
             raise LiveTradingDisabled(
@@ -98,6 +186,14 @@ class LiveCoinbaseAccount:
         if self.config.exchange_id not in {"binance", "coinbaseadvanced"}:
             raise LiveTradingDisabled("Unsupported live exchange")
         self.client = client if client is not None else client_factory(self.config)
+
+    @property
+    def managed(self) -> bool:
+        return self._managed
+
+    @property
+    def legacy_opt_in(self) -> bool:
+        return self._legacy_opt_in
 
     def get_balances(self) -> dict[str, Any]:
         return self.client.fetch_balance()
@@ -137,8 +233,11 @@ class LiveCoinbaseAccount:
         ``risk_check`` receives symbol, side, base quantity, reference price, and
         quote notional. It must return True or a tuple beginning with True.
         """
-        if self.managed:
+        # Unreachable for managed accounts; legacy callers must opt in explicitly.
+        if self._managed or _is_managed_client(self.client):
             raise LiveTradingRejected("Managed accounts require prepared bounded transport")
+        if self._legacy_opt_in is not True:
+            raise LiveTradingRejected("Legacy market orders require explicit legacy_opt_in=True")
         normalized_side = side.lower()
         if normalized_side not in {"buy", "sell"}:
             raise ValueError("side must be buy or sell")
@@ -201,6 +300,9 @@ class VerifiedVenueCapabilities:
     client_id_max_length: int
 
 
+MAX_RESPONSE_BYTES = 1_048_576
+
+
 class ManagedBoundedTransport:
     """Inert, injected-client transport boundary; no authority or live wiring.
 
@@ -221,7 +323,12 @@ class ManagedBoundedTransport:
             raise LiveTradingRejected('Managed account identity required')
         self.client, self.account_id = client, account_id
         # The injected client is owned exclusively by this transport/LiveVenue.
+        _register_managed_client(client)
         self.client_lock = threading.RLock()
+        # Every HTTP response body (submit and reads) is bounded while streaming.
+        self.max_response_bytes = MAX_RESPONSE_BYTES
+        if hasattr(client, 'session'):
+            client.session = BoundedSession(client.session, max_bytes=MAX_RESPONSE_BYTES)
         self.capability_verifier = capability_verifier
         self.clock_us, self.monotonic_ns = clock_us, monotonic_ns
 

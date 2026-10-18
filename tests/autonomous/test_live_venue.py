@@ -15,6 +15,7 @@ class FakeCoinbase:
         self.fills = []
         self.account_pages = []
         self.order_pages = []
+        self.transactions = []
         self.failure = None
     def create_order(self, *args):
         self.calls.append(('create', args, self.timeout))
@@ -36,6 +37,12 @@ class FakeCoinbase:
     def v3PrivateGetBrokerageAccounts(self, params):
         self.calls.append(('accounts', params, self.timeout))
         return self.account_pages.pop(0)
+    def v2PrivateGetAccountsAccountIdTransactions(self, params):
+        self.calls.append(('transactions', params, self.timeout))
+        item = self.transactions.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        return item
     def v3PrivatePostBrokerageOrdersBatchCancel(self, params):
         self.calls.append(('cancel', params, self.timeout))
         return {'results': [{'success': True, 'order_id': 'order-1'}]}
@@ -250,4 +257,198 @@ class LiveVenueTests(unittest.TestCase):
         self.transport.capability_verifier = None
         with self.assertRaises(LiveTradingRejected):
             self.venue.submit(self.intent, None, self.market)
+        self.assertEqual([], self.client.calls)
+
+
+T0 = 1_767_225_600_000_000  # 2026-01-01T00:00:00Z
+
+
+class LiveVenueReconciliationTests(LiveVenueTests):
+    """Transfers, fee finality, balance reconciliation and response bounds (fakes only)."""
+
+    def tx(self, ident, kind, amount, currency='USD', status='completed', at='2026-01-01T00:00:00Z'):
+        return {'id': ident, 'type': kind, 'status': status,
+            'amount': {'amount': amount, 'currency': currency}, 'created_at': at}
+
+    def page(self, items, after=None):
+        return {'data': items, 'pagination': {'next_starting_after': after}}
+
+    def transfers(self, **kw):
+        args = dict(since_us=T0 - 10_000_000, until_us=T0 + 10_000_000, deadline_mono_ns=100)
+        args.update(kw)
+        return self.venue.read_transfers((('wallet-usd', 'USD'),), **args)
+
+    # ---- transfers ----
+    def test_transfers_paginate_classify_and_bind_wallet(self):
+        self.client.transactions = [
+            self.page([self.tx('t1', 'fiat_deposit', '100'), self.tx('t2', 'fiat_withdrawal', '-25.5')], after='t2'),
+            self.page([self.tx('t3', 'advanced_trade_fill', '-1')])]
+        batch = self.transfers()
+        self.assertTrue(batch.complete, batch.reason_codes)
+        self.assertTrue(batch.all_final)
+        self.assertEqual([('deposit', D('100')), ('withdrawal', D('25.5'))],
+            [(t.direction, t.quantity) for t in batch.transfers])
+        self.assertEqual('wallet-usd', self.client.calls[0][1]['account_id'])
+        self.assertEqual('t2', self.client.calls[1][1]['starting_after'])
+        self.assertTrue(all(t.source.issuer is self.venue for t in batch.transfers))
+
+    def test_foreign_activity_currency_mismatch_and_pending_are_not_complete(self):
+        cases = ((self.tx('t1', 'buy', '1'), 'FOREIGN_ACTIVITY'),
+                 (self.tx('t1', 'fiat_deposit', '1', currency='BTC'), 'TRANSFER_CURRENCY_MISMATCH'),
+                 (self.tx('t1', 'fiat_deposit', '-1'), 'TRANSFER_SIGN_MISMATCH'),
+                 (self.tx('t1', 'fiat_deposit', 1.0), 'INEXACT_SOURCE_NUMBER'))
+        for raw, code in cases:
+            with self.subTest(code):
+                self.client.transactions = [self.page([raw])]
+                batch = self.transfers()
+                self.assertFalse(batch.complete)
+                self.assertIn(code, batch.reason_codes)
+        self.client.transactions = [self.page([self.tx('t1', 'fiat_deposit', '1', status='pending')])]
+        pending = self.transfers()
+        self.assertFalse(pending.all_final)
+        self.assertIn('TRANSFER_NOT_FINAL', pending.reason_codes)
+
+    def test_transfers_stop_at_window_start_and_reject_unordered_history(self):
+        older = self.tx('t0', 'fiat_deposit', '5', at='2025-12-31T00:00:00Z')
+        self.client.transactions = [self.page([self.tx('t1', 'fiat_deposit', '1'), older], after='t0')]
+        batch = self.transfers()
+        self.assertTrue(batch.complete, batch.reason_codes)
+        self.assertEqual(['t1'], [t.transaction_id for t in batch.transfers])
+        self.assertEqual(1, len([c for c in self.client.calls if c[0] == 'transactions']))
+        self.client.transactions = [self.page([older, self.tx('t1', 'fiat_deposit', '1')])]
+        self.assertIn('UNORDERED_SOURCE', self.transfers().reason_codes)
+
+    def test_transfer_pages_are_bounded_and_changed_payload_conflicts(self):
+        self.client.transactions = [self.page([self.tx('t%d' % i, 'fiat_deposit', '1')], after='t%d' % i)
+            for i in range(6)]
+        batch = self.transfers()
+        self.assertFalse(batch.complete)
+        self.assertIn('PAGE_LIMIT', batch.reason_codes)
+        self.assertEqual(5, len(self.client.calls))
+        self.client.calls.clear()
+        self.client.transactions = [self.page([self.tx('t1', 'fiat_deposit', '1')])]
+        first = self.transfers()
+        known = {first.transfers[0].dedupe_key: first.transfers[0].payload_hash}
+        self.client.transactions = [self.page([self.tx('t1', 'fiat_deposit', '2')])]
+        changed = self.transfers(known_hashes=known)
+        self.assertEqual(1, len(changed.conflicts))
+        self.assertFalse(changed.complete)
+
+    # ---- fee finality ----
+    def finality_inputs(self, *, order=None, fills=None):
+        self.client.orders = [order or self.order(status='FILLED', filled_size='.01001', total_fees='.02')]
+        terminal = self.venue.lookup(self.reference, 'BTC-USD', deadline_mono_ns=100)
+        self.now = 20  # fills are read after the terminal observation
+        self.client.fills = [{'fills': fills if fills is not None else [
+            self.fill('trade-1', size='.005', commission='.01'),
+            self.fill('trade-2', size='.00501', commission='.01')], 'cursor': ''}]
+        batch = self.venue.read_fills(since_us=0, until_us=2_000_000_000_000_000, deadline_mono_ns=100)
+        return terminal, batch
+
+    def test_terminal_order_with_all_final_fees_is_releasable(self):
+        terminal, fills = self.finality_inputs()
+        proof = self.venue.fee_finality(terminal, fills)
+        self.assertTrue(proof.fees_final, proof.reason_codes)
+        self.assertEqual(D('.01001'), proof.accounted_quantity)
+        self.assertEqual(D('.02'), proof.total_fee)
+        self.assertTrue(proof.releasable)
+
+    def test_missing_fee_partial_fills_or_corrected_fee_is_not_final(self):
+        cases = (([self.fill('trade-1', size='.005', commission='.01'),
+                   self.fill('trade-2', size='.00501', commission=None)], 'FILL_FEE_MISSING'),
+                 ([self.fill('trade-1', size='.005', commission='.02')], 'FILLED_QUANTITY_MISMATCH'),
+                 ([self.fill('trade-1', size='.005', commission='.01'),
+                   self.fill('trade-2', size='.00501', commission='.011')], 'FEE_TOTAL_MISMATCH'))
+        for fills, code in cases:
+            with self.subTest(code):
+                self.client.calls.clear()
+                self.now = 10
+                terminal, batch = self.finality_inputs(fills=fills)
+                proof = self.venue.fee_finality(terminal, batch)
+                self.assertFalse(proof.fees_final)
+                self.assertFalse(proof.releasable)
+                self.assertIn(code, proof.reason_codes)
+
+    def test_non_terminal_unsettled_or_stale_fill_read_is_not_final(self):
+        for order, code in ((self.order(status='OPEN', filled_size='.005', total_fees='.01'), 'ORDER_NOT_TERMINAL'),
+                            (self.order(status='FILLED', filled_size='.01001', total_fees='.02', settled=False), 'ORDER_NOT_SETTLED'),
+                            (self.order(status='FILLED', filled_size='.01001', total_fees=None), 'ORDER_FEE_MISSING')):
+            with self.subTest(code):
+                self.now = 10
+                terminal, batch = self.finality_inputs(order=order)
+                self.assertIn(code, self.venue.fee_finality(terminal, batch).reason_codes)
+        # Fills read before the terminal observation cannot rule out a late fill.
+        self.now = 10
+        self.client.fills = [{'fills': [self.fill('trade-1', size='.01001', commission='.02')], 'cursor': ''}]
+        early = self.venue.read_fills(since_us=0, until_us=2_000_000_000_000_000, deadline_mono_ns=100)
+        self.now = 30
+        self.client.orders = [self.order(status='FILLED', filled_size='.01001', total_fees='.02')]
+        terminal = self.venue.lookup(self.reference, 'BTC-USD', deadline_mono_ns=100)
+        proof = self.venue.fee_finality(terminal, early)
+        self.assertFalse(proof.fees_final)
+        self.assertIn('FILLS_READ_BEFORE_TERMINAL', proof.reason_codes)
+
+    def test_foreign_issuer_evidence_is_not_final(self):
+        terminal, fills = self.finality_inputs()
+        other = self.fresh_venue()
+        self.assertIn('FOREIGN_EVIDENCE', other.fee_finality(terminal, fills).reason_codes)
+
+    # ---- balance reconciliation ----
+    def reconciliation_inputs(self, *, usd='98.97', btc='0.01', deposits=('100',)):
+        account = dict(uuid='wallet-usd', currency='USD', retail_portfolio_id='portfolio-1',
+            available_balance={'value': usd, 'currency': 'USD'}, hold={'value': '0', 'currency': 'USD'})
+        btc_wallet = dict(account, uuid='wallet-btc', currency='BTC',
+            available_balance={'value': btc, 'currency': 'BTC'}, hold={'value': '0', 'currency': 'BTC'})
+        self.client.account_pages = [{'accounts': [account, btc_wallet], 'has_next': False, 'cursor': ''}]
+        self.client.order_pages = [{'orders': [], 'has_next': False, 'cursor': ''}]
+        state = self.venue.read_account(deadline_mono_ns=100)
+        window = dict(since_us=T0 - 1_000_000, until_us=T0 + 1_000_000, deadline_mono_ns=100, overlap_us=0)
+        self.client.fills = [{'fills': [self.fill('trade-1', side='BUY', size='0.01', price='100',
+            commission='0.03', trade_time='2026-01-01T00:00:00Z')], 'cursor': ''}]
+        fills = self.venue.read_fills(**window)
+        self.client.transactions = [self.page([self.tx('d%d' % i, 'fiat_deposit', v) for i, v in enumerate(deposits)]),
+            self.page([])]
+        transfers = self.venue.read_transfers((('wallet-usd', 'USD'), ('wallet-btc', 'BTC')), **window)
+        return state, fills, transfers
+
+    def test_balances_reconcile_from_opening_fills_and_transfers(self):
+        state, fills, transfers = self.reconciliation_inputs()
+        # USD: 0 + 100 deposit - 1 quote - 0.03 fee = 98.97; BTC: +0.01.
+        result = self.venue.reconcile_balances(state, {}, fills, transfers)
+        self.assertTrue(result.ready, result.reason_codes)
+        self.assertEqual((), result.differences)
+
+    def test_failed_balance_match_is_not_ready(self):
+        state, fills, transfers = self.reconciliation_inputs(usd='98.96')
+        result = self.venue.reconcile_balances(state, {}, fills, transfers)
+        self.assertFalse(result.ready)
+        self.assertIn('BALANCE_MISMATCH', result.reason_codes)
+        self.assertEqual((('USD', D('-0.01')),), result.differences)
+
+    def test_foreign_holding_or_incomplete_inputs_are_not_ready(self):
+        state, fills, transfers = self.reconciliation_inputs()
+        self.assertFalse(self.venue.reconcile_balances(state, {'ETH': D('1')}, fills, transfers).ready)
+        incomplete = dataclasses.replace(transfers, complete=False)
+        self.assertIn('TRANSFERS_INCOMPLETE', self.venue.reconcile_balances(state, {}, fills, incomplete).reason_codes)
+        shifted = dataclasses.replace(fills, since_us=fills.since_us - 1)
+        self.assertIn('WINDOW_MISMATCH', self.venue.reconcile_balances(state, {}, shifted, transfers).reason_codes)
+
+    # ---- bounds ----
+    def test_oversized_response_is_unavailable_without_retry(self):
+        from bot.live_coinbase_adapter import ResponseTooLarge
+        self.client.orders = [ResponseTooLarge('too big'), self.order()]
+        result = self.venue.lookup(self.reference, 'BTC-USD', deadline_mono_ns=100)
+        self.assertFalse(result.complete)
+        self.assertIn('SOURCE_PAYLOAD_SIZE', result.reason_codes)
+        self.assertEqual(1, len(self.client.calls))
+
+    def test_replaced_unbounded_http_session_fails_closed(self):
+        self.client.session = object()
+        self.client.orders = [self.order()]
+        result = self.venue.lookup(self.reference, 'BTC-USD', deadline_mono_ns=100)
+        self.assertIn('UNBOUNDED_TRANSPORT', result.reason_codes)
+        self.assertEqual([], self.client.calls)
+        from bot.live_coinbase_adapter import LiveTradingRejected
+        with self.assertRaises(LiveTradingRejected):
+            self.fresh_venue().submit(self.intent, None, self.market)
         self.assertEqual([], self.client.calls)

@@ -20,15 +20,19 @@ importer. That importer must check issuer identity, source-account binding and r
 hashes, and verify terminal quantities/fees against fills/balances/transfers.
 No record in this module authorizes reservation release or creates a journal.
 
-HANDOFF(claude-opus-5.5 2026-10-17): still missing for Task 13 acceptance --
-(1) transfers/deposits are never read, so balance reconciliation cannot be
-complete and `reconciliation_ready` is always False; (2) no source yields
-`fees_final=True`, so `reservation_releasable` can never pass from this module;
-(3) the single-dispatch guard is in-process only; the durable cross-restart
-guard is the authority's DISPATCHING/UNKNOWN ledger state (execution.py);
-(4) payload size is checked after the SDK has buffered the response, so memory
-is bounded only by the SDK/HTTP layer; (5) the execution.py/ledger importer
-that turns this evidence into journals and releases capacity is not wired.
+HANDOFF(claude-opus-5.5 2026-10-18): now provided here -- bounded transfer
+reads (`read_transfers`), fee-finality proof (`fee_finality`), exact balance
+reconciliation (`reconcile_balances`) and a streamed response bound (installed by
+ManagedBoundedTransport). Still missing for Task 13 acceptance: (1) the
+execution.py/ledger importer that journals this evidence (corrections and
+compensating entries for conflicts), supplies authoritative opening balances and
+releases reservations only when fee finality AND balance reconciliation pass;
+(2) startup/periodic reconciliation of every UNKNOWN intent before readiness;
+(3) the single-dispatch guard is in-process only -- the durable cross-restart
+guard is the authority's DISPATCHING/UNKNOWN ledger state; (4) a production
+VenueCapabilityVerifier; (5) Coinbase v2 transaction type coverage was taken
+from documentation and must be verified against real account history before
+live (unknown types fail closed as FOREIGN_ACTIVITY).
 """
 from __future__ import annotations
 
@@ -40,16 +44,27 @@ from decimal import Decimal, localcontext
 from fractions import Fraction
 from typing import Callable, Mapping
 
-from bot.live_coinbase_adapter import ManagedBoundedTransport, LiveTradingRejected
+from bot.live_coinbase_adapter import (BoundedSession, LiveTradingRejected, ManagedBoundedTransport,
+    ResponseTooLarge)
 from .contracts import (IntentState, MarketRules, OrderReference, VenueOrderResult,
     content_hash, decimal_text, decimal_value)
-from .execution import VenueExecution
+from .execution import VenueExecution, reservation_releasable
 
 _ORDER = 'v3PrivateGetBrokerageOrdersHistoricalOrderId'
 _ORDERS = 'v3PrivateGetBrokerageOrdersHistoricalBatch'
 _FILLS = 'v3PrivateGetBrokerageOrdersHistoricalFills'
 _ACCOUNTS = 'v3PrivateGetBrokerageAccounts'
 _CANCEL = 'v3PrivatePostBrokerageOrdersBatchCancel'
+_TRANSACTIONS = 'v2PrivateGetAccountsAccountIdTransactions'
+# Coinbase v2 transaction types. Deposits/withdrawals change balances outside
+# trading; advanced-trade fills are covered by the fills endpoint; anything else
+# (retail buy/sell, staking, conversions, unknown) is foreign activity.
+_DEPOSIT_TYPES = frozenset({'fiat_deposit', 'exchange_deposit', 'pro_deposit', 'deposit'})
+_WITHDRAWAL_TYPES = frozenset({'fiat_withdrawal', 'exchange_withdrawal', 'pro_withdrawal', 'withdrawal'})
+_SIGNED_TRANSFER_TYPES = frozenset({'send', 'receive', 'transfer'})
+_FILL_TYPES = frozenset({'advanced_trade_fill'})
+_FINAL_EFFECTIVE = frozenset({'completed'})
+_FINAL_VOID = frozenset({'failed', 'canceled', 'cancelled', 'expired'})
 _EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
 
@@ -221,6 +236,77 @@ class AccountEvidence:
 
 
 @dataclass(frozen=True)
+class TransferObservation:
+    account_id: str
+    venue: str
+    wallet_id: str
+    transaction_id: str
+    kind: str
+    asset: str
+    direction: str  # 'deposit' | 'withdrawal'
+    quantity: Decimal  # absolute, positive
+    status: str
+    final: bool
+    effective: bool  # False for failed/canceled/expired transfers
+    event_at_us: int
+    payload_hash: str
+    source: SourceEvidence
+
+    @property
+    def dedupe_key(self):
+        return self.account_id, self.venue, self.transaction_id
+
+
+@dataclass(frozen=True)
+class TransferConflict:
+    previous_hash: str
+    observation: TransferObservation
+
+
+@dataclass(frozen=True)
+class TransferEvidenceBatch:
+    transfers: tuple[TransferObservation, ...]
+    conflicts: tuple[TransferConflict, ...]
+    sources: tuple[SourceEvidence, ...]
+    wallets: tuple[tuple[str, str], ...]
+    since_us: int
+    until_us: int
+    complete: bool
+    all_final: bool
+    reason_codes: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class FeeFinality:
+    """Terminal order plus every fill with a final fee: the ledger's release input."""
+    reference: OrderReference
+    terminal: bool
+    filled_quantity: Decimal | None
+    accounted_quantity: Decimal
+    total_fee: Decimal | None
+    fee_asset: str | None
+    fees_final: bool
+    fill_trade_ids: tuple[str, ...]
+    sources: tuple[SourceEvidence, ...]
+    reason_codes: tuple[str, ...]
+
+    @property
+    def releasable(self) -> bool:
+        # Necessary, never sufficient: balances/transfers must also reconcile.
+        return reservation_releasable(self.terminal, self.filled_quantity, self.accounted_quantity,
+            self.fees_final)
+
+
+@dataclass(frozen=True)
+class BalanceReconciliation:
+    ready: bool
+    expected: tuple[tuple[str, Decimal], ...]
+    observed: tuple[tuple[str, Decimal], ...]
+    differences: tuple[tuple[str, Decimal], ...]  # observed - expected, nonzero only
+    reason_codes: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class LiveSubmission(VenueExecution):
     order_evidence: OrderEvidence
 
@@ -270,7 +356,14 @@ class LiveVenue:
         return SourceEvidence(self, self.account_id, self.portfolio_id, self.venue,
             endpoint, requested, received, content_hash(raw), encoded)
 
+    def _bounded(self):
+        # A real CCXT client has an HTTP session; it must be the streaming bound
+        # installed by ManagedBoundedTransport. Injected fakes have no session.
+        return not hasattr(self.client, 'session') or type(self.client.session) is BoundedSession
+
     def _call(self, method, params, deadline, *, retry=True):
+        if not self._bounded():
+            raise AcquisitionUnavailable('UNBOUNDED_TRANSPORT')
         function = getattr(self.client, method, None)
         if not callable(function):
             raise AcquisitionUnavailable('UNSUPPORTED_ENDPOINT')
@@ -299,6 +392,8 @@ class LiveVenue:
                 if type(raw) is not dict or raw.get('proof_token_required') is True:
                     raise AcquisitionUnavailable('INCOMPLETE_SOURCE_RESPONSE')
                 return raw, source
+            except ResponseTooLarge as exc:
+                raise AcquisitionUnavailable('SOURCE_PAYLOAD_SIZE') from exc
             except Exception as exc:
                 network = isinstance(exc, (TimeoutError, OSError)) or any(
                     kind.__name__ in {'RequestTimeout', 'NetworkError', 'ExchangeNotAvailable',
@@ -364,6 +459,8 @@ class LiveVenue:
         deadline = getattr(getattr(intent, 'proposal', None), 'deadline_mono_ns', None)
         if type(client_order_id) is not str or not client_order_id or type(deadline) is not int:
             raise LiveTradingRejected('Typed prepared intent required')
+        if not self._bounded():
+            raise LiveTradingRejected('Unbounded HTTP session; submit refused')
         with self.transport.client_lock:
             if client_order_id in self._dispatched:
                 raise LiveTradingRejected('Client order ID already dispatched; reconcile, never resubmit')
@@ -574,3 +671,236 @@ class LiveVenue:
             reasons += (str(exc),)
         return AccountEvidence(self.account_id, self.portfolio_id, tuple(balances), tuple(orders),
             sources, complete, tuple(dict.fromkeys(reasons)))
+
+    # ---- transfers -------------------------------------------------------
+
+    def _transfer(self, raw, wallet, asset, source):
+        kind, status = raw.get('type'), raw.get('status')
+        if type(kind) is not str or type(status) is not str:
+            raise AcquisitionUnavailable('INCOMPLETE_TRANSFER')
+        if kind in _FILL_TYPES:
+            return None
+        if kind not in _DEPOSIT_TYPES | _WITHDRAWAL_TYPES | _SIGNED_TRANSFER_TYPES:
+            raise AcquisitionUnavailable('FOREIGN_ACTIVITY')
+        amount = raw.get('amount')
+        if type(amount) is not dict or amount.get('currency') != asset:
+            raise AcquisitionUnavailable('TRANSFER_CURRENCY_MISMATCH')
+        text = amount.get('amount')
+        if type(text) is not str:
+            raise AcquisitionUnavailable('INEXACT_SOURCE_NUMBER')
+        negative = text.startswith('-')
+        quantity = _decimal(text[1:] if negative else text, positive=True)
+        direction = 'withdrawal' if negative else 'deposit'
+        if (kind in _DEPOSIT_TYPES and negative) or (kind in _WITHDRAWAL_TYPES and not negative):
+            raise AcquisitionUnavailable('TRANSFER_SIGN_MISMATCH')
+        final = status in _FINAL_EFFECTIVE or status in _FINAL_VOID
+        return TransferObservation(self.account_id, self.venue, wallet, _id(raw.get('id')), kind, asset,
+            direction, quantity, status, final, status in _FINAL_EFFECTIVE,
+            _timestamp(raw.get('created_at')), content_hash(raw), source)
+
+    def read_transfers(self, wallets, *, since_us, until_us, deadline_mono_ns, overlap_us=1_000_000,
+            known_hashes: Mapping[tuple[str, str, str], str] | None = None):
+        """Deposits/withdrawals per wallet (newest first, bounded pages) for reconciliation.
+
+        `complete` means every wallet was traversed back past the window start
+        with no foreign activity, conflict or parse failure. Non-final transfers
+        are returned and clear `all_final`; reconciliation cannot complete then.
+        """
+        if (type(since_us) is not int or type(until_us) is not int or not 0 <= since_us < until_us
+                or type(overlap_us) is not int or not 0 <= overlap_us <= 60_000_000
+                or type(wallets) is not tuple or not wallets
+                or any(type(w) is not tuple or len(w) != 2 for w in wallets)):
+            raise AcquisitionUnavailable('INVALID_WINDOW')
+        wallets = tuple((_id(w), _id(a)) for w, a in wallets)
+        if len({w for w, _ in wallets}) != len(wallets):
+            raise AcquisitionUnavailable('DUPLICATE_WALLET')
+        start = max(0, since_us - overlap_us)
+        transfers, conflicts, sources, reasons = [], [], [], []
+        complete, seen = True, dict(known_hashes or {})
+        page_size = min(self.page_size, 100)
+        try:
+            deadline = self._budget(deadline_mono_ns)
+        except AcquisitionUnavailable as exc:
+            return TransferEvidenceBatch((), (), (), wallets, start, until_us, False, False, (str(exc),))
+        pages_left = self.max_pages
+        for wallet, asset in wallets:
+            cursor, cursors, newest_seen, done = None, set(), None, False
+            while not done:
+                if pages_left <= 0:
+                    complete = False
+                    reasons.append('PAGE_LIMIT')
+                    break
+                pages_left -= 1
+                request = {'account_id': wallet, 'limit': page_size, 'order': 'desc'}
+                if cursor:
+                    request['starting_after'] = cursor
+                try:
+                    raw, source = self._call(_TRANSACTIONS, request, deadline)
+                    sources.append(source)
+                    page, pagination = raw.get('data'), raw.get('pagination')
+                    if (type(page) is not list or len(page) > page_size or type(pagination) is not dict
+                            or any(type(item) is not dict for item in page)):
+                        raise AcquisitionUnavailable('INVALID_SOURCE_PAGE')
+                    for item in page:
+                        try:
+                            at = _timestamp(item.get('created_at'))
+                            if newest_seen is not None and at > newest_seen:
+                                raise AcquisitionUnavailable('UNORDERED_SOURCE')
+                            newest_seen = at
+                            if at < start:
+                                done = True
+                                continue
+                            if at > until_us:
+                                continue
+                            transfer = self._transfer(item, wallet, asset, source)
+                            if transfer is None:
+                                continue
+                            previous = seen.get(transfer.dedupe_key)
+                            if previous is None:
+                                transfers.append(transfer)
+                                seen[transfer.dedupe_key] = transfer.payload_hash
+                            elif previous != transfer.payload_hash:
+                                conflicts.append(TransferConflict(previous, transfer))
+                                complete = False
+                                reasons.append('TRANSFER_PAYLOAD_CONFLICT')
+                        except (ValueError, TypeError, AttributeError) as exc:
+                            complete = False
+                            reasons.append(str(exc))
+                    following = pagination.get('next_starting_after')
+                    if done or following in (None, ''):
+                        done = True
+                    elif type(following) is not str or len(following) > 1024 or following in cursors:
+                        raise AcquisitionUnavailable('CURSOR_STALLED')
+                    else:
+                        cursors.add(following)
+                        cursor = following
+                except AcquisitionUnavailable as exc:
+                    complete = False
+                    reasons.append(str(exc))
+                    break
+        all_final = all(t.final for t in transfers)
+        if not all_final:
+            reasons.append('TRANSFER_NOT_FINAL')
+        return TransferEvidenceBatch(tuple(transfers), tuple(conflicts), tuple(sources), wallets, start,
+            until_us, complete, all_final, tuple(dict.fromkeys(reasons)))
+
+    # ---- fee finality ------------------------------------------------------
+
+    def fee_finality(self, order: OrderEvidence, fills: FillEvidenceBatch) -> FeeFinality:
+        """Prove a terminal order's cumulative quantity and fees from its own fills.
+
+        Requires this venue's own evidence, a complete settled terminal order with
+        a reported total fee, and a complete fill read that started after the
+        terminal observation (so a late fill cannot be missed). Every fill must
+        carry a USD fee; quantities and fees must sum exactly to the order's.
+        """
+        reasons = []
+        if type(order) is not OrderEvidence or type(fills) is not FillEvidenceBatch:
+            raise AcquisitionUnavailable('INVALID_EVIDENCE')
+        venue_id = order.reference.venue_order_id
+        mine = [f for f in fills.fills if venue_id is not None and f.order_id == venue_id]
+        with localcontext() as context:
+            context.prec = 100
+            accounted = sum((f.base_quantity for f in mine), Decimal(0))
+            fees = sum((f.fee_quantity for f in mine if f.fee_quantity is not None), Decimal(0))
+        if (not order.sources or not fills.sources
+                or any(src.issuer is not self for src in order.sources + fills.sources)
+                or any(f.source.issuer is not self for f in mine)
+                or order.reference.account_id != self.account_id):
+            reasons.append('FOREIGN_EVIDENCE')
+        if venue_id is None:
+            reasons.append('ORDER_ID_REQUIRED')
+        if not order.complete:
+            reasons.append('ORDER_INCOMPLETE')
+        if not order.terminal:
+            reasons.append('ORDER_NOT_TERMINAL')
+        if order.settled is not True:
+            reasons.append('ORDER_NOT_SETTLED')
+        if order.total_fee is None:
+            reasons.append('ORDER_FEE_MISSING')
+        if not fills.complete:
+            reasons.append('FILLS_INCOMPLETE')
+        if any(c.observation.order_id == venue_id for c in fills.conflicts):
+            reasons.append('FILL_CONFLICT')
+        if order.sources and fills.sources:
+            observed = max(src.received_at_us for src in order.sources)
+            if min(src.requested_at_us for src in fills.sources) < observed or fills.until_us < observed:
+                reasons.append('FILLS_READ_BEFORE_TERMINAL')
+            if order.event_at_us is None or fills.since_us > order.event_at_us:
+                reasons.append('FILL_WINDOW_AFTER_ORDER')
+        if any(f.fee_quantity is None or f.fee_asset != 'USD' for f in mine):
+            reasons.append('FILL_FEE_MISSING')
+        if any(f.instrument != order.instrument or f.side != order.side for f in mine):
+            reasons.append('FILL_IDENTITY_MISMATCH')
+        if order.filled_quantity is None or accounted != order.filled_quantity:
+            reasons.append('FILLED_QUANTITY_MISMATCH')
+        if order.total_fee is not None and fees != order.total_fee:
+            reasons.append('FEE_TOTAL_MISMATCH')
+        final = not reasons
+        return FeeFinality(order.reference, order.terminal, order.filled_quantity, accounted,
+            order.total_fee if final else None, 'USD' if final else None, final,
+            tuple(f.trade_id for f in mine), tuple(order.sources) + tuple(fills.sources), tuple(reasons))
+
+    # ---- balance reconciliation ---------------------------------------------
+
+    def reconcile_balances(self, account: AccountEvidence, opening: Mapping[str, Decimal],
+            fills: FillEvidenceBatch, transfers: TransferEvidenceBatch) -> BalanceReconciliation:
+        """Exact per-asset check: opening + fills + transfers == observed available+hold.
+
+        `opening` is the authoritative balance at the shared window start. Any
+        incomplete/non-final/conflicting input, foreign evidence, non-USD fee or
+        asset difference (including unexpected holdings) leaves it not ready.
+        """
+        if (type(account) is not AccountEvidence or type(fills) is not FillEvidenceBatch
+                or type(transfers) is not TransferEvidenceBatch):
+            raise AcquisitionUnavailable('INVALID_EVIDENCE')
+        reasons = []
+        if not account.complete:
+            reasons.append('ACCOUNT_INCOMPLETE')
+        if not fills.complete or fills.conflicts:
+            reasons.append('FILLS_INCOMPLETE')
+        if not transfers.complete or transfers.conflicts:
+            reasons.append('TRANSFERS_INCOMPLETE')
+        if not transfers.all_final:
+            reasons.append('TRANSFER_NOT_FINAL')
+        if (fills.since_us, fills.until_us) != (transfers.since_us, transfers.until_us):
+            reasons.append('WINDOW_MISMATCH')
+        wallets = {b.wallet_id: b.asset for b in account.balances}
+        if dict(transfers.wallets) != wallets:
+            reasons.append('TRANSFER_WALLETS_MISMATCH')
+        sources = account.sources + fills.sources + transfers.sources
+        if (any(src.issuer is not self for src in sources) or account.account_id != self.account_id
+                or any(b.source.issuer is not self for b in account.balances)):
+            reasons.append('FOREIGN_EVIDENCE')
+        expected, observed = {}, {}
+        with localcontext() as context:
+            context.prec = 100
+            for asset, value in dict(opening).items():
+                if type(asset) is not str or type(value) is not Decimal or not value.is_finite():
+                    raise AcquisitionUnavailable('INVALID_OPENING_BALANCE')
+                expected[asset] = expected.get(asset, Decimal(0)) + value
+            for fill in fills.fills:
+                if fill.fee_quantity is None or fill.fee_asset != 'USD':
+                    reasons.append('FILL_FEE_MISSING')
+                    continue
+                base = fill.instrument.split('-')[0]
+                sign = 1 if fill.side == 'buy' else -1
+                expected[base] = expected.get(base, Decimal(0)) + sign * fill.base_quantity
+                expected['USD'] = (expected.get('USD', Decimal(0)) - sign * fill.quote_quantity
+                    - fill.fee_quantity)
+            for transfer in transfers.transfers:
+                if transfer.effective:
+                    sign = 1 if transfer.direction == 'deposit' else -1
+                    expected[transfer.asset] = expected.get(transfer.asset, Decimal(0)) + sign * transfer.quantity
+            for balance in account.balances:
+                observed[balance.asset] = observed.get(balance.asset, Decimal(0)) + balance.available + balance.hold
+            differences = []
+            for asset in sorted(set(expected) | set(observed)):
+                delta = observed.get(asset, Decimal(0)) - expected.get(asset, Decimal(0))
+                if delta != 0:
+                    differences.append((asset, delta))
+        if differences:
+            reasons.append('BALANCE_MISMATCH')
+        reasons = tuple(dict.fromkeys(reasons))
+        return BalanceReconciliation(not reasons, tuple(sorted(expected.items())), tuple(sorted(observed.items())),
+            tuple(differences), reasons)

@@ -16,7 +16,8 @@ from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconn
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
 
-from dashboard.backend.authority_client import gateway_for, set_session_cookie
+from dashboard.backend.authority_client import (allowed_host, check_local_post, gateway_for,
+    local_csrf_token, set_session_cookie, unavailable)
 
 from bot.risk_gates import RiskGates
 from bot.onboard_ai import OnboardTradingAgent
@@ -44,8 +45,15 @@ app = FastAPI(title="SURGE Crypto Trading Platform", version="1.1.0")
 logger = logging.getLogger("surge.collector")
 live_armed_until = 0.0
 
-_MANAGED_MUTATIONS = frozenset({"/api/orders", "/api/control/arm", "/api/control/kill",
+_MANAGED_MUTATIONS = frozenset({"/api/orders", "/api/control/arm", "/api/control/disarm", "/api/control/kill",
     "/api/control/flatten", "/api/live/arm", "/api/live/disarm", "/api/live/orders", "/api/automation"})
+# Session bootstrap performs its own Origin and one-time-token checks.
+_SELF_CHECKED_POSTS = frozenset({"/api/session/bootstrap"})
+LIVE_ACKNOWLEDGEMENT = "I UNDERSTAND THIS SENDS REAL ORDERS"
+
+
+def _post_paths() -> frozenset:
+    return frozenset(route.path for route in app.routes if "POST" in (getattr(route, "methods", None) or ()))
 
 
 @app.middleware("http")
@@ -53,12 +61,43 @@ async def authenticate_managed_mutations(request: Request, call_next):
     execute = request.query_params.get('execute', '').lower() in {'true', '1', 'yes', 'on'}
     managed = request.method == 'POST' and (request.url.path in _MANAGED_MUTATIONS
         or request.url.path == '/api/strategy/run' and execute)
-    if managed:
-        try:
+    try:
+        if managed:
             gateway_for(request, mutation=True)
-        except HTTPException as exc:
-            return JSONResponse(status_code=exc.status_code, content={'detail': exc.detail})
+        elif (request.method == 'POST' and request.url.path not in _SELF_CHECKED_POSTS
+                and request.url.path in _post_paths()):
+            # Every other POST mutation needs loopback Host, same Origin and CSRF.
+            check_local_post(request)
+    except HTTPException as exc:
+        return JSONResponse(status_code=exc.status_code, content={'detail': exc.detail})
     return await call_next(request)
+
+
+@app.get('/api/csrf')
+def csrf_token(request: Request):
+    """Per-process token for non-managed POSTs; unreadable cross-origin."""
+    if not allowed_host(request):
+        raise HTTPException(403, 'Host rejected')
+    return {'csrf_token': local_csrf_token(request.app)}
+
+
+class BootstrapRequest(BaseModel):
+    token: str = Field(min_length=32, max_length=256)
+
+
+@app.post('/api/session/bootstrap')
+def bootstrap_session(request: Request, body: BootstrapRequest):
+    """Exchange a one-time launcher token for the HttpOnly SameSite=Strict session."""
+    if not allowed_host(request):
+        raise HTTPException(403, 'Host rejected')
+    gateway = getattr(request.app.state, 'authority_gateway', None)
+    if gateway is None:
+        raise HTTPException(503, 'Authority gateway unavailable')
+    session = gateway.bootstrap(request, body.token)
+    result = JSONResponse({'actor': session.actor, 'role': session.role,
+        'csrf_token': session.csrf_token})
+    set_session_cookie(result, session)
+    return result
 
 
 @app.get('/api/session')
@@ -201,7 +240,17 @@ class OrderRequest(BaseModel):
 
 
 class ArmRequest(BaseModel):
-    duration_minutes: int = Field(default=30, ge=1, le=60)
+    release_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    reason: str = Field(default="operator arm", min_length=1, max_length=256)
+
+
+class DisarmRequest(BaseModel):
+    reason: str = Field(default="operator disarm", min_length=1, max_length=256)
+
+
+class FlattenRequest(BaseModel):
+    reason: str = Field(default="operator flatten", min_length=1, max_length=256)
+    incident_id: str | None = Field(default=None, min_length=1, max_length=128)
 
 
 class AutomationRequest(BaseModel):
@@ -221,6 +270,7 @@ class BacktestRequest(BaseModel):
 
 class LiveArmRequest(BaseModel):
     acknowledgement: str
+    release_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
 
 
 class LiveOrderRequest(BaseModel):
@@ -379,7 +429,7 @@ def get_automation():
 
 @app.post("/api/automation")
 def set_automation(request: AutomationRequest):
-    raise HTTPException(409, "Authority automation handler unavailable")
+    return unavailable("Authority automation handler unavailable")
 
 
 @app.get("/api/live/status")
@@ -391,18 +441,23 @@ def live_status():
 
 
 @app.post("/api/live/arm")
-def arm_live(request: LiveArmRequest):
-    raise HTTPException(409, "Authority live activation handler unavailable")
+def arm_live(request: Request, body: LiveArmRequest):
+    if body.acknowledgement != LIVE_ACKNOWLEDGEMENT:
+        raise HTTPException(422, "Exact live acknowledgement required")
+    return gateway_for(request, mutation=True).forward(request, 'arm',
+        {'reason': 'operator live arm', 'release_hash': body.release_hash}, require_mode='live')
 
 
 @app.post("/api/live/disarm")
-def disarm_live():
-    raise HTTPException(409, "Authority disarm handler unavailable")
+def disarm_live(request: Request, body: DisarmRequest | None = None):
+    reason = (body or DisarmRequest()).reason
+    return gateway_for(request, mutation=True).forward(request, 'disarm', {'reason': reason},
+        require_mode='live')
 
 
 @app.post("/api/live/orders")
 def place_live_order(request: LiveOrderRequest):
-    raise HTTPException(409, "Authority live order handler unavailable")
+    return unavailable("Authority live order handler unavailable")
 
 
 @app.get("/api/live/orders")
@@ -665,7 +720,7 @@ def book_observations(limit: int = 8):
     if not path.exists():
         body = {"rows": [], "eligible": False, "dispatched": False}
     else:
-        with closing(sqlite3.connect(path)) as connection:
+        with closing(sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)) as connection:
             found = connection.execute(
                 "SELECT sequence, exchange_time, bids, asks, reason FROM book_observations ORDER BY sequence DESC LIMIT ?",
                 (min(max(limit, 1), 20),)).fetchall()
@@ -1012,7 +1067,7 @@ def signals(limit: int = 20):
 def run_strategy(symbol: str = "BTC-USD", strategy: str = "ema_12_26_crossover", execute: bool = False,
                  exchange: str = "coinbase"):
     if execute:
-        raise HTTPException(409, "Authority strategy execution handler unavailable")
+        return unavailable("Authority strategy execution handler unavailable")
     if exchange not in {"coinbase", "binance", "kraken"}:
         raise HTTPException(status_code=422, detail="Unsupported exchange")
     candle_rows = CandleHistoryStore(DB_FILE).load(exchange, symbol, "1h")
@@ -1045,12 +1100,19 @@ def run_strategy(symbol: str = "BTC-USD", strategy: str = "ema_12_26_crossover",
 
 @app.post("/api/orders")
 def place_order(request: OrderRequest):
-    raise HTTPException(409, "Authority manual order handler unavailable")
+    return unavailable("Authority manual order handler unavailable")
 
 
 @app.post("/api/control/arm")
-def arm(request: ArmRequest):
-    raise HTTPException(409, "Authority arm handler unavailable")
+def arm(request: Request, body: ArmRequest):
+    return gateway_for(request, mutation=True).forward(request, 'arm',
+        {'reason': body.reason, 'release_hash': body.release_hash})
+
+
+@app.post("/api/control/disarm")
+def disarm(request: Request, body: DisarmRequest | None = None):
+    return gateway_for(request, mutation=True).forward(request, 'disarm',
+        {'reason': (body or DisarmRequest()).reason})
 
 
 def _paper_control_flags() -> dict:
@@ -1226,8 +1288,14 @@ def kill(request: Request):
 
 
 @app.post("/api/control/flatten")
-def flatten():
-    raise HTTPException(409, "Authority bounded reduction handler unavailable")
+def flatten(request: Request, body: FlattenRequest | None = None):
+    """Bounded reduction is an authority command; under hard kill the authority's
+    actual rejection is returned, never a local flatten."""
+    body = body or FlattenRequest()
+    payload = {'reason': body.reason}
+    if body.incident_id is not None:
+        payload['incident_id'] = body.incident_id
+    return gateway_for(request, mutation=True).forward(request, 'reduce', payload)
 
 
 @app.get("/api/orders")
