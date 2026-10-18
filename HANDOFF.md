@@ -1,23 +1,37 @@
 # HANDOFF — for Cursor / next agent
 
-Signed: `HANDOFF(claude-opus-5.5 2026-10-17)`. Search the tree for `HANDOFF(` to find inline markers.
+Signed `HANDOFF(claude-opus-5.5 2026-10-17)`, updated 2026-10-18. Search the tree for `HANDOFF(` to find inline markers.
 
-## State at handoff
-- Branch `feat/autonomous-crypto-agent`. Commit `32a72bc` checkpoints Codex's paper-reconciliation WIP. The full suite was 582 tests OK on Python 3.14 (`.venv/bin/python -m unittest discover -s tests`).
-- History: `.agenkit/sdd/progress.md` (newest entries at the top), `master-context.md` (Task 13–22 gap table), `docs/checkpoints/`.
-- Still uncommitted, operator-owned: `dashboard/`, `deploy/deploy.sh`, `bot/live_coinbase_adapter.py`, `tests/test_live_adapter.py`, `tests/test_platform_api.py`. Preserve them; review before committing.
+## State
+- Branch `feat/autonomous-crypto-agent`. Suite: `.venv/bin/python -m unittest discover -s tests` passed with 905 tests at `27af3eb`. Network-guard run: `PYTHONPATH=deploy/autonomous/ci SURGE_BLOCK_NETWORK=1`.
+- Running locally (paper): `data/autonomous/runtime` (unarmed) and `data/autonomous/runtime-demo-armed` (armed paper, tiny exploration). Stop either with `touch <dir>/STOP`.
+- Full narrative: `docs/checkpoints/2026-10-17-claude-paper-runtime.md`. Codex-WIP acceptance record: `docs/reviews/2026-10-17-codex-wip-acceptance.md`. Operations: `docs/runbooks/autonomous-paper.md`. History: `.agenkit/sdd/progress.md`, `master-context.md`.
 
-## Done (Claude session), see `docs/checkpoints/2026-10-17-claude-paper-runtime.md`
-- `bot/autonomous/runtime.py`: the paper loop, reviewed twice; all findings fixed. Running locally, unarmed, on `data/autonomous/runtime/`.
-- `GET /api/autonomous/runtime` read model, plus `deploy/autonomous/` systemd units (not installed).
+## What exists (commit → piece)
+| Commit | Piece |
+|---|---|
+| `81910dd`…`1eaf7ca` | `runtime.py` paper loop. Offline/Jev REFLEX, code gate, quarter Kelly, hard risk, cost-aware labels, public market rules, nightly. Every piece independently reviewed and fixed. |
+| `4b98194`, `1eaf7ca` | `jev_reflex.py`. Inert until JEV_API_KEY plus an operator-approved schema; hard 250 ms deadline; fail-safe holds. |
+| `a1cc5cc` | `runtime_authority.py`: `--accounting ledger` routes orders via OrderAuthority/Ledger. |
+| `4fb0de9`, `71e75ff` | `live_venue.py` (Task 13): no submit retry, single dispatch, transfers, fee finality, streamed bounds. `authority_client.py` and dashboard (Task 17): authenticated forwarding, durable nonces, Origin/CSRF. |
+| `7028b56`, `7900c6e` | Task 15 activation: ledger-enforced approvals, operator-only, at the hour boundary. Task 14: paper arm with deadman lease, uid-bound sessions, latch rules (drawdown never clearable, daily at rollover, crisis operator-only with conditions). |
+| `bcafcd7` | Task 20: compose overlay, CI workflow with network guard, lock file, SQLite backup tool, runbook. |
+| `c812fca` | Task 19: `replay.py`, exact-fidelity replay, sealed splits with purge/embargo, stresses, holdout register, promotion criteria. |
+| `27af3eb` | Task 18: `brain_anthropic.py`. Opus 5.5 BRAIN for escalations and nightly, proposal-only (`python -m bot.autonomous.nightly`). |
 
-## Next for Cursor (in order)
-1. Jev adapter is wired (`bot/autonomous/jev_reflex.py`); next is an authenticated evaluation with the operator's key and approved schema, plus tokenizer proof.
-2. Route runtime paper orders through OrderAuthority/Ledger (Tasks 12/16).
-3. Verified MarketRules; labels that include spread and slippage.
-4. Latch clearing and kill via the authenticated control socket (Tasks 14/17).
+## In flight when this was written
+1. Builder: an authority lease renewer (Task 16), plus a formal decision bridge so ledger-mode entries can work once a real calibration attestation exists. Uncommitted edits are in runtime*.py, ledger.py, jev_reflex.py and test_authority_worker.py.
+2. Reviewer agent: BRAIN request without `fallbacks` by default, token usage accounting, and a dashboard proposals/midnight view.
+
+## Next (in order)
+1. Finish the two in-flight items above and get an independent review of each.
+2. Authenticated evaluations needing operator credentials: Jev (key, approved schema, tokenizer proof, latency) and Anthropic BRAIN (key).
+3. Task 13: import live evidence into ledger journals; reconcile UNKNOWN intents at startup; production capability verifier.
+4. Task 15: production release verifier and trusted catalog.
+5. Task 20: four-role process split with file-mounted secrets; run `docker compose config` and the drills.
+6. Task 21 independent acceptance. Task 22 needs explicit operator approval for any live progression.
 
 ## Hard rules (do not relax)
-- No live orders or arming. Live progression requires Tasks 13/14/15/20/21 and explicit operator approval (Task 22).
-- Code owns every threshold, size and side effect. The model only judges.
-- Below 100 resolved labels per cohort, the calibrated probability is a prior with zero Kelly, so no paper entries occur. That outcome is correct, not a bug.
+- No live orders or arming. Live arm is refused in code (`LIVE_ARM_REQUIRES_TASK22`).
+- Code owns every threshold, size and side effect. Models (Jev/BRAIN) only judge or propose; they can never approve, activate, arm or clear.
+- Calibration comes only from real resolved labels. An empty eligible universe or "never trades" is a valid outcome.
