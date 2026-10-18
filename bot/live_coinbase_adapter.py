@@ -1,11 +1,15 @@
-"""Opt-in CCXT exchange adapter. It never creates orders unless explicitly armed.
+"""Legacy opt-in account and an inert, injected managed transport boundary.
 
 The adapter is intentionally separate from the paper account and is not wired into
-the dashboard. Callers must provide a risk callback for every order submission.
+the dashboard. Legacy submissions require a risk callback; managed transport
+requires an authority-prepared intent and independently verified capabilities.
 """
 from __future__ import annotations
 
 import os
+import re
+from abc import ABC, abstractmethod
+from fractions import Fraction
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping
 
@@ -77,7 +81,9 @@ class LiveCoinbaseAccount:
         user_armed: bool = False,
         client: Any | None = None,
         client_factory: Callable[[LiveConfig], Any] = _ccxt_client,
+        managed: bool = False,
     ) -> None:
+        self.managed = managed
         self.config = config or LiveConfig.from_env()
         if not self.config.enabled or not self.config.armed or not user_armed:
             raise LiveTradingDisabled(
@@ -130,6 +136,8 @@ class LiveCoinbaseAccount:
         ``risk_check`` receives symbol, side, base quantity, reference price, and
         quote notional. It must return True or a tuple beginning with True.
         """
+        if self.managed:
+            raise LiveTradingRejected("Managed accounts require prepared bounded transport")
         normalized_side = side.lower()
         if normalized_side not in {"buy", "sell"}:
             raise ValueError("side must be buy or sell")
@@ -151,3 +159,139 @@ class LiveCoinbaseAccount:
         if not allowed:
             raise LiveTradingRejected(f"Risk check rejected order: {decision!r}")
         return self.client.create_order(symbol, "market", normalized_side, amount)
+
+
+# These claims describe the exact CCXT call below, including its parameter names
+# and Decimal-text serialization. A vendor's generic "supports limit" flag does
+# not establish them.
+MANAGED_CAPABILITIES = frozenset({
+    'spot_usd', 'tick_lot_minimum', 'limit_ioc', 'ccxt_decimal_text',
+    'ccxt_timeInForce_IOC', 'ccxt_clientOrderId', 'client_id_action_binding',
+    'client_id_idempotency', 'client_id_lookup', 'usd_fee_bound', 'fill_history',
+    'submit_no_retries',
+})
+
+
+class VenueCapabilityVerifier(ABC):
+    """Trusted authority dependency, never a wire value or a caller approval bool.
+
+    A production implementation must verify immutable source records against the
+    exact configured client/version/account, all MarketRules, IOC and parameter
+    semantics, collision-safe action-derived client IDs, idempotency/lookup,
+    complete fill history and USD-only bounded fees. There is intentionally no
+    production implementation or permissive default. Hashes alone are not proof.
+    """
+
+    @abstractmethod
+    def verify(self, intent, market, now_us: int, *, client: Any) -> VerifiedVenueCapabilities | None:
+        raise NotImplementedError
+
+
+@dataclass(frozen=True)
+class VerifiedVenueCapabilities:
+    issuer: VenueCapabilityVerifier
+    client: Any
+    intent_hash: str
+    market_hash: str
+    verified_at_us: int
+    expires_at_us: int
+    source_record_hashes: tuple[str, ...]
+    capabilities: frozenset[str]
+    client_id_max_length: int
+
+
+class ManagedBoundedTransport:
+    """Inert, injected-client transport boundary; no authority or live wiring.
+
+    This is deliberately not VenuePort: submit_prepared returns an untrusted raw
+    acknowledgment, not reconciled execution/fill evidence. A future live port
+    must verify it and reconcile before capacity can be released. The authority
+    must commit DISPATCHING under its dispatch mutex before invoking this method.
+    Any create_order exception propagates unchanged: acceptance is unknown and
+    the authority must retain the reservation. This layer never retries submits.
+    """
+
+    venue = 'coinbaseadvanced'
+
+    def __init__(self, *, client: Any, account_id: str,
+            capability_verifier: VenueCapabilityVerifier | None,
+            clock_us: Callable[[], int], monotonic_ns: Callable[[], int]):
+        if type(account_id) is not str or not account_id:
+            raise LiveTradingRejected('Managed account identity required')
+        self.client, self.account_id = client, account_id
+        self.capability_verifier = capability_verifier
+        self.clock_us, self.monotonic_ns = clock_us, monotonic_ns
+
+    def submit_prepared(self, intent, market) -> dict[str, Any]:
+        from .autonomous.contracts import (
+            IntentState, MarketRules, PreparedIntent, Side, content_hash, decimal_text,
+        )
+        reject = LiveTradingRejected
+        if type(intent) is not PreparedIntent or type(market) is not MarketRules:
+            raise reject('Typed prepared intent and market rules required')
+        p, reservation = intent.proposal, intent.reservation
+        now, mono = self.clock_us(), self.monotonic_ns()
+        if (type(now) is not int or now < 0 or type(mono) is not int or mono < 0
+                or p.deadline_mono_ns <= mono or market.expires_at_us <= now):
+            raise reject('Expired intent or market rules')
+        if (p.account_id != self.account_id or intent.state is not IntentState.DISPATCHING
+                or p.side not in (Side.BUY, Side.SELL)
+                or p.side is Side.SELL and not p.reducing_only):
+            raise reject('Invalid managed dispatch identity/state/side')
+        if (market.venue != self.venue or not market.spot_allowed or not market.limit_ioc_verified
+                or market.quote_asset != 'USD' or p.instrument != market.instrument
+                or market.instrument != f'{market.base_asset}/USD'
+                or not re.fullmatch(r'[A-Z0-9]+', market.base_asset)):
+            raise reject('Verified Coinbase USD spot market required')
+        if (reservation.intent_id != intent.intent_id
+                or reservation.instrument != p.instrument or reservation.side != p.side.value
+                or reservation.state is not IntentState.RESERVED
+                or reservation.base_quantity != p.base_quantity
+                or reservation.remaining_quantity != p.base_quantity):
+            raise reject('Prepared reservation does not match dispatch')
+        # Fraction operations preserve exact products and increments even at 38
+        # significant digits and independently of ambient Decimal precision.
+        quantity, price = decimal_text(p.base_quantity), decimal_text(p.limit_price)
+        for value in (market.tick_size, market.lot_size, market.minimum_quantity,
+                market.minimum_notional, market.fee_bound):
+            decimal_text(value)
+        q, price_value = Fraction(p.base_quantity), Fraction(p.limit_price)
+        if (q <= 0 or price_value <= 0 or market.tick_size <= 0 or market.lot_size <= 0
+                or market.minimum_quantity < 0 or market.minimum_notional < 0
+                or q < market.minimum_quantity or q * price_value < market.minimum_notional
+                or (q / Fraction(market.lot_size)).denominator != 1
+                or (price_value / Fraction(market.tick_size)).denominator != 1
+                or not 0 < market.fee_bound <= 1
+                or not 0 <= market.max_price_precision <= 38
+                or len(price.partition('.')[2]) > market.max_price_precision):
+            raise reject('Invalid bounded quantity/price/increments/minimum/fee rules')
+        fee_u = q * price_value * Fraction(market.fee_bound) * 1_000_000
+        ceiling_fee_u = -(-fee_u.numerator // fee_u.denominator)
+        if p.max_fee_usd_u < ceiling_fee_u:
+            raise reject('Prepared fee buffer below verified bound')
+        if not re.fullmatch(r'[A-Za-z0-9_-]+', intent.client_order_id):
+            raise reject('Unsupported client ID format')
+        verifier = self.capability_verifier
+        if not isinstance(verifier, VenueCapabilityVerifier):
+            raise reject('Source capability verifier required')
+        evidence = verifier.verify(intent, market, now, client=self.client)
+        if (type(evidence) is not VerifiedVenueCapabilities or evidence.issuer is not verifier
+                or evidence.client is not self.client
+                or evidence.intent_hash != content_hash(intent) or evidence.market_hash != content_hash(market)
+                or type(evidence.verified_at_us) is not int or type(evidence.expires_at_us) is not int
+                or not 0 <= evidence.verified_at_us <= now < evidence.expires_at_us
+                or type(evidence.capabilities) is not frozenset
+                or not MANAGED_CAPABILITIES <= evidence.capabilities
+                or type(evidence.source_record_hashes) is not tuple or not evidence.source_record_hashes
+                or any(type(h) is not str or not re.fullmatch(r'[0-9a-f]{64}', h)
+                    for h in evidence.source_record_hashes)
+                or type(evidence.client_id_max_length) is not int
+                or not len(intent.client_order_id) <= evidence.client_id_max_length <= 128):
+            raise reject('Missing, unbound or expired venue capability evidence')
+        # Verification may consume time; expiry is checked again immediately
+        # before the sole effectful operation. No fallback, catch, or retry here.
+        if (self.monotonic_ns() >= p.deadline_mono_ns
+                or self.clock_us() >= min(market.expires_at_us, evidence.expires_at_us)):
+            raise reject('Dispatch expired during capability verification')
+        return self.client.create_order(p.instrument, 'limit', p.side.value, quantity, price,
+            {'timeInForce': 'IOC', 'clientOrderId': intent.client_order_id})
