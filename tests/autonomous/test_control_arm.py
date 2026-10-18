@@ -239,5 +239,18 @@ class AwaitingMidnightTests(LedgerCase):
         self.assertFalse(status["ledger"]["ready"])
 
 
+class StaleEpochTests(ArmCase):
+    def test_stale_epoch_is_rejected_but_reports_the_current_epoch(self):
+        service = self.service(operator())
+        for kind, payload in (("status", {}), ("arm", {"reason": "x", "release_hash": RELEASE}),
+                              ("clear_latch", {"latch": "crisis", "reason": "x"})):
+            with self.subTest(kind):
+                receipt = self.send(service, operator(), kind, payload, "stale-" + kind, epoch=7)
+                self.assertEqual("rejected", receipt["status"])
+                self.assertEqual(["STALE_EPOCH"], receipt["reason_codes"])
+                self.assertEqual(1, receipt["data"]["current_epoch"])
+        self.assertEqual("none", self.control_row()["permit"])  # nothing was applied
+
+
 if __name__ == "__main__":
     unittest.main()

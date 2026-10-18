@@ -35,6 +35,13 @@ An explicit ``--explore-fraction`` permits tiny labeled exploration entries
 #      methods and still need the authenticated control path.
 #   6. Warmup (fewer than 20 contiguous candles) gates entries only; exits and the crisis latch still act.
 #      Warmup decisions are stored with phase='warmup' and never labeled or used for calibration.
+#  12. Formal pipeline (2026-10-18, bot/autonomous/runtime_formal.py): ledger mode ingests every fetched book (plus a
+#      pre-close read 1.5 s before each close) into the StateEngine archive; formal decisions come from
+#      snapshot/encode/persist_encoded_state; paper labels resolve from archived books only; the nightly hook attests
+#      calibrators from real labels (evidence only); `formal_entry` is the attested entry path. Production blocker:
+#      no provider tokenizer proof -> AUTHORITY_REFUSED:SNAPSHOT_TOKEN_PROOF_UNAVAILABLE.
+#  11. A cycle (or an outage) longer than the 30 s deadman lease lets it lapse to exit-only; renewal never revives
+#      an expired lease, so resuming entries needs an operator re-arm (control `arm`).
 #  10. Task 16 (2026-10-18): in ledger mode serve() renews the deadman lease every 10 s through an in-process
 #      `authority` role session, only while the cycle, books and ledger readiness are < 2 candles old and there are
 #      no unknown intents; otherwise it lapses to exit-only. Jev judgments on research candidates are persisted as
@@ -82,7 +89,9 @@ from .state import book_metrics, require_token_budget
 
 REFLEX_ID = "offline-reflex-v1"
 LEDGER_ACCOUNT_ID = "runtime-paper"
-RENEW_EVERY_S = 10  # authority-worker lease renewal cadence against the 30 s deadman lease
+PRECLOSE_LEAD_S = 1.5  # formal snapshots sample the book at or before each close: read it just before
+RENEW_EVERY_S = 10
+_UNUSABLE_BOOK = frozenset({"STALE_BOOK", "FUTURE_OBSERVATION", "AWAY_FROM_CLOSE", "INVALID_BOOK", "DUPLICATE_CANDLE"})  # authority-worker lease renewal cadence against the 30 s deadman lease
 MIDNIGHT_LEAD_S = 1.2  # pre-midnight book read lead; the ledger accepts depth observed <= 2 s before the boundary
 SNAPSHOT_VERSION = "paper-snapshot-v1"
 SCHEMA_VERSION = "runtime-v3"
@@ -421,7 +430,7 @@ class PaperRuntime:
 
     def __init__(self, config: RuntimeConfig, *, book_source: Callable[[str], dict] | None = None,
                  clock_us: Callable[[], int] | None = None, reflex: ReflexPort | None = None,
-                 rules_source: Callable[[str], dict] | None = None, authority=None):
+                 rules_source: Callable[[str], dict] | None = None, authority=None, formal=None):
         self.config = config
         if authority is not None and config.accounting != "ledger":
             raise ValueError("an authority adapter is only valid with ledger accounting")
@@ -441,6 +450,7 @@ class PaperRuntime:
                 self.db.close()
                 raise
         self.authority = authority
+        self.formal = formal or getattr(self, "_pending_formal", None)  # causal ingestion + formal decisions (ledger mode)
         self.book_source = book_source or _public_book_source(config.data_dir)
         self.rules_source = rules_source or _public_rules_source(config.data_dir)
         self._rules: dict[str, MarketRules] = {}
@@ -470,8 +480,14 @@ class PaperRuntime:
         self._owned_ledger = ledger
         ledger._clock_us = self.clock_us
         open_paper_account(ledger, LEDGER_ACCOUNT_ID, self.config.starting_cash_usd)
-        return RuntimeAuthority(ledger, account_id=LEDGER_ACCOUNT_ID, clock_us=self.clock_us, fee_rate=self.config.fee_rate,
-                                limit_slippage_bps=self.config.max_slippage_bps)
+        authority = RuntimeAuthority(ledger, account_id=LEDGER_ACCOUNT_ID, clock_us=self.clock_us, fee_rate=self.config.fee_rate,
+                                     limit_slippage_bps=self.config.max_slippage_bps)
+        from .runtime_formal import FormalPipeline, PaperBookOutcomeVerifier, configure_paper_verifier
+        # No ProviderTokenCounter exists in production: formal decisions report SNAPSHOT_TOKEN_PROOF_UNAVAILABLE.
+        self._pending_formal = FormalPipeline(authority, self.config.data_dir / "archive", token_counter=None,
+                                              fee_rate=self.config.fee_rate)
+        configure_paper_verifier(ledger, PaperBookOutcomeVerifier(ledger, fee_rate=self.config.fee_rate))
+        return authority
 
     def _bind_meta(self) -> None:
         """Accounting depends on starting cash, candle cadence and the accounting path; a restart may not change them."""
@@ -790,11 +806,26 @@ class PaperRuntime:
             except Exception as exc:  # public read failures hold, never trade
                 errors[instrument] = type(exc).__name__ if not isinstance(exc, Unavailable) else str(exc)
         cutoff = self.clock_us()
+        if self.formal is not None:
+            self.ingest_formal(observed)
         bids = {i: max(_levels(b.get("bids")) or [(0.0, 0.0)])[0] for i, (b, _, _) in observed.items()}
         with self._tx():
             account = self.mark({i: p for i, p in bids.items() if p > 0}, cutoff)
         account["bid"] = {i: Decimal(str(p)) for i, p in bids.items()}
         results = {i: {"status": "hold", "reasons": [e]} for i, e in errors.items()}
+        if self.authority is not None:
+            # Reconcile BEFORE deciding: a mark advances the account revision, so formal snapshots frozen after it
+            # stay current through this cycle's entries.
+            for instrument, (book, event_us, _) in observed.items():
+                try:
+                    self.authority.observe(instrument, _levels(book.get("bids")), _levels(book.get("asks")), event_us,
+                                           self.market_rules(instrument, cutoff))
+                except Exception:
+                    continue
+            try:
+                self.authority.mark()
+            except Exception:
+                pass
         self._judge_cycle(observed, cutoff, account)
         for instrument, (book, event_us, received_us) in observed.items():
             try:
@@ -811,15 +842,21 @@ class PaperRuntime:
                 ledger.latch_account_crisis(account_id, "reflex-crisis-" + str(cutoff), self._crisis_pending[0][:200])
             try:
                 self.authority.mark()  # paper reconciliation each cycle keeps the ledger account's proofs current
+                marked = True
             except Exception:
-                pass  # an unready ledger refuses orders by itself; the cycle still records state
+                marked = False  # an unready ledger refuses orders by itself; the cycle still records state
             # An operator-scheduled activation commits only at its boundary, on a freshly reconciled account, under
             # the authority's account lock; nothing here activates on its own.
             with self.authority.authority._lock(account_id):
                 ledger.apply_due_activation(account_id)
-            # Health evidence for the lease renewer: this cycle completed, its books were fresh, the ledger was ready.
-            self._last_cycle_ok_us = cutoff
-            if not errors and observed:
+            if self.formal is not None:
+                self.formal.resolve_matured_labels(cutoff)  # paper labels from archived public books only
+            # Health evidence for the lease renewer: only real per-instrument success counts.
+            reasons = [r for result in results.values() for r in result.get("reasons", ())]
+            if marked and not any(r.startswith("DECISION_ERROR") for r in reasons):
+                self._last_cycle_ok_us = cutoff
+            if (not errors and set(observed) == set(self.config.instruments)
+                    and not any(r in _UNUSABLE_BOOK for r in reasons)):
                 self._last_books_ok_us = cutoff
             if self.authority.view()["ready"]:
                 self._ledger_ready_us = cutoff
@@ -924,9 +961,16 @@ class PaperRuntime:
         reasons, action = reflex_notes + list(escalate) + (["WARMUP"] if warm else []), "hold"
         formal_record = (None, ("FORMAL_JUDGMENT_UNAVAILABLE",))
         if self.authority is not None and judgment is not None and not warm:
-            try:  # formal provenance for every live judgment (audit only; it never authorizes by itself)
-                formal_record = self.authority.record_decision(instrument, snap, judgment, gate_open=gate,
-                                                               reflex_call=getattr(self.reflex, "last_call", None))
+            call = getattr(self.reflex, "last_call", None) or {}
+            try:
+                if self.formal is not None:
+                    # Formal decisions come from the causal StateEngine snapshot of the activated release.
+                    formal_record = self.formal.decide(instrument, judgment, close_us=snap.candle_close_us, now_us=self.clock_us(),
+                                                       mono_ns=self.authority.monotonic_ns(), gate_open=gate,
+                                                       boot_id=self.authority.boot_id,
+                                                       raw_response_hash=call.get("response_hash"))
+                else:  # provenance-only bridge (invalid snapshot) when no causal pipeline is attached
+                    formal_record = self.authority.record_decision(instrument, snap, judgment, gate_open=gate, reflex_call=call)
             except Exception as exc:
                 formal_record = (None, ("FORMAL_RECORD_FAILED:" + type(exc).__name__,))
         # The REFLEX call takes wall-clock time: re-check the book age with the real clock before any fill.
@@ -997,8 +1041,19 @@ class PaperRuntime:
                 elif self.authority is not None:
                     # The formal path needs a valid decision snapshot and an attested calibration; until both exist
                     # the precise missing prerequisites are reported and nothing is submitted.
-                    decision_ref, bridge_reasons = formal_record
-                    reasons += ["AUTHORITY_REFUSED:" + r for r in self.authority.entry_refusals(decision_ref, bridge_reasons)]
+                    if self.formal is not None and not isinstance(formal_record, tuple):
+                        if formal_record.reasons:
+                            reasons += ["AUTHORITY_REFUSED:" + r for r in formal_record.reasons]
+                        else:
+                            outcome = self.authority.formal_entry(instrument, formal_record)
+                            if outcome.ok:
+                                fill, action = (outcome.qty, outcome.avg_price, outcome.notional, outcome.fee), "buy"
+                                reasons.append("LEDGER")
+                            else:
+                                reasons += ["AUTHORITY_REFUSED:" + r for r in outcome.reasons]
+                    else:
+                        decision_ref, bridge_reasons = formal_record
+                        reasons += ["AUTHORITY_REFUSED:" + r for r in self.authority.entry_refusals(decision_ref, bridge_reasons)]
                 else:
                     limit = rules.round_limit(Decimal(str(best_ask)) * (1 + self.config.max_slippage_bps / Decimal(10_000)), "buy")
                     fill = paper_fill(asks, "buy", notional * (1 + self.config.fee_rate), None, limit, self.config.fee_rate, rules)
@@ -1118,6 +1173,19 @@ class PaperRuntime:
             now_s = self.clock_us() / 1e6
             wait = max(0.0, step - now_s % step + offset_s) if attempts else 0.0
             to_boundary = (now_s // 86_400 + 1) * 86_400 - MIDNIGHT_LEAD_S - now_s
+            to_preclose = (now_s // step + 1) * step - PRECLOSE_LEAD_S - now_s
+            if (self.formal is not None and attempts and 0 <= to_preclose < wait and not 0 <= to_boundary < wait
+                    and getattr(self, "_preclose_done", None) != (now_s // step + 1)):
+                wait_for(to_preclose)
+                self._preclose_done = now_s // step + 1
+                observed = {}
+                for instrument in self.config.instruments:
+                    try:
+                        observed[instrument] = self.observe(instrument)
+                    except Exception:
+                        continue  # a missed pre-close read leaves that close without a formal snapshot
+                self.ingest_formal(observed)
+                continue
             if self.authority is not None and attempts and 0 <= to_boundary < wait:
                 wait_for(to_boundary)
                 try:
@@ -1139,6 +1207,34 @@ class PaperRuntime:
                       file=sys.stderr, flush=True)
         return cycles
 
+    def nightly_attestation(self) -> list[dict]:
+        """Nightly hook: attest calibrators from real resolved labels where floors are met (evidence only)."""
+        approved = self.authority.ledger.active_approved(self.authority.account_id)
+        if approved is None:
+            return []
+        results = []
+        for candidate in approved.bundle.candidates:
+            for regime in Regime:
+                result = self.formal.attestation_job(instrument=candidate.instrument, regime=regime,
+                                                     model_id=self.reflex.reflex_id, now_us=self.clock_us(),
+                                                     out_dir=self.config.data_dir / "reviews")
+                results.append(dict(result, instrument=candidate.instrument, regime=regime.value))
+        self._attestation = results
+        return results
+
+    def ingest_formal(self, observed: dict) -> dict:
+        """Feed fetched public books into the formal StateEngine (immutable SourceEvents + archive)."""
+        out = {}
+        for instrument, (book, event_us, received_us) in observed.items():
+            try:
+                out[instrument] = self.formal.ingest_book(instrument, _levels(book.get("bids")), _levels(book.get("asks")),
+                                                          event_us=event_us, received_us=received_us,
+                                                          sequence=book.get("sequence"))
+            except Exception as exc:
+                out[instrument] = "INGEST_ERROR:" + type(exc).__name__
+        self._formal_ingest = out
+        return out
+
     def midnight_boundary(self, sleep: Callable[[float], None] = time.sleep) -> bool:
         """Read books just before UTC midnight, then record the ledger's exact-midnight boundary mark.
 
@@ -1156,6 +1252,11 @@ class PaperRuntime:
             except Exception:
                 continue  # a held asset without depth leaves the account unready; orders are refused, never forced
         sleep(max(0.0, (midnight - self.clock_us()) / 1e6))
+        if self.formal is not None:
+            try:
+                self.nightly_attestation()
+            except Exception as exc:
+                print(json.dumps({"attestation_error": type(exc).__name__}), file=sys.stderr, flush=True)
         for _ in range(3):  # retry inside the ledger's 2 s acceptance window only
             try:
                 if self.authority.boundary_mark(midnight):
@@ -1235,10 +1336,13 @@ class PaperRuntime:
     def renewal_blocker(self) -> str | None:
         """Why the lease must not be renewed now, or None. Any doubt lets the lease lapse to exit-only."""
         ledger, account_id = self.authority.ledger, self.authority.account_id
-        row = ledger.connection.execute("SELECT permit, hard_killed FROM account_control WHERE account_id=?",
-                                        (account_id,)).fetchone()
-        if row["permit"] == "none" or row["hard_killed"]:
+        row = ledger.connection.execute("SELECT * FROM account_control WHERE account_id=?", (account_id,)).fetchone()
+        if row["permit"] == "none":
             return "NOT_ARMED"
+        if row["hard_killed"] or (self.config.data_dir / "KILL").exists():
+            return "KILL_SWITCH"
+        if row["drawdown_latched"] or row["daily_halted"] or row["crisis_halted"]:
+            return "LATCHED"
         now, window = self.clock_us(), 2 * self.config.candle_seconds * 1_000_000
         if now - self._last_cycle_ok_us > window:
             return "CYCLE_STALE"

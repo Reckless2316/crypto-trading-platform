@@ -594,11 +594,12 @@ class StateEngine:
         return ExecutableBook(venue,instrument,row['event_at_us'],book,
             content_hash(('executable-book-v1',event_id,sequence)))
 
-    def snapshot(self, symbol: str, cutoffs: CausalCutoffs) -> NumericSnapshot:
+    def snapshot(self, symbol: str, cutoffs: CausalCutoffs, *, eligibility: bool | None = None) -> NumericSnapshot:
         """Build candidate features only from events visible at the frozen cutoffs.
 
         Historical inventory and book mids are reconstructed at the frozen cutoffs.
-        Current AccountView is reserved for execution-time controls.
+        Current AccountView is reserved for execution-time controls. ``eligibility`` is the
+        candidate's admission in the operator-activated, validated release (None: unmeasured).
         """
         self._require_owner()
         if type(symbol) is not str or not symbol.endswith('-USD') or type(cutoffs) is not CausalCutoffs:
@@ -692,7 +693,8 @@ class StateEngine:
             'return_1h':(one_hour_return,one_hour_return is not None),
             'base_inventory':(base_inventory if inventory_valid else 0.0,inventory_valid),
             'inventory_usd':(base_inventory*metrics[0] if metrics and inventory_valid else 0.0,inventory_valid and metrics is not None and math.isfinite(base_inventory*metrics[0])),
-            'eligible':(0.0,False), 'evidence_age_minutes':(0.0,False),
+            'eligible':((1.0 if eligibility else 0.0),True) if type(eligibility) is bool else (0.0,False),
+            'evidence_age_minutes':(0.0,False),
             'evidence_expiry_minutes':(0.0,False), 'thesis_condition_bits':(0.0,False),
             'position_headroom':(0.0,False),
             # Buy the ask and sell the bid pays the quoted spread once. Unobserved fees stay out.

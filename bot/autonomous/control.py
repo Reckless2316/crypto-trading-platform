@@ -362,7 +362,9 @@ class LedgerControlBackend:
             if request.account_id != self.account_id or request.mode != self.mode:
                 raise ControlRejected('ACCOUNT_MODE_MISMATCH')
             if request.expected_epoch != row['permit_epoch']:
-                raise ControlRejected('STALE_EPOCH')
+                # Still rejected; the current epoch is returned so an authenticated client can resync directly.
+                return response(request, 'rejected', row['permit_epoch'], reason_codes=('STALE_EPOCH',),
+                    data={'current_epoch': row['permit_epoch']})
             if not command_allowed(role, request.kind, bool(row['hard_killed'])):
                 raise ControlRejected('COMMAND_FORBIDDEN')
             if request.kind == 'status':

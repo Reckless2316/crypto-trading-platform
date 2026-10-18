@@ -895,14 +895,30 @@ class Ledger:
             if not proposal.reducing_only:
                 raise ContractViolation('missing decision authority')
             return
-        row = self.connection.execute('SELECT d.*,s.account_id,s.release_hash,s.snapshot_id,s.lineage_hash,s.valid,s.candle_close_us FROM decisions d JOIN snapshots s USING(snapshot_id) WHERE d.decision_id=?',(decision.decision_id,)).fetchone()
-        if row is None or row['account_id']!=proposal.account_id or row['request_id']!=decision.request_id or row['release_hash']!=decision.release_hash or row['snapshot_id']!=decision.snapshot_hash or row['candle_close_us']!=proposal.candle_close_us or not row['valid'] or row['status']!='completed':
+        row = self.connection.execute('SELECT d.*,s.account_id,s.release_hash,s.snapshot_id,s.lineage_hash,s.valid,s.candle_close_us,s.state_json,s.invalid_reason FROM decisions d JOIN snapshots s USING(snapshot_id) WHERE d.decision_id=?',(decision.decision_id,)).fetchone()
+        if row is None or row['account_id']!=proposal.account_id or row['request_id']!=decision.request_id or row['release_hash']!=decision.release_hash or not self._snapshot_reference_matches(row,decision.snapshot_hash) or row['candle_close_us']!=proposal.candle_close_us or not row['valid'] or row['status']!='completed':
             raise ContractViolation('unproven decision reference')
         if self._source_lineage_invalid(row['snapshot_id']):
             raise StateUnavailable('decision source lineage invalidated')
         candidate = self.connection.execute('SELECT status FROM candidate_results WHERE decision_id=? AND candidate_id=?',(decision.decision_id,candidate_wire_id(proposal.candidate_id))).fetchone()
         if not proposal.reducing_only and (candidate is None or candidate[0]!='eligible'):
             raise ContractViolation('decision candidate not eligible')
+
+    def _snapshot_reference_matches(self, row, snapshot_hash: str) -> bool:
+        """A decision reference names its snapshot by row id, or by the content hash that StateEngine's
+        persist_encoded_state bound into that row id (snapshot hash, state, account, release, ranking, reason)."""
+        if row['snapshot_id'] == snapshot_hash:
+            return True
+        release = self.connection.execute('SELECT manifest_json FROM release_bundles WHERE release_hash=?',
+                                          (row['release_hash'],)).fetchone()
+        try:
+            manifest = strict_json(release['manifest_json']) if release else {}
+            state_hash = content_hash(strict_json(row['state_json']))
+        except (ContractViolation, TypeError, ValueError):
+            return False
+        policy = manifest.get('policy_hash') if type(manifest) is dict else None
+        return row['snapshot_id'] == content_hash((snapshot_hash, state_hash, row['account_id'], row['release_hash'],
+                                                   row['release_hash'], policy, row['invalid_reason']))
 
     def _latch_current_losses(self, account_id: str) -> None:
         """Persist drawdown/daily latches from current exact NAV in their own commit.
@@ -1324,6 +1340,11 @@ class Ledger:
         persisted = self.connection.execute('SELECT * FROM snapshots WHERE snapshot_id=?', (snapshot.snapshot_id,)).fetchone()
         if anchor is None or persisted is None:
             return None
+        # The decision's own snapshot must be valid, and the caller's snapshot must be that row or a sibling row
+        # committed by the same persist_encoded_state (same commit time and token proof); a later clone never is.
+        siblings = all(anchor[k] == persisted[k] for k in ('recorded_at_us', 'tokenizer_hash', 'token_count', 'field_hash'))
+        if not anchor['valid'] or (anchor['snapshot_id'] != snapshot.snapshot_id and not siblings):
+            return None
         if (persisted['state_json'] != anchor['state_json'] or not persisted['valid']
                 or persisted['release_hash'] != batch.bundle_hash or persisted['account_id'] != snapshot.account_id
                 or persisted['candle_close_us'] != snapshot.cutoffs.candle_close_us
@@ -1707,6 +1728,34 @@ class Ledger:
             self._release_killed_reservations(account_id)
             return True
 
+    def record_formal_decision(self, *, snapshot_id: str, batch, candidate_wire: int, eligible: bool) -> str:
+        """Persist a completed DecisionBatch over a snapshot committed by StateEngine.persist_encoded_state.
+
+        The snapshot must already exist, carry the batch's release and state hash, and include the candidate row."""
+        from .contracts import DecisionBatch
+        if type(batch) is not DecisionBatch or len(batch.decisions) != 1 or type(eligible) is not bool:
+            raise ContractViolation('typed single-candidate DecisionBatch required')
+        row = self.connection.execute('SELECT * FROM snapshots WHERE snapshot_id=?', (snapshot_id,)).fetchone()
+        if (row is None or row['release_hash'] != batch.bundle_hash
+                or content_hash(strict_json(row['state_json'])) != batch.state_hash):
+            raise ContractViolation('formal decision is not bound to its persisted causal snapshot')
+        decision_id = 'formal-decision-' + content_hash((snapshot_id, batch.request_id))
+        response_json = batch.to_json()
+        with self.transaction() as c:
+            existing = c.execute('SELECT response_json FROM decisions WHERE decision_id=?', (decision_id,)).fetchone()
+            if existing is not None:
+                if existing[0] != response_json:
+                    raise ContractViolation('formal decision identity/content conflict')
+                return decision_id
+            now = self._clock_us()
+            c.execute('INSERT INTO decisions VALUES (?,?,?,?,?,?,?,?,?,?,?)',
+                      (decision_id, snapshot_id, batch.request_id, batch.received_at_us, batch.model_id, response_json,
+                       content_hash(strict_json(response_json)), 'completed', 'runtime-formal', batch.received_at_us, now))
+            c.execute('INSERT INTO candidate_results VALUES (?,?,?,?,?,?)',
+                      (decision_id, candidate_wire, 'eligible' if eligible else 'hold', None,
+                       '[]' if eligible else '["ENTRY_GATE_REFUSED"]', now))
+        return decision_id
+
     # ---------- runtime decision bridge (formal provenance, never asserted validity) ----------
     RUNTIME_SNAPSHOT_INVALID = 'TOKENIZER_PROOF_UNAVAILABLE;CAUSAL_SOURCE_LINEAGE_UNAVAILABLE'
 
@@ -1728,8 +1777,7 @@ class Ledger:
         with self.transaction() as c:
             existing = c.execute('SELECT response_json FROM decisions WHERE decision_id=?', (decision_id,)).fetchone()
             if existing is not None:
-                if existing[0] != response_json:
-                    raise ContractViolation('runtime decision identity/content conflict')
+                # A rerun after a runtime rollback keeps the first immutable record (deterministic content matches).
                 return decision_id
             now = self._clock_us()
             revision = canonical_bytes(self._revision(account_id)).decode()

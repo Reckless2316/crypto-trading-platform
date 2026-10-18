@@ -98,6 +98,7 @@ class RuntimeAuthority:
         # ``slippage_bps`` is the PaperVenue's adverse execution model; ``limit_slippage_bps`` bounds the IOC limit.
         self.fee_rate, self.slippage_bps, self.limit_bps, self.boot_id = fee_rate, slippage_bps, limit_slippage_bps, boot_id
         self._books: dict[str, ExecutableBook] = {}
+        self._formal_evidence: dict[str, tuple] = {}
         self._rules: dict[str, MarketRules] = {}
         if configure_risk:
             # Default limits are unarmed: the formal path refuses every entry until promotion configuration exists.
@@ -246,31 +247,26 @@ class RuntimeAuthority:
         if release is None:
             return None, ("NO_ACTIVE_RELEASE",)
         dictionary = default_field_dictionary()
-        view = self.view()
-        held = view["positions"].get(instrument, Decimal(0))
-        equity = Decimal(view["equity_usd_u"]) / _MICRO if view["equity_usd_u"] else Decimal(0)
-        bid = self._books[instrument].book.bids[0][0] if instrument in self._books else None
-        value = held * bid if bid is not None else None
-        measured = {  # every value is the runtime's own measurement; anything not measured stays invalid
-            "mid": snap.mid, "spread_bps": snap.spread_bps, "imbalance": snap.imbalance,
-            "rv_60m": snap.realized_vol_bps / 10_000 if snap.history >= 60 else None, "rv_samples": float(snap.history),
-            "return_1h": (math.exp(snap.momentum_bps / 10_000) - 1) if snap.history >= 60 else None,
-            "base_inventory": float(held), "inventory_usd": float(value) if value is not None else None,
-            "estimated_roundtrip_cost_bps": float(2 * self.fee_rate * 10_000) + snap.spread_bps}
+        held = self.view()["positions"].get(instrument, Decimal(0))
+        # Only fields whose definitions match StateEngine.snapshot exactly are valid; everything else stays invalid.
+        measured = {"mid": snap.mid, "spread_bps": snap.spread_bps, "imbalance": snap.imbalance,
+                    "base_inventory": float(held), "inventory_usd": float(held) * snap.mid,
+                    "estimated_roundtrip_cost_bps": snap.spread_bps}
         candidate_features = tuple(Feature(f.name, float(measured.get(f.name) or 0.0), measured.get(f.name) is not None)
                                    for f in dictionary.candidate_fields)
-        shared_measured = {"candle_close_ms": float(snap.candle_close_us // 1000), "drawdown": snap.drawdown,
-                           "daily_loss": snap.daily_loss,
-                           "cash_headroom": float(view["cash"] / equity) if equity > 0 else None}
-        shared_features = tuple(Feature(f.name, float(shared_measured.get(f.name) or 0.0), shared_measured.get(f.name) is not None)
-                                for f in dictionary.shared_fields)
+        shared_features = tuple(Feature(f.name, float(snap.candle_close_us // 1000) if f.name == "candle_close_ms" else 0.0,
+                                        f.name == "candle_close_ms") for f in dictionary.shared_fields)
         state = [_wire_values(shared_features, dictionary.shared_fields), [_wire_values(candidate_features, dictionary.candidate_fields, candidate)]]
         state_json = canonical_bytes(state).decode()
         runtime_hash = content_hash(snap.wire())  # the runtime's own persisted snapshot identity
-        mono = self.monotonic_ns()
         call = reflex_call or {}
+        # Deterministic on rerun: provider call timings when the REFLEX reported them, otherwise zero, and the
+        # snapshot's own knowledge cutoff as the receipt time (never the wall clock at write time).
+        started = call.get("started_mono_ns") if type(call.get("started_mono_ns")) is int else 0
+        received = call.get("received_mono_ns") if type(call.get("received_mono_ns")) is int else started
+        deadline = max(call.get("deadline_mono_ns") if type(call.get("deadline_mono_ns")) is int else received, received)
         batch = DecisionBatch(f"runtime-{judgment.reflex_id}-{instrument}-{snap.candle_close_us}", content_hash(state),
-                              release, judgment.reflex_id, mono, mono, self.clock_us(), (formal,),
+                              release, judgment.reflex_id, deadline, received, snap.cutoff_us, (formal,),
                               call.get("response_hash"), schema_hash=getattr(judgment, "schema_hash", None))
         vetoes = ("SNAPSHOT_TOKEN_PROOF_UNAVAILABLE",) + (() if gate_open else ("ENTRY_GATE_REFUSED",))
         decision_id = self.ledger.record_runtime_decision(
@@ -298,10 +294,61 @@ class RuntimeAuthority:
                                                 (self.account_id,)).fetchone()[0]
         if calibrator is None or self.ledger.attested_calibration(calibrator, active) is None:
             out.insert(0, "CALIBRATION_NOT_ATTESTED")
-        # HANDOFF(claude-opus-5.5 2026-10-18): with a valid snapshot AND an attested calibration, wire
-        # estimate_edge -> size_entry -> sizing_entry_verifier and submit through `entry`. Unreachable today: no
-        # provider tokenizer proof (snapshots stay invalid) and no production OutcomeEvidenceVerifier (no labels).
+        # Provenance-only bridge (no causal pipeline attached). With runtime_formal.FormalPipeline attached, entries
+        # go through `formal_entry` (estimate_edge -> evaluate_candidate/size_entry -> risk.assess -> submit).
         return tuple(out) or ("ATTESTED_ENTRY_PATH_PENDING",)
+
+    # ---------- attested formal entry path ----------
+    def formal_entry(self, instrument: str, formal) -> AuthorityOutcome:
+        """estimate_edge -> size_entry (via evaluate_candidate + EntryContext) -> risk.assess -> OrderAuthority.submit.
+
+        ``formal`` is a runtime_formal.FormalDecision persisted over a causal snapshot. The authority's entry verifier
+        re-derives the same sizing from this evidence before dispatch (sizing_entry_verifier)."""
+        from .calibration import estimate_edge
+        from .contracts import ControlState, EdgeEstimate, Mode, Permit
+        from .execution import sizing_entry_verifier
+        from .policy import EntryContext, evaluate_candidate
+        if formal is None or formal.reasons or formal.decision_id is None:
+            return _refused(*(getattr(formal, "reasons", None) or ("FORMAL_DECISION_UNAVAILABLE",)))
+        self.ledger.enforce_lease(self.account_id)
+        if blocked := self.diagnose(instrument, reducing=False):
+            return _refused(*blocked)
+        approved = self.ledger.active_approved(self.account_id)
+        if approved is None or approved.bundle_hash != formal.batch.bundle_hash:
+            return _refused("RELEASE_CHANGED")
+        artifact = self.ledger.attested_calibration(approved.bundle.calibrator_hash, approved.bundle_hash)
+        if artifact is None:
+            return _refused("CALIBRATION_NOT_ATTESTED")
+        now = self.clock_us()
+        edge = estimate_edge(formal.batch, formal.decision, formal.snapshot, artifact, ledger=self.ledger, now_us=now)
+        if type(edge) is not EdgeEstimate:
+            return _refused("EDGE_UNAVAILABLE:" + edge.reason_code)
+        # No mark here: a mark advances the account revision and would make the decision's frozen snapshot stale.
+        # The runtime reconciles before deciding; an account that is not ready now refuses.
+        account = self.ledger.account_view(self.account_id)
+        if not account.ready:
+            return _refused("ACCOUNT_UNREADY")
+        row = self.ledger.connection.execute("SELECT * FROM account_control WHERE account_id=?", (self.account_id,)).fetchone()
+        mono = self.monotonic_ns()
+        deadline = min(mono + _DEADLINE_NS, row["lease_deadline_mono_ns"])
+        limits = self.ledger._risk_config[0]
+        book, rules = self._books[instrument], self._rules[instrument]
+        context = EntryContext(formal.batch, artifact, rules, book, limits, self.ledger, now, row["permit_epoch"], deadline)
+        policy = evaluate_candidate(formal.decision, formal.snapshot, approved, edge, account, context=context)
+        if not policy.propose:
+            return _refused(*("POLICY:" + code for code in policy.reason_codes))
+        control = ControlState(Mode(account.mode.value), Permit(row["permit"]), hard_killed=bool(row["hard_killed"]),
+                               drawdown_latched=bool(row["drawdown_latched"]), daily_halted=bool(row["daily_halted"]),
+                               crisis_halted=bool(row["crisis_halted"]), control_epoch=row["permit_epoch"],
+                               boot_id=row["lease_boot_id"], deadman_deadline_mono_ns=row["lease_deadline_mono_ns"],
+                               active_release_hash=row["active_release_hash"], reconciliation_ready=account.ready,
+                               armed=row["permit"] != "none")
+        verdict = risk.assess(policy.proposal, account, control, limits, rules, now, now_mono_ns=mono, current_boot_id=self.boot_id)
+        if not verdict.allowed:
+            return _refused(*("RISK:" + code for code in verdict.reason_codes))
+        self._formal_evidence[formal.decision_id] = (formal.batch, formal.decision, formal.snapshot, artifact, edge)
+        self.authority.entry_verifier = sizing_entry_verifier(self.ledger, self._formal_evidence.get, limits)
+        return self._submit(policy.proposal, policy.proposal.decision)
 
     # ---------- admission ----------
     def diagnose(self, instrument: str, *, reducing: bool) -> tuple[str, ...]:

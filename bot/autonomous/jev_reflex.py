@@ -204,7 +204,8 @@ class JevReflex:
         instruments = tuple(sorted(snapshots))
         started = self.monotonic_ns()
         record = {"reflex_id": self.reflex_id, "questions": 5 * len(instruments), "outcome": None, "latency_ms": None,
-                  "request_hash": None, "response_hash": None, "provider_request_id": None, "status": None}
+                  "request_hash": None, "response_hash": None, "provider_request_id": None, "status": None,
+                  "started_mono_ns": started, "deadline_mono_ns": started + self.budget_ns, "received_mono_ns": None}
         self.last_call = record
 
         def fail(reason):
@@ -252,7 +253,8 @@ class JevReflex:
         if self.monotonic_ns() - started > self.budget_ns:
             return fail("latency_budget")
         record["outcome"] = "ok"
-        record["latency_ms"] = (self.monotonic_ns() - started) / 1e6
+        record["received_mono_ns"] = self.monotonic_ns()
+        record["latency_ms"] = (record["received_mono_ns"] - started) / 1e6
         return judgments
 
     def _parse(self, raw: bytes, instruments: tuple[str, ...], judgment_type) -> dict:

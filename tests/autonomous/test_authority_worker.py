@@ -182,5 +182,61 @@ class DecisionBridgeTests(WorkerCase):
                                                 ProviderLike().judge(snap), gate_open=True))
 
 
+class ReviewFixTests(WorkerCase):
+    def test_stale_books_let_the_lease_lapse(self):
+        self.arm()
+        self.books.lag_us = 600_000_000  # every fetched book is ten minutes old
+        rt = self.runtime()
+        self.serve_for(rt, 240)
+        self.assertLessEqual(self.control()["lease_deadline_mono_ns"], self.mono.ns)
+        self.assertIn(rt.lease_status()["blocker"], ("BOOKS_STALE", "CYCLE_STALE"))
+
+    def test_latches_and_kill_file_block_renewal(self):
+        self.arm()
+        rt = self.runtime()
+        self.serve_for(rt, 70)
+        with self.ledger.transaction() as c:
+            c.execute("UPDATE account_control SET crisis_halted=1")
+        self.assertEqual("LATCHED", rt.renewal_blocker())
+        with self.ledger.transaction() as c:
+            c.execute("UPDATE account_control SET crisis_halted=0")
+        (self.dir / "rt" / "KILL").write_text("operator")
+        self.assertEqual("KILL_SWITCH", rt.renewal_blocker())
+
+    def bridge_snapshot(self, rt):
+        self.observe(self.a)
+        return rt.snapshot("AAVE-USD", {"bids": [[99.99, 1]], "asks": [[100.01, 1]]}, self.clock.us - 500_000,
+                           self.clock.us - 100_000, self.clock.us, rt.mark({}, self.clock.us))
+
+    def test_bridge_is_idempotent_uses_engine_definitions_and_never_verifies(self):
+        from bot.autonomous.contracts import NumericSnapshot, CausalCutoffs, AccountRevision, Feature, default_field_dictionary
+        rt = self.runtime(ProviderLike())
+        snap = self.bridge_snapshot(rt)
+        call = {"started_mono_ns": 5, "received_mono_ns": 9, "deadline_mono_ns": 20, "response_hash": "a" * 64}
+        first = self.a.record_decision("AAVE-USD", snap, ProviderLike().judge(snap), gate_open=True, reflex_call=call)
+        self.clock.us += 1_000
+        again = self.a.record_decision("AAVE-USD", snap, ProviderLike().judge(snap), gate_open=True, reflex_call=call)
+        self.assertEqual(first, again)
+        row = self.ledger.connection.execute("SELECT d.response_json, s.* FROM decisions d JOIN snapshots s USING(snapshot_id) "
+                                             "WHERE d.decision_id=?", (first[0],)).fetchone()
+        batch = DecisionBatch.from_json(row["response_json"])
+        self.assertEqual((20, 9, snap.cutoff_us), (batch.deadline_mono_ns, batch.received_mono_ns, batch.received_at_us))
+        names = [f.name for f in default_field_dictionary().candidate_fields]
+        wire = json.loads(row["state_json"])[1][0]
+        mask = wire[-1]
+        valid = {names[i] for i in range(len(names)) if mask >> i & 1}
+        self.assertTrue({"rv_60m", "rv_samples", "return_1h"}.isdisjoint(valid))
+        # A cloned VALID row with the same state and lineage never verifies a bridge decision.
+        clone = dict(row)
+        self.ledger.connection.execute("INSERT INTO snapshots VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            ("clone", clone["account_id"], clone["release_hash"], clone["candle_close_us"], clone["knowledge_cutoff_us"],
+             clone["field_hash"], clone["state_json"], "c" * 64, 10, clone["lineage_hash"], clone["account_revision"], 1,
+             None, clone["recorded_at_us"] + 1))
+        fake = NumericSnapshot("aave", "AAVE-USD", "e" * 64, CausalCutoffs(clone["candle_close_us"], clone["knowledge_cutoff_us"], 0, "b"),
+                               tuple(Feature(n, 0.0, False) for n in names), 0, clone["lineage_hash"], AccountRevision(),
+                               snapshot_id="clone", account_id=clone["account_id"], release_hash=clone["release_hash"])
+        self.assertIsNone(self.ledger.verified_decision_snapshot(batch, fake))
+
+
 if __name__ == "__main__":
     unittest.main()
