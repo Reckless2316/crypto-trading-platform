@@ -30,7 +30,7 @@ class Fixture(unittest.TestCase):
 
     def config(self, **kw):
         args = dict(runtime_dir=self.runtime, session_file=None, session_dir=None, state_dir=self.root / "state",
-                    host="127.0.0.1", port=8765, epoch=0)
+                    host="127.0.0.1", port=8765)
         args.update(kw)
         return launch.LaunchConfig(**args)
 
@@ -101,16 +101,23 @@ class RefusalTests(Fixture):
 
 
 class FakeStatusClient:
-    def __init__(self, epoch=3, status="completed", reason=()):
+    """Authority stand-in at a fixed epoch: a stale expectation is rejected with data.current_epoch."""
+    def __init__(self, epoch=3, status="completed", reason=(), reveal_epoch=True):
         self.epoch, self.status, self.reason, self.calls = epoch, status, list(reason), []
+        self.reveal_epoch = reveal_epoch
 
     def request(self, raw):
         value = json.loads(raw)
         self.calls.append(value)
-        return {"version": 1, "request_id": value["request_id"], "status": self.status,
-                "control_epoch": self.epoch if self.status == "completed" else value["expected_epoch"],
-                "reason_codes": self.reason, "local_inhibited": False, "cancellations_pending": [],
-                "data": {"hard_killed": False} if self.status == "completed" else {}}
+        base = {"version": 1, "request_id": value["request_id"], "local_inhibited": False, "cancellations_pending": []}
+        if self.status != "completed":
+            return {**base, "status": self.status, "control_epoch": value["expected_epoch"],
+                    "reason_codes": self.reason, "data": {}}
+        if value["expected_epoch"] != self.epoch:
+            return {**base, "status": "rejected", "control_epoch": self.epoch, "reason_codes": ["STALE_EPOCH"],
+                    "data": {"current_epoch": self.epoch} if self.reveal_epoch else {}}
+        return {**base, "status": "completed", "control_epoch": self.epoch, "reason_codes": [],
+                "data": {"hard_killed": False}}
 
 
 class BuildTests(Fixture):
@@ -128,13 +135,28 @@ class BuildTests(Fixture):
         self.assertEqual(0, result.gateway.control_epoch)
         self.assertNotIn(result.bootstrap_token, (self.root / "state" / "nonces.json").read_text())
 
-    def test_stale_epoch_is_reported_not_guessed(self):
+    def test_stale_status_resyncs_once_from_the_authority_epoch(self):
         path = self.issue()
-        client = FakeStatusClient(status="rejected", reason=["STALE_EPOCH"])
-        result = launch.build(self.config(session_file=path, epoch=0), client=client)
+        client = FakeStatusClient(epoch=3)
+        result = launch.build(self.config(session_file=path), client=client)
+        self.assertEqual(3, result.epoch)
+        self.assertEqual([0, 3], [c["expected_epoch"] for c in client.calls])  # one retry, a fresh nonce
+        self.assertNotEqual(client.calls[0]["nonce"], client.calls[1]["nonce"])
+        self.assertNotEqual(client.calls[0]["request_id"], client.calls[1]["request_id"])
+        self.assertEqual([], result.notes)
+
+    def test_without_a_revealed_epoch_nothing_is_guessed(self):
+        path = self.issue()
+        client = FakeStatusClient(epoch=3, reveal_epoch=False)
+        result = launch.build(self.config(session_file=path), client=client)
         self.assertIsNone(result.epoch)
         self.assertIn("EPOCH_UNKNOWN:STALE_EPOCH", result.notes)
-        self.assertEqual(1, len(client.calls))  # one probe; epochs are never brute-forced
+        self.assertEqual(1, len(client.calls))  # epochs are never brute-forced
+
+    def test_launcher_has_no_epoch_guess_option(self):
+        with self.assertRaises(SystemExit):
+            with contextlib.redirect_stderr(io.StringIO()):
+                launch.main(["--runtime-dir", str(self.runtime), "--session-file", "x", "--epoch", "0"])
 
     def test_unavailable_authority_still_starts_read_only_with_a_note(self):
         path = self.issue()
@@ -189,6 +211,88 @@ class FrontendBootstrapTests(unittest.TestCase):
 
 
 class RealControlServerTests(Fixture):
+    def serve(self, *, epoch, requests):
+        """A real ledger-backed UnixControlServer at a given permit epoch serving exactly `requests` requests."""
+        from bot.autonomous.control import (ControlService, FileControlJournal, LedgerControlBackend,
+                                            UnixControlServer, load_issued_sessions)
+        from bot.autonomous.execution import OrderAuthority
+        from tests.autonomous.test_ledger import LedgerTests
+        socket_path = self.runtime / "control" / "control.sock"
+        ready, errors, state = threading.Event(), [], {}
+
+        def run():
+            fixture = LedgerTests()
+            try:
+                fixture.setUp()
+                fixture.ledger.connection.execute("UPDATE account_control SET permit_epoch=? WHERE account_id='paper-test'",
+                                                  (epoch,))
+                authority = OrderAuthority(fixture.ledger, None, book_source=lambda _: None,
+                                           market_source=lambda _: None, entry_verifier=lambda *a: False,
+                                           clock_us=lambda: 1)
+                backend = LedgerControlBackend(fixture.ledger, authority, account_id="paper-test", mode="paper")
+                service = ControlService(backend=backend, journal=FileControlJournal(self.root / "journal"),
+                                         sessions=load_issued_sessions(self.sessions, boot_id="boot"),
+                                         boot_id="boot", monotonic_ns=__import__("time").monotonic_ns)
+                with UnixControlServer(socket_path, service) as server:
+                    ready.set()
+                    for _ in range(requests):
+                        server.serve_once()
+                row = fixture.ledger.connection.execute(
+                    "SELECT permit, permit_epoch FROM account_control WHERE account_id='paper-test'").fetchone()
+                state.update(permit=row[0], epoch=row[1])
+            except BaseException as exc:
+                errors.append(exc)
+                ready.set()
+            finally:
+                fixture.tearDown()
+
+        thread = threading.Thread(target=run)
+        thread.start()
+        self.assertTrue(ready.wait(5))
+        self.assertFalse(errors, errors)
+        return thread, errors, state
+
+    def test_status_resyncs_from_epoch_3_with_the_client_at_0(self):
+        path = self.issue()
+        thread, errors, state = self.serve(epoch=3, requests=2)
+        try:
+            result = launch.build(self.config(session_file=path))
+        finally:
+            thread.join(5)
+        self.assertFalse(errors, errors)
+        self.assertEqual(3, result.epoch, result.notes)
+        self.assertEqual("completed", result.status["status"])
+        self.assertEqual(3, state["epoch"])
+
+    def test_arm_at_a_stale_epoch_returns_a_receipt_and_applies_nothing(self):
+        from fastapi.testclient import TestClient
+        from dashboard.backend import app as web
+        path = self.issue()
+        thread, errors, state = self.serve(epoch=3, requests=3)  # status, status retry, one arm
+        try:
+            result = launch.build(self.config(session_file=path))
+            previous = (getattr(web.app.state, "authority_gateway", None), getattr(web.app.state, "allowed_hosts", None))
+            self.addCleanup(lambda: (setattr(web.app.state, "authority_gateway", previous[0]),
+                                     setattr(web.app.state, "allowed_hosts", previous[1])))
+            launch.install(web.app, result)
+            client = TestClient(web.app, base_url="http://127.0.0.1:8765")
+            self.addCleanup(client.close)
+            session = client.post("/api/session/bootstrap", json={"token": result.bootstrap_token},
+                                  headers={"Origin": "http://127.0.0.1:8765"}).json()
+            reply = client.post("/api/control/arm", json={"release_hash": "e" * 64},
+                                headers={"Origin": "http://127.0.0.1:8765", "X-CSRF-Token": session["csrf_token"],
+                                         "X-Request-ID": "arm-stale-1", "X-Control-Epoch": "0"})
+        finally:
+            thread.join(5)
+        self.assertFalse(errors, errors)
+        self.assertEqual(409, reply.status_code, reply.text)
+        body = reply.json()
+        self.assertEqual("stale_epoch", body["receipt"])
+        self.assertEqual(3, body["current_epoch"])
+        self.assertEqual(["STALE_EPOCH"], body["reason_codes"])
+        self.assertEqual({"permit": "none", "epoch": 3}, state)  # nothing applied, no auto-retry
+
+
     def test_launcher_reads_status_from_a_real_unix_control_server(self):
         from bot.autonomous.control import (ControlService, FileControlJournal, LedgerControlBackend,
                                             UnixControlServer, load_issued_sessions)

@@ -7,14 +7,12 @@ Builds the AuthorityGateway from trusted local configuration:
   * the durable 0600 nonce store under `--state-dir`;
   * a one-time bootstrap token printed once to stdout as `http://127.0.0.1:<port>/#bootstrap=<token>`
     (the fragment never reaches server logs; the page exchanges it for the HttpOnly session cookie).
-Uvicorn binds 127.0.0.1 only. The control epoch is read with one authenticated status request at start.
+Uvicorn binds 127.0.0.1 only. The control epoch comes from the authority: the start-up status read adopts
+the `current_epoch` of a STALE_EPOCH rejection and retries once (no operator-supplied epoch guess).
 
-HANDOFF(claude-opus-5.5 2026-10-18): (1) control.py rejects a status request whose expected epoch is stale
-(STALE_EPOCH) and echoes the caller's epoch, so the current epoch cannot be discovered without guessing; the
-launcher probes `--epoch` (default 0, a fresh account) once and reports EPOCH_UNKNOWN otherwise. Needs a
-control.py change (epoch-free status, or STALE_EPOCH replies carrying the current permit_epoch). (2) Issued
+HANDOFF(claude-opus-5.5 2026-10-18): (1) Issued
 sessions live at most one hour; the launcher does not hot-reload a re-issued session, so the operator restarts
-it. (3) If the operator CLI and the dashboard share one issued session, nonces used by the CLI after launch
+it. (2) If the operator CLI and the dashboard share one issued session, nonces used by the CLI after launch
 collide (reported as outcome unknown); issue a dedicated dashboard session.
 """
 from __future__ import annotations
@@ -49,7 +47,6 @@ class LaunchConfig:
     state_dir: Path | None = None
     host: str = LOOPBACK_HOST
     port: int = 8000
-    epoch: int = 0
 
 
 @dataclass
@@ -135,7 +132,7 @@ def build(config: LaunchConfig, *, client=None, monotonic_ns=time.monotonic_ns) 
                                sessions=[browser], nonce_store=DurableNonceStore(state_dir / "nonces.json"),
                                bootstrap_tokens={bootstrap_token_hash(token): browser.session_id},
                                monotonic_ns=monotonic_ns)
-    status, note = gateway.probe_status(config.epoch)
+    status, note = gateway.probe_status()
     notes = [note] if note else []
     return Launch(gateway, token, f"{origin}/#bootstrap={token}", gateway.control_epoch, status, notes)
 
@@ -160,11 +157,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--state-dir", type=Path, default=None, help="durable nonce store directory (0700)")
     parser.add_argument("--host", default=LOOPBACK_HOST)
     parser.add_argument("--port", type=int, default=8000)
-    parser.add_argument("--epoch", type=int, default=0, help="expected control epoch for the start-up status probe")
     args = parser.parse_args(argv)
     try:
         result = build(LaunchConfig(args.runtime_dir, args.session_file, args.session_dir, args.state_dir,
-                                    args.host, args.port, args.epoch))
+                                    args.host, args.port))
     except LaunchRefused as exc:
         parser.exit(2, f"refused: {exc}\n")
     from dashboard.backend.app import app

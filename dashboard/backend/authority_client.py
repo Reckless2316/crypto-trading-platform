@@ -7,11 +7,12 @@ Managed mutations are forwarded to the authority control protocol; when the
 authority has no handler the result is an explicit 409 "unavailable" receipt and
 nothing is mutated locally.
 
-HANDOFF(claude-opus-5.5 2026-10-18): the control protocol has no session
-issuance or epoch-discovery command (control.py is owned elsewhere). Browser and
-control sessions are still provisioned by trusted launcher code; a status read
-with a stale X-Control-Epoch is rejected (STALE_EPOCH) without revealing the
-current epoch, so the UI cannot learn it from the protocol yet.
+Epoch resync: a STALE_EPOCH rejection carries data.current_epoch. A status read adopts it
+and retries exactly once with a fresh nonce; a mutation never retries and returns a typed
+`stale_epoch` receipt with the current epoch so the operator re-confirms.
+
+HANDOFF(claude-opus-5.5 2026-10-18): the control protocol has no session issuance;
+browser and control sessions are provisioned by trusted launcher code.
 """
 from __future__ import annotations
 
@@ -231,22 +232,29 @@ class AuthorityGateway:
         self._lock = threading.Lock()
         self.control_epoch: int | None = None  # last epoch confirmed by a completed authority reply
 
-    def probe_status(self, epoch: int) -> tuple[dict | None, str | None]:
-        """One authenticated status read (one nonce) to confirm the authority epoch. Never retries or guesses."""
+    def probe_status(self, epoch: int | None = None) -> tuple[dict | None, str | None]:
+        """Authenticated status read at start. A STALE_EPOCH rejection carrying data.current_epoch is adopted and the
+        status read is retried exactly once with a fresh nonce; epochs are never guessed or iterated."""
         session = next((s for s in self.sessions.values() if s.role == 'operator'), None) or next(iter(self.sessions.values()))
-        request_id = 'launch-status-' + uuid.uuid4().hex
-        try:
-            raw = self._envelope(session, request_id, 'status', epoch, {})
-        except HTTPException as exc:
-            return None, f'AUTHORITY_UNAVAILABLE:{exc.detail}'
-        try:
-            reply = self.client.request(raw)
-            self._validate_reply(reply, request_id)
-        except Exception as exc:  # unavailable socket, protocol failure or unbound reply
-            return None, 'AUTHORITY_UNAVAILABLE:' + type(exc).__name__
-        if reply['status'] == 'completed':
-            self.control_epoch = reply['control_epoch']
-            return reply, None
+        expected = epoch if epoch is not None else (self.control_epoch if self.control_epoch is not None else 0)
+        for attempt in range(2):
+            request_id = 'launch-status-' + uuid.uuid4().hex
+            try:
+                raw = self._envelope(session, request_id, 'status', expected, {})
+            except HTTPException as exc:
+                return None, f'AUTHORITY_UNAVAILABLE:{exc.detail}'
+            try:
+                reply = self.client.request(raw)
+                self._validate_reply(reply, request_id)
+            except Exception as exc:  # unavailable socket, protocol failure or unbound reply
+                return None, 'AUTHORITY_UNAVAILABLE:' + type(exc).__name__
+            if reply['status'] == 'completed':
+                self.control_epoch = reply['control_epoch']
+                return reply, None
+            current = stale_epoch(reply)
+            if current is None or attempt:
+                break
+            self.control_epoch = expected = current
         return reply, 'EPOCH_UNKNOWN:' + ','.join(reply['reason_codes'] or ['REJECTED'])
 
     def session_alive(self, session, now=None):
@@ -341,6 +349,32 @@ class AuthorityGateway:
         if request_id is None:
             raise HTTPException(422, 'X-Request-ID required')
         epoch = int(epoch_text)
+        reply = self._send(session, request_id, kind, epoch, payload)
+        if isinstance(reply, JSONResponse):
+            return reply
+        current = stale_epoch(reply)
+        if current is not None:
+            self.control_epoch = current
+            if kind != 'status':
+                # Never auto-retry a mutation: the operator re-confirms against the current state and epoch.
+                return JSONResponse(status_code=409, content={**reply, 'receipt': 'stale_epoch', 'current_epoch': current,
+                    'detail': f'Authority epoch is now {current}; review the current state and confirm again.'})
+            # A status read is retried exactly once at the authority's epoch, with a fresh request and nonce.
+            request_id = 'status-' + uuid.uuid4().hex
+            reply = self._send(session, request_id, kind, current, payload)
+            if isinstance(reply, JSONResponse):
+                return reply
+        if reply['status'] == 'completed':
+            self.control_epoch = reply['control_epoch']
+        if reply['status'] == 'rejected' and 'HANDLER_UNAVAILABLE' in reply['reason_codes']:
+            receipt, code = 'unavailable', 409
+        else:
+            receipt = reply['status']
+            code = 409 if receipt == 'rejected' else 202 if receipt == 'pending' else 200
+        return JSONResponse(status_code=code, content={**reply, 'receipt': receipt})
+
+    def _send(self, session, request_id, kind, epoch, payload):
+        """One envelope, one send. Returns the bound reply dict or a typed error/unknown JSONResponse."""
         raw = self._envelope(session, request_id, kind, epoch, payload)
         try:
             reply = self.client.request(raw)
@@ -360,14 +394,7 @@ class AuthorityGateway:
             self._validate_reply(reply, request_id)
         except (ValueError, TypeError):
             return _unknown(request_id)
-        if reply['status'] == 'completed':
-            self.control_epoch = reply['control_epoch']
-        if reply['status'] == 'rejected' and 'HANDLER_UNAVAILABLE' in reply['reason_codes']:
-            receipt, code = 'unavailable', 409
-        else:
-            receipt = reply['status']
-            code = 409 if receipt == 'rejected' else 202 if receipt == 'pending' else 200
-        return JSONResponse(status_code=code, content={**reply, 'receipt': receipt})
+        return reply
 
     @staticmethod
     def _validate_reply(reply, request_id):
@@ -386,6 +413,14 @@ class AuthorityGateway:
                 or any(type(item) is not str for item in reply['cancellations_pending'])
                 or type(reply['data']) is not dict):
             raise ValueError('Unbound response')
+
+
+def stale_epoch(reply) -> int | None:
+    """The authority's current epoch from a bound STALE_EPOCH rejection, else None."""
+    if reply.get('status') != 'rejected' or 'STALE_EPOCH' not in reply.get('reason_codes', ()):
+        return None
+    current = (reply.get('data') or {}).get('current_epoch')
+    return current if type(current) is int and 0 <= current <= 2**63 - 1 else None
 
 
 def gateway_for(request: Request, *, mutation=False):

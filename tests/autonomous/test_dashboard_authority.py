@@ -411,3 +411,57 @@ class ReadOnlyDiagnosticsTests(unittest.TestCase):
                     continue
                 self.assertIn('mode=ro', call)
                 self.assertIn('uri=True', call)
+
+
+class EpochResyncTests(DashboardAuthorityTests):
+    """STALE_EPOCH carries data.current_epoch: status retries once; mutations never auto-retry."""
+
+    def stale_client(self, epoch=5):
+        owner = self
+        class Client:
+            def request(self, raw):
+                value = json.loads(raw)
+                owner.calls.append(value)
+                if value["expected_epoch"] != epoch:
+                    return dict(version=1, request_id=value["request_id"], status="rejected", control_epoch=epoch,
+                                reason_codes=["STALE_EPOCH"], local_inhibited=False, cancellations_pending=[],
+                                data={"current_epoch": epoch})
+                return dict(version=1, request_id=value["request_id"], status="completed", control_epoch=epoch,
+                            reason_codes=[], local_inhibited=value["kind"] == "kill", cancellations_pending=[],
+                            data={})
+        return Client()
+
+    def test_status_adopts_the_current_epoch_and_retries_once(self):
+        self.install(client=self.stale_client())
+        result = self.client.get("/api/control/status", headers={"X-Control-Epoch": "1"})
+        self.assertEqual(200, result.status_code, result.text)
+        self.assertEqual([1, 5], [c["expected_epoch"] for c in self.calls])
+        self.assertEqual(5, self.gateway.control_epoch)
+
+    def test_mutations_return_a_stale_epoch_receipt_without_retrying(self):
+        self.install(client=self.stale_client())
+        for url, body in (("/api/control/kill", None), ("/api/control/arm", {"release_hash": RELEASE}),
+                          ("/api/control/flatten", None)):
+            with self.subTest(url=url):
+                before = len(self.calls)
+                result = self.client.post(url, json=body, headers={**self.headers, "X-Request-ID": url.split("/")[-1]})
+                self.assertEqual(409, result.status_code, result.text)
+                self.assertEqual("stale_epoch", result.json()["receipt"])
+                self.assertEqual(5, result.json()["current_epoch"])
+                self.assertEqual(1, len(self.calls) - before)
+        self.assertEqual(5, self.gateway.control_epoch)
+
+    def test_runtime_file_switches_are_covered_by_origin_and_csrf(self):
+        runtime = self.path / "rt"
+        with patch.dict(os.environ, {"AUTONOMOUS_RUNTIME_DIR": str(runtime)}):
+            for headers in ({}, {"Origin": "http://evil.test", "X-CSRF-Token": web.local_csrf_token(web.app)},
+                            {"Origin": "http://testserver", "X-CSRF-Token": "wrong"}):
+                with self.subTest(headers=headers):
+                    reply = self.client.post("/api/autonomous/runtime/command", json={"action": "kill"}, headers=headers)
+                    self.assertEqual(403, reply.status_code, reply.text)
+                    self.assertFalse((runtime / "KILL").exists())
+            token = self.client.get("/api/csrf").json()["csrf_token"]
+            ok = self.client.post("/api/autonomous/runtime/command", json={"action": "stop"},
+                                  headers={"Origin": "http://testserver", "X-CSRF-Token": token})
+            self.assertEqual(200, ok.status_code, ok.text)
+            self.assertTrue((runtime / "STOP").exists())
