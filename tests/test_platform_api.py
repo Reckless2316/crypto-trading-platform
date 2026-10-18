@@ -160,5 +160,32 @@ class PlatformApiTests(unittest.TestCase):
         self.assertFalse(body["rows"][0]["eligible"])
 
 
+    def test_strategy_queue_scores_markov_and_elliott_without_orders(self):
+        self.seed_candles()
+        for name in ("markov_regime", "elliott_wave_heuristic"):
+            queued = self.client.post("/api/strategy/queue", json={"strategy": name, "symbol": "BTC-USD", "timeframe": "1h"})
+            self.assertEqual(queued.status_code, 200, queued.text)
+            self.assertFalse(queued.json()["executes_orders"])
+        before = self.order_count()
+        ran = self.client.post("/api/strategy/queue/run")
+        self.assertEqual(ran.status_code, 200, ran.text)
+        body = ran.json()
+        self.assertFalse(body["executes_orders"])
+        self.assertEqual([item["strategy"] for item in body["triggers"]], ["markov_regime", "elliott_wave_heuristic"])
+        self.assertTrue(all(item["order"] is None for item in body["triggers"]))
+        self.assertEqual(self.order_count(), before)
+
+    def test_runtime_file_command_writes_kill_without_arming(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.object(platform_app, "_runtime_dir", return_value=Path(directory)):
+                response = self.client.post("/api/autonomous/runtime/command", json={"action": "kill"})
+            self.assertEqual(response.status_code, 200, response.text)
+            self.assertTrue((Path(directory) / "KILL").exists())
+            self.assertFalse(response.json()["armed"])
+            self.assertFalse(response.json()["executes_orders"])
+        refused = self.client.post("/api/autonomous/runtime/command", json={"action": "arm"})
+        self.assertEqual(refused.status_code, 422)
+
+
 if __name__ == "__main__":
     unittest.main()

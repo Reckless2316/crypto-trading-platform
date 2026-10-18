@@ -29,7 +29,7 @@ from data.collectors.collector_base import Candle
 from data.history import CandleHistoryStore, ExchangeHistory
 from research.autonomous.status_cards import candidate_cards
 from data.backtesting import BacktestEngine
-from strategies.strategy_suite import STRATEGY_CATALOG, generate_signal
+from strategies.strategy_suite import STRATEGY_CATALOG, STRATEGIES, generate_signal
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -170,6 +170,10 @@ def init_db() -> None:
           id INTEGER PRIMARY KEY, exchange TEXT NOT NULL, symbol TEXT NOT NULL, side TEXT NOT NULL,
           quote_amount REAL NOT NULL, status TEXT NOT NULL, exchange_order_id TEXT,
           created_at REAL NOT NULL, response_json TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS strategy_queue (
+          id INTEGER PRIMARY KEY, strategy TEXT NOT NULL, symbol TEXT NOT NULL,
+          timeframe TEXT NOT NULL, created_at REAL NOT NULL
         );
         INSERT OR IGNORE INTO account_state(account_id,cash,starting_equity)
           VALUES('paper_default',10000,10000);
@@ -460,9 +464,176 @@ def autonomous_proposals():
             "governance": "Proposals only: operator review required; nothing here approves or applies."}
 
 
+_TIMEFRAMES = {"1m": 60, "5m": 300, "15m": 900, "1h": 3600, "4h": 14400, "1d": 86400}
+_RUNTIME_FILE_COMMANDS = {
+    "stop": ("STOP", "create"),
+    "clear_stop": ("STOP", "remove"),
+    "kill": ("KILL", "create"),
+    "clear_kill": ("KILL", "remove"),
+}
+
+
+class StrategyQueueItem(BaseModel):
+    strategy: str
+    symbol: str = "BTC-USD"
+    timeframe: str = "1h"
+
+
+class RuntimeFileCommand(BaseModel):
+    action: Literal["stop", "clear_stop", "kill", "clear_kill"]
+
+
+def _product_symbol(symbol: str) -> str:
+    parts = symbol.split("-")
+    if len(parts) != 2 or not all(part.isalnum() and part for part in parts):
+        raise HTTPException(status_code=422, detail="Product must look like BTC-USD")
+    return symbol
+
+
+def _load_closed_candles(exchange: str, symbol: str, timeframe: str) -> list:
+    if exchange not in {"coinbase", "binance", "kraken"} or timeframe not in _TIMEFRAMES:
+        raise HTTPException(status_code=422, detail="Unsupported exchange or timeframe")
+    candle_rows = CandleHistoryStore(DB_FILE).load(exchange, symbol, timeframe)
+    if not candle_rows and exchange == "coinbase":
+        with closing(db()) as con:
+            raw = con.execute(
+                "SELECT ts_open,open,high,low,close,volume FROM candles WHERE symbol=? AND timeframe=? ORDER BY ts_open",
+                (symbol, timeframe)).fetchall()
+        width = _TIMEFRAMES[timeframe] * 1000
+        candle_rows = [Candle(float(r["open"]), float(r["high"]), float(r["low"]), float(r["close"]),
+                              float(r["volume"]), int(r["ts_open"]), int(r["ts_open"]) + width) for r in raw]
+    now_ms = int(time.time() * 1000)
+    return [c for c in candle_rows if c.ts_close <= now_ms]
+
+
 @app.get("/api/strategies")
 def strategy_catalog():
     return STRATEGY_CATALOG
+
+
+@app.get("/api/market/ticker")
+def market_ticker(symbol: str = "BTC-USD"):
+    """Public Coinbase ticker. The exchange trade time is the price timestamp."""
+    import urllib.request
+    symbol = _product_symbol(symbol)
+    url = f"https://api.exchange.coinbase.com/products/{symbol}/ticker"
+    request = urllib.request.Request(url, headers={"User-Agent": "SURGE-paper-platform/1.0"})
+    try:
+        with urllib.request.urlopen(request, timeout=8) as response:
+            payload = json.loads(response.read().decode())
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Coinbase ticker failed: {type(exc).__name__}")
+    try:
+        price = float(payload["price"])
+        bid = float(payload["bid"])
+        ask = float(payload["ask"])
+    except (KeyError, TypeError, ValueError):
+        raise HTTPException(status_code=502, detail="Coinbase ticker missing price, bid, or ask")
+    if not price > 0 or not bid > 0 or not ask > 0:
+        raise HTTPException(status_code=502, detail="Coinbase ticker prices are not positive")
+    return {"symbol": symbol, "price": price, "bid": bid, "ask": ask,
+            "trade_time": payload.get("time"), "trade_size": payload.get("size"),
+            "volume": payload.get("volume"), "source_url": url,
+            "retrieved_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "note": "Last trade and top of book from Coinbase. This is not a fill and not a regime."}
+
+
+@app.get("/api/strategy/queue")
+def strategy_queue():
+    with closing(db()) as con:
+        rows = con.execute("SELECT id,strategy,symbol,timeframe,created_at FROM strategy_queue ORDER BY id").fetchall()
+    return {"items": [dict(row) for row in rows], "executes_orders": False,
+            "catalog": [item["name"] for item in STRATEGY_CATALOG]}
+
+
+@app.post("/api/strategy/queue")
+def enqueue_strategy(item: StrategyQueueItem):
+    if item.strategy not in STRATEGIES or item.timeframe not in _TIMEFRAMES:
+        raise HTTPException(status_code=422, detail="Unknown strategy or timeframe")
+    symbol = _product_symbol(item.symbol)
+    with closing(db()) as con:
+        cur = con.execute(
+            "INSERT INTO strategy_queue(strategy,symbol,timeframe,created_at) VALUES(?,?,?,?)",
+            (item.strategy, symbol, item.timeframe, time.time()))
+        con.commit()
+        row_id = cur.lastrowid
+    return {"id": row_id, "strategy": item.strategy, "symbol": symbol, "timeframe": item.timeframe,
+            "executes_orders": False}
+
+
+@app.post("/api/strategy/queue/remove")
+def dequeue_strategy(item_id: int):
+    with closing(db()) as con:
+        cur = con.execute("DELETE FROM strategy_queue WHERE id=?", (item_id,))
+        con.commit()
+    if cur.rowcount != 1:
+        raise HTTPException(status_code=404, detail="Queue item not found")
+    return {"removed": item_id, "executes_orders": False}
+
+
+@app.post("/api/strategy/queue/run")
+def run_strategy_queue():
+    """Score every queued strategy on stored closed candles. Never submits an order."""
+    with closing(db()) as con:
+        queued = [dict(row) for row in con.execute(
+            "SELECT id,strategy,symbol,timeframe FROM strategy_queue ORDER BY id")]
+    triggers = []
+    for item in queued:
+        candles = _load_closed_candles("coinbase", item["symbol"], item["timeframe"])
+        if len(candles) < 2:
+            triggers.append({**item, "status": "insufficient_candles", "direction": None, "order": None})
+            continue
+        try:
+            decision = generate_signal(item["strategy"], item["symbol"],
+                                       [float(c.close) for c in candles],
+                                       highs=[float(c.high) for c in candles],
+                                       lows=[float(c.low) for c in candles])
+        except (ValueError, TypeError) as exc:
+            triggers.append({**item, "status": "refused", "detail": str(exc), "order": None})
+            continue
+        price = float(candles[-1].close)
+        now = time.time()
+        with closing(db()) as con:
+            cur = con.execute(
+                "INSERT INTO signals(symbol,strategy,direction,strength,reference_price,created_at,details_json) VALUES(?,?,?,?,?,?,?)",
+                (item["symbol"], item["strategy"], decision["direction"], decision["strength"], price, now, json.dumps(decision)))
+            con.commit()
+            signal_id = cur.lastrowid
+        active = decision["direction"] in {"long", "exit"}
+        triggers.append({**item, "status": "trigger" if active else "watch", "signal_id": signal_id,
+                         "price": price, "direction": decision["direction"], "strength": decision["strength"],
+                         "reason": decision.get("reason"), "caveat": decision.get("caveat"),
+                         "candle_close_ms": candles[-1].ts_close, "order": None})
+    return {"triggers": triggers, "executes_orders": False,
+            "note": "Signals and triggers only. The paper authority still owns every order."}
+
+
+@app.get("/api/autonomous/commands")
+def autonomous_commands():
+    directory = _runtime_dir()
+    return {"directory": str(directory), "executes_orders": False, "arms": False, "commands": [
+        {"action": "stop", "file": "STOP", "effect": "Ask the paper runtime in this directory to exit. Does not start it and does not flatten."},
+        {"action": "clear_stop", "file": "STOP", "effect": "Remove STOP. Does not start the process."},
+        {"action": "kill", "file": "KILL", "effect": "Block every new paper order, including exits, until the file is removed."},
+        {"action": "clear_kill", "file": "KILL", "effect": "Remove KILL. Does not arm paper and does not place an order."},
+    ], "present": {"STOP": (directory / "STOP").exists(), "KILL": (directory / "KILL").exists()}}
+
+
+@app.post("/api/autonomous/runtime/command")
+def autonomous_runtime_command(command: RuntimeFileCommand):
+    """File switch for the configured paper runtime directory. Cannot arm or submit."""
+    name, effect = _RUNTIME_FILE_COMMANDS[command.action]
+    directory = _runtime_dir().resolve()
+    target = (directory / name).resolve()
+    if target.parent != directory:
+        raise HTTPException(status_code=400, detail="Runtime command path rejected")
+    directory.mkdir(parents=True, exist_ok=True)
+    if effect == "create":
+        target.touch()
+    elif target.exists():
+        target.unlink()
+    return {"action": command.action, "file": name, "present": target.exists(),
+            "directory": str(directory), "executes_orders": False, "armed": False}
 
 
 @app.post("/api/ai/analyze")
