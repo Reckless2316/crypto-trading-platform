@@ -25,7 +25,7 @@ from .contracts import ControlCommand, ControlKind, ControlReceipt, content_hash
 MAX_MESSAGE_BYTES = 16_384
 _ROLES = {
     'operator': frozenset({'status', 'arm', 'disarm', 'kill', 'reduce', 'cancel',
-        'resolve_review', 'activate_release', 'reconcile', 'export_session'}),
+        'resolve_review', 'activate_release', 'reconcile', 'export_session', 'clear_latch'}),
     'reflex': frozenset({'submit_judgment'}),
     'brain': frozenset({'import_proposal', 'import_label_events'}),
     'reader': frozenset({'status'}),
@@ -36,6 +36,7 @@ _PAYLOAD_FIELDS = {
     'cancel': {'intent_id': str}, 'resolve_review': {'incident_id': str, 'review_id': str,
         'finding_hash': str, 'reason': str},
     'activate_release': {'release_hash': str, 'reason': str}, 'reconcile': {'reason': str},
+    'clear_latch': {'latch': str, 'reason': str},
     'export_session': {'cutoff_us': int}, 'submit_judgment': {'artifact_hash': str},
     'import_proposal': {'artifact_hash': str}, 'import_label_events': {'artifact_hash': str},
 }
@@ -294,6 +295,8 @@ class ControlService:
                 raise ControlRejected('EXPIRED')
         def operation():
             try:
+                if getattr(self.backend, 'accepts_session', False):
+                    return self.backend.dispatch(request, role=session.role, authorize=authorize, session=session)
                 return self.backend.dispatch(request, role=session.role, authorize=authorize)
             except ControlRejected as exc:
                 return response(request, 'rejected', request.expected_epoch, reason_codes=(str(exc),))
@@ -309,14 +312,23 @@ class LedgerControlBackend:
     is a narrow integration seam until execution exposes a public accessor.
     """
 
+    accepts_session = True
+
     def __init__(self, ledger, authority, *, account_id: str, mode: str,
-            handlers: Mapping[str, Callable[[ControlRequest], ControlReceipt]] | None = None):
+            handlers: Mapping[str, Callable[[ControlRequest], ControlReceipt]] | None = None,
+            release_catalog: Callable[[str], tuple | None] | None = None, release_verifier=None,
+            on_clear: Callable[[str], None] | None = None):
+        """``release_catalog`` (release_hash -> (bundle, approvals, artifacts)) and ``release_verifier`` are trusted
+        authority wiring for the built-in ``activate_release``; ``on_clear`` lets the hosting runtime mirror an
+        operator latch clear into its own latch log. ``clear_latch`` is built in and operator-only."""
         if authority.ledger is not ledger or mode not in {'paper', 'live'} or not _text(account_id):
             raise ControlRejected('INVALID_AUTHORITY_CONFIGURATION')
         self.ledger, self.authority, self.account_id, self.mode = ledger, authority, account_id, mode
         self.dispatch_mutex = authority._lock(account_id)
         self.handlers = MappingProxyType(dict(handlers or {}))
-        if any(kind not in _PAYLOAD_FIELDS or kind in {'kill', 'status'} for kind in self.handlers):
+        self.release_catalog, self.release_verifier, self.on_clear = release_catalog, release_verifier, on_clear
+        builtin = {'kill', 'status', 'clear_latch'} | ({'activate_release'} if release_catalog else set())
+        if any(kind not in _PAYLOAD_FIELDS or kind in builtin for kind in self.handlers):
             raise ControlRejected('INVALID_HANDLER_CONFIGURATION')
         self._state()
 
@@ -328,7 +340,7 @@ class LedgerControlBackend:
             raise ControlRejected('ACCOUNT_MODE_MISMATCH')
         return row
 
-    def dispatch(self, request: ControlRequest, *, role: str, authorize: Callable[[], None]):
+    def dispatch(self, request: ControlRequest, *, role: str, authorize: Callable[[], None], session=None):
         with self.dispatch_mutex:
             authorize()
             row = self._state()
@@ -356,6 +368,10 @@ class LedgerControlBackend:
                 return response(request, 'pending' if pending else 'completed', after['permit_epoch'],
                     local_inhibited=True, cancellations_pending=pending,
                     reason_codes=('CANCELLATION_RECONCILIATION_REQUIRED',) if pending else ())
+            if request.kind == 'clear_latch':
+                return self._clear_latch(request)
+            if request.kind == 'activate_release' and self.release_catalog is not None:
+                return self._activate_release(request, session)
             handler = self.handlers.get(request.kind)
             if handler is None:
                 raise ControlRejected('HANDLER_UNAVAILABLE')
@@ -363,6 +379,39 @@ class LedgerControlBackend:
             if type(receipt) is not ControlReceipt or receipt.request_id != request.request_id:
                 raise ControlRejected('INVALID_HANDLER_RECEIPT')
             return response(request, receipt.status.value, receipt.control_epoch, reason_codes=receipt.reason_codes)
+
+    def _clear_latch(self, request):
+        latch = request.payload.get('latch')
+        if latch not in ('kill', 'drawdown', 'daily', 'crisis'):
+            raise ControlRejected('INVALID_PAYLOAD')
+        refusal = self.ledger.clear_latch(self.account_id, latch, request.actor)
+        after = self._state()
+        if refusal is not None:
+            return response(request, 'rejected', after['permit_epoch'], reason_codes=(refusal,))
+        if self.on_clear is not None:
+            self.on_clear(latch)
+        return response(request, 'completed', after['permit_epoch'], data={'cleared': latch})
+
+    def _activate_release(self, request, session):
+        """Plan (never apply) an operator activation at the next hourly boundary; the ledger applies it there."""
+        from . import release
+        found = self.release_catalog(request.payload.get('release_hash'))
+        row = self._state()
+        if found is None:
+            return response(request, 'rejected', row['permit_epoch'], reason_codes=('RELEASE_UNKNOWN',))
+        bundle, approvals, artifacts = found
+        source = getattr(self.authority, 'reconciliation_source', None)
+        if source is not None:  # a fresh paper reconciliation; planning requires a reconciled account
+            self.ledger.record_mark(source(self.account_id))
+        now = self.ledger._clock_us()
+        plan = release.plan_activation(bundle=bundle, approvals=approvals, artifacts=artifacts,
+            verifier=self.release_verifier, now_us=now, state=self.ledger.activation_state(self.account_id),
+            session=session, boundary_us=(now // release.HOUR_US + 1) * release.HOUR_US)
+        if type(plan) is not release.ActivationPlan:
+            return response(request, 'rejected', row['permit_epoch'], reason_codes=plan.reason_codes)
+        self.ledger.schedule_activation(plan, request.request_id)
+        return response(request, 'pending', row['permit_epoch'], reason_codes=('SCHEDULED_AT_BOUNDARY',),
+            data={'plan_hash': plan.plan_hash, 'effective_at_us': plan.effective_at_us, 'bundle_hash': plan.approved.bundle_hash})
 
     def _unresolved(self):
         return [row[0] for row in self.ledger.connection.execute(

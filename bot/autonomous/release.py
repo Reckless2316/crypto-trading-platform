@@ -3,11 +3,14 @@
 This module never arms, writes the ledger or swaps a live bundle. `plan_activation`
 returns the exact transition the authority must commit atomically at the boundary.
 
-HANDOFF(claude-opus-5.5 2026-10-17): the ledger release registry, the durable
-atomic commit of an ActivationPlan (with judgment invalidation) and the control
-`activate_release` handler are not implemented (ledger.py/execution.py are owned
-elsewhere). Migration of conversational gate approvals into operator-reviewed
-release evidence at Ship is also outstanding.
+HANDOFF(claude-opus-5.5 2026-10-18): the ledger registry (Ledger.register_release /
+schedule_activation / apply_due_activation, append-only control_events + release_events)
+and the operator-only control `activate_release` handler now commit plans at their hourly
+boundary; entries consult `entries_allowed` (Ledger.entries_allowed_now). Still open: a
+production ReleaseEvidenceVerifier and trusted release catalog (authenticated operator
+approval events), migration of conversational gate approvals into operator-reviewed
+release evidence at Ship, and invalidated judgments are recorded but not yet rejected by
+id at the decision layer (they fail naturally: their release is no longer active).
 
 Approval records are claims until authenticated by an authority-injected verifier.
 The verifier is trusted process wiring, never a JSON/provider supplied dependency.

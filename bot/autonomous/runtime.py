@@ -69,6 +69,7 @@ from .state import book_metrics, require_token_budget
 
 REFLEX_ID = "offline-reflex-v1"
 LEDGER_ACCOUNT_ID = "runtime-paper"
+MIDNIGHT_LEAD_S = 1.2  # pre-midnight book read lead; the ledger accepts depth observed <= 2 s before the boundary
 SNAPSHOT_VERSION = "paper-snapshot-v1"
 SCHEMA_VERSION = "runtime-v3"
 UPGRADABLE_SCHEMAS = ("runtime-v2",)  # additive migrations only
@@ -527,12 +528,35 @@ class PaperRuntime:
             self.db.execute("INSERT INTO latches(kind,action,reason,at_us) VALUES (?,?,?,?)", (kind, "set", reason, now))
 
     def clear_latch(self, kind: str, reason: str = "operator") -> None:
-        """Operator-only local action; the REFLEX has no path to this method."""
+        """Operator-only local action for runtime accounting; the REFLEX has no path to this method.
+
+        In ledger mode latches (and the durable kill) are cleared only by an authenticated operator ``clear_latch``
+        control request; the control backend mirrors it here through ``control_cleared``."""
+        if self.authority is not None:
+            raise ValueError("ledger mode: clear latches through the authenticated control socket (clear_latch)")
         self.db.execute("INSERT INTO latches(kind,action,reason,at_us) VALUES (?,?,?,?)", (kind, "clear", reason, self.clock_us()))
 
     def resolve_escalation(self, escalation_id: str, note: str) -> None:
         """BRAIN/operator acknowledgment; the escalation row itself stays immutable."""
         self.db.execute("INSERT INTO escalation_resolutions VALUES (?,?,?)", (escalation_id, note, self.clock_us()))
+
+    _CONTROL_LATCHES = {"crisis": ("CRISIS_HALT",), "drawdown": ("DRAWDOWN_LATCH",), "daily": ("DAILY_HALT:",), "kill": ()}
+
+    def control_cleared(self, latch: str) -> None:
+        """on_clear hook for LedgerControlBackend: mirror an operator-authenticated ledger clear into runtime latches."""
+        for kind in self.latched():
+            if any(kind == prefix or (prefix.endswith(":") and kind.startswith(prefix)) for prefix in self._CONTROL_LATCHES[latch]):
+                self.db.execute("INSERT INTO latches(kind,action,reason,at_us) VALUES (?,?,?,?)",
+                                (kind, "clear", "control:" + latch, self.clock_us()))
+
+    def control_backend(self, *, release_catalog=None, release_verifier=None):
+        """The authenticated control backend for this runtime's ledger account (host it with ControlService)."""
+        from .control import LedgerControlBackend
+        if self.authority is None:
+            raise ValueError("control backend requires ledger accounting")
+        return LedgerControlBackend(self.authority.ledger, self.authority.authority, account_id=self.authority.account_id,
+                                    mode="paper", release_catalog=release_catalog, release_verifier=release_verifier,
+                                    on_clear=self.control_cleared)
 
     def mark(self, bids_by: dict[str, float], now: int) -> dict:
         cash, held = self.cash(), self.positions()
@@ -721,6 +745,9 @@ class PaperRuntime:
 
     # ---------- one cycle ----------
     def cycle(self) -> dict:
+        if self.authority is not None:
+            # An operator-scheduled activation commits only at its boundary; nothing here activates on its own.
+            self.authority.ledger.apply_due_activation(self.authority.account_id)
         observed, errors = {}, {}
         for instrument in self.config.instruments:
             try:
@@ -743,6 +770,11 @@ class PaperRuntime:
             except Exception as exc:
                 results[instrument] = {"status": "hold", "reasons": ["DECISION_ERROR:" + type(exc).__name__]}
             account["cash"], account["positions"] = self.cash(), self.positions()
+        if self.authority is not None:
+            try:
+                self.authority.mark()  # paper reconciliation each cycle keeps the ledger account's proofs current
+            except Exception:
+                pass  # an unready ledger refuses orders by itself; the cycle still records state
         with self._tx():
             labeled = self.label_matured(cutoff)
         return self.write_status(cutoff, results, labeled)
@@ -1025,12 +1057,23 @@ class PaperRuntime:
         return status
 
     def serve(self, stop: Callable[[], bool], sleep: Callable[[float], None] = time.sleep, offset_s: float = 1.0) -> int:
-        """Run one cycle shortly after each candle close until ``stop()``. A failed cycle is logged, never fatal."""
+        """Run one cycle shortly after each candle close until ``stop()``. A failed cycle is logged, never fatal.
+
+        In ledger mode it also wakes ``MIDNIGHT_LEAD_S`` before each UTC midnight for the boundary mark."""
         cycles = attempts = 0
         step = self.config.candle_seconds
         while not stop():
             now_s = self.clock_us() / 1e6
-            sleep(max(0.0, step - now_s % step + offset_s) if attempts else 0.0)
+            wait = max(0.0, step - now_s % step + offset_s) if attempts else 0.0
+            to_boundary = (now_s // 86_400 + 1) * 86_400 - MIDNIGHT_LEAD_S - now_s
+            if self.authority is not None and attempts and 0 <= to_boundary < wait:
+                sleep(to_boundary)
+                try:
+                    self.midnight_boundary(sleep)
+                except Exception as exc:
+                    print(json.dumps({"boundary_error": type(exc).__name__, "at_us": self.clock_us()}), file=sys.stderr, flush=True)
+                continue
+            sleep(wait)
             if stop():
                 break
             attempts += 1
@@ -1043,6 +1086,25 @@ class PaperRuntime:
                 print(json.dumps({"cycle_error": type(exc).__name__, "detail": str(exc)[:200], "at_us": self.clock_us()}),
                       file=sys.stderr, flush=True)
         return cycles
+
+    def midnight_boundary(self, sleep: Callable[[float], None] = time.sleep) -> bool:
+        """Read books just before UTC midnight, then record the ledger's exact-midnight boundary mark.
+
+        The ledger accepts a new day only from a mark whose event time is exactly the UTC boundary and whose
+        executable depth was observed at most 2 s before it."""
+        now = self.clock_us()
+        midnight = (now // 86_400_000_000 + 1) * 86_400_000_000
+        if not 0 < midnight - now <= 3_000_000:
+            return False
+        for instrument in self.config.instruments:
+            try:
+                book, event_us, _ = self.observe(instrument)
+                rules = self.market_rules(instrument, now)
+                self.authority.observe(instrument, _levels(book.get("bids")), _levels(book.get("asks")), event_us, rules)
+            except Exception:
+                continue  # a held asset without depth leaves the account unready; orders are refused, never forced
+        sleep(max(0.0, (midnight - self.clock_us()) / 1e6))
+        return self.authority.boundary_mark(midnight)
 
     def close(self):
         self.db.close()
@@ -1194,6 +1256,8 @@ def main(argv: list[str] | None = None) -> int:
     runtime = PaperRuntime(config, reflex=reflex)
     try:
         if args.clear_latch:
+            if config.accounting == "ledger":
+                raise SystemExit("ledger mode: send an operator-authenticated clear_latch request over the control socket")
             runtime.clear_latch(args.clear_latch)
             print(json.dumps({"cleared": args.clear_latch}))
         elif args.once:

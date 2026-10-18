@@ -19,10 +19,10 @@ the evidence class the ledger accepts for paper accounts. They are not venue att
 # HANDOFF(claude-opus-5.5 2026-10-17): remaining for the ledger accounting path ->
 #   1. Entries: a formal decision record per runtime judgment (Task 7/10 batch persistence) plus a recorded
 #      calibration attestation (Task 8) and an entry verifier bound to it; until then entries are refused.
-#   2. Activation: release.py approval-bound activation and control.py arm/lease renewal; nothing here writes
-#      release_bundles or account_control permits (tests use explicit fixtures).
-#   3. UTC day boundary: the ledger is ready only after a mark exactly at UTC midnight. A boundary mark needs
-#      books observed <= 2 s before midnight; schedule that pre-midnight fetch in the runtime serve loop.
+#   2. Activation: DONE for releases (operator `activate_release` -> ledger schedule -> boundary apply). Still open:
+#      control.py arm/lease renewal; nothing here writes account_control permits (tests use explicit fixtures).
+#   3. DONE: PaperRuntime.serve wakes 1.2 s before UTC midnight, reads books and records `boundary_mark` exactly at
+#      the boundary. A missed boundary (process down at midnight) leaves the account unready until the next one.
 #   4. Sub-minimum reduce-only exits are refused by the formal minimum-notional check (runtime mode allows them).
 """
 from __future__ import annotations
@@ -179,6 +179,28 @@ class RuntimeAuthority:
 
     def mark(self) -> bool:
         self._record_paper_mark(self.ledger, self.account_id, self._mark_books(), self.clock_us())
+        return self.ledger.account_view(self.account_id).ready
+
+    def boundary_mark(self, day_start_us: int) -> bool:
+        """The exact-UTC-midnight mark: event time is the boundary, depth was observed <= 2 s before it.
+
+        Must be called within 2 s after the boundary with books read just before it."""
+        now = self.clock_us()
+        if day_start_us % 86_400_000_000 or not 0 <= now - day_start_us <= 2_000_000:
+            return False
+        books = {asset: book for asset, book in self._mark_books().items() if 0 <= day_start_us - book["at_us"] <= 2_000_000}
+        c = self.ledger.connection
+        balances = {r["asset"]: r["native_qty"] for r in c.execute(
+            "SELECT asset, native_qty FROM balance_positions WHERE account_id=? ORDER BY asset", (self.account_id,))}
+        held = {asset for asset, qty in balances.items() if asset != "USD" and Decimal(qty) > 0}
+        payload = {"balances": balances, "heartbeat_at_us": day_start_us, "liabilities_usd_u": 0, "exit_cost_usd_u": 0,
+                   "open_intent_ids": [r[0] for r in c.execute(
+                       "SELECT intent_id FROM order_intents WHERE account_id=? AND state NOT IN ('filled','canceled','rejected') "
+                       "ORDER BY intent_id", (self.account_id,))],
+                   "books": {asset: books[asset] for asset in held if asset in books}}
+        evidence = self.ledger.import_local_evidence(self.account_id, f"runtime-boundary-{day_start_us}", "mark", payload,
+                                                     event_at_us=day_start_us, received_at_us=now, known_at_us=now)
+        self.ledger.record_mark(evidence)
         return self.ledger.account_view(self.account_id).ready
 
     def _reconciliation_mark(self, account_id: str) -> str:

@@ -424,7 +424,10 @@ class Ledger:
                 raise PersistenceUnavailable('release manifest is not an object')
             # Gate approvals bind the canonical core, avoiding self-reference.
             core = {key:value for key,value in manifest.items() if key!='gate_approvals'}
-            if content_hash(core)!=row['release_hash']:
+            # Registry bundles store the approval-free CandidateBundle (empty gate_approvals), whose
+            # identity is CandidateBundle.bundle_hash; both forms bind the same approval-free core.
+            registry = manifest.get('gate_approvals')==[] and content_hash(manifest)==row['release_hash']
+            if content_hash(core)!=row['release_hash'] and not registry:
                 raise PersistenceUnavailable('release content identity mismatch')
         for row in self.connection.execute('SELECT archive_json,manifest_hash,export_json FROM review_sessions'):
             archive = SessionArchive.from_json(row[0])
@@ -795,6 +798,8 @@ class Ledger:
             raise ContractViolation('missing/expired release')
         if not proposal.reducing_only and (row['permit']!='entry' or row['drawdown_latched'] or row['daily_halted'] or row['crisis_halted'] or not limits.exposure_enabled or proposal.candidate_id=='ondo'):
             raise ContractViolation('entry inhibited')
+        if not proposal.reducing_only and not self.entries_allowed_now(proposal.account_id):
+            raise ContractViolation('release entries not allowed')
         pause = self.connection.execute('SELECT review_paused FROM candidate_control WHERE account_id=? AND candidate_id=?',(proposal.account_id,candidate_wire_id(proposal.candidate_id))).fetchone()
         if pause and pause[0] and not proposal.reducing_only:
             raise ContractViolation('candidate review paused')
@@ -1701,6 +1706,177 @@ class Ledger:
                 (reason, now, account_id))
             self._release_killed_reservations(account_id)
             return True
+
+    # ---------- Task 15: approval-bound release registry and boundary activation ----------
+    # Activations are operator plans from release.plan_activation, stored as append-only
+    # control_events ('activate_release') and applied only at their hourly boundary.
+    # Latches, order intents and history are never reset; there is no auto-activation.
+
+    def _activation_events(self, account_id: str) -> list[dict]:
+        rows = self.connection.execute(
+            "SELECT event_id, reason, recorded_at_us FROM control_events WHERE account_id=? AND kind='activate_release' "
+            "ORDER BY rowid", (account_id,)).fetchall()
+        return [dict(strict_json(r['reason']), event_id=r['event_id']) for r in rows]
+
+    def register_release(self, approved) -> str:
+        """Append an approved, approval-free bundle and its approval records (idempotent)."""
+        from .contracts import ApprovedBundle
+        if type(approved) is not ApprovedBundle:
+            raise ContractViolation('typed approved bundle required')
+        bundle = approved.bundle
+        with self.transaction() as c:
+            existing = c.execute('SELECT manifest_json FROM release_bundles WHERE release_hash=?', (approved.bundle_hash,)).fetchone()
+            manifest = canonical_bytes(bundle.to_dict()).decode()
+            if existing:
+                if existing[0] != manifest:
+                    raise ContractViolation('release identity/content conflict')
+            else:
+                parent = bundle.parent_hash if bundle.parent_hash and c.execute(
+                    'SELECT 1 FROM release_bundles WHERE release_hash=?', (bundle.parent_hash,)).fetchone() else None
+                c.execute('INSERT INTO release_bundles VALUES (?,?,?,?,?)',
+                          (approved.bundle_hash, manifest, parent, bundle.expires_at_us, self._clock_us()))
+                for approval in approved.approvals:
+                    c.execute("INSERT INTO release_events VALUES (?,?,'approval',?,?,?)",
+                              ('approval-' + content_hash((approved.bundle_hash, approval)), approved.bundle_hash,
+                               approval.actor, content_hash(approval), self._clock_us()))
+        return approved.bundle_hash
+
+    def active_approved(self, account_id: str):
+        """The ApprovedBundle of the last applied activation, if it is still the active release."""
+        from .contracts import ApprovedBundle
+        active = self.connection.execute('SELECT active_release_hash FROM account_control WHERE account_id=?',
+                                         (account_id,)).fetchone()[0]
+        applied = [e for e in self._activation_events(account_id) if e['phase'] == 'applied']
+        if not applied or applied[-1]['bundle_hash'] != active:
+            return None
+        return ApprovedBundle.from_json(applied[-1]['approved_json'])
+
+    def entries_allowed_now(self, account_id: str) -> bool:
+        """Entries consult release.entries_allowed whenever the active release came from the registry.
+
+        An active release set outside the registry (legacy fixtures) keeps the existing expiry check."""
+        from .release import entries_allowed
+        if not any(e['phase'] == 'applied' for e in self._activation_events(account_id)):
+            return True
+        return entries_allowed(self.active_approved(account_id), self._clock_us())
+
+    def activation_state(self, account_id: str):
+        from .release import ActivationState
+        account = self._account_view(account_id) if self.connection.in_transaction else self.account_view(account_id)
+        row = self.connection.execute('SELECT * FROM account_control WHERE account_id=?', (account_id,)).fetchone()
+        events = self._activation_events(account_id)
+        closed = {e['plan_hash'] for e in events if e['phase'] in ('applied', 'refused')}
+        scheduled = [e for e in events if e['phase'] == 'scheduled' and e['plan_hash'] not in closed]
+        latches = tuple(name for name in ('hard_killed', 'drawdown_latched', 'daily_halted', 'crisis_halted') if row[name])
+        pending = tuple(r[0] for r in self.connection.execute(
+            "SELECT intent_id FROM order_intents WHERE account_id=? AND state NOT IN ('filled','canceled','rejected') ORDER BY intent_id",
+            (account_id,)))
+        in_flight = tuple(r[0] for r in self.connection.execute(
+            "SELECT d.decision_id FROM decisions d JOIN snapshots s USING(snapshot_id) WHERE s.account_id=? AND d.status='pending' "
+            "ORDER BY d.decision_id", (account_id,)))
+        return ActivationState(account_id=account_id, active=self.active_approved(account_id), armed=row['permit'] != 'none',
+            reconciled=account.ready, unknown_intent_ids=account.unknown_intent_ids, pending_action_keys=pending,
+            in_flight_judgment_ids=in_flight, risk_latches=latches,
+            history=tuple(e['bundle_hash'] for e in events if e['phase'] == 'applied'),
+            boundary_in_progress=bool(scheduled))
+
+    def schedule_activation(self, plan, request_id: str) -> str:
+        """Durably record one operator plan; nothing changes until its boundary."""
+        from .release import ActivationPlan, HOUR_US
+        if type(plan) is not ActivationPlan or type(request_id) is not str or not request_id:
+            raise ContractViolation('typed activation plan required')
+        account_id = None
+        for row in self.connection.execute('SELECT account_id FROM accounts'):
+            account_id = row[0]
+        if account_id is None or plan.effective_at_us % HOUR_US or plan.effective_at_us <= self._clock_us():
+            raise ContractViolation('activation boundary must be a future hour')
+        state = self.activation_state(account_id)
+        if state.boundary_in_progress:
+            raise ContractViolation('an activation is already scheduled')
+        if (plan.previous_hash != (state.active.bundle_hash if state.active else None)
+                or plan.history != state.history + (plan.approved.bundle_hash,)):
+            raise ContractViolation('activation plan does not extend current history')
+        self.register_release(plan.approved)
+        with self.transaction() as c:
+            epoch = c.execute('SELECT permit_epoch FROM account_control WHERE account_id=?', (account_id,)).fetchone()[0]
+            payload = {'phase': 'scheduled', 'plan_hash': plan.plan_hash, 'bundle_hash': plan.approved.bundle_hash,
+                       'previous_hash': plan.previous_hash, 'effective_at_us': plan.effective_at_us, 'actor': plan.actor,
+                       'rollback': plan.rollback, 'invalidated_judgment_ids': list(plan.invalidated_judgment_ids),
+                       'retained_action_keys': list(plan.retained_action_keys), 'risk_latches': list(plan.risk_latches),
+                       'history': list(plan.history), 'approved_json': plan.approved.to_json()}
+            c.execute("INSERT INTO control_events VALUES (?,?,?,?,'activate_release',?,?,?)",
+                      ('activation-scheduled-' + plan.plan_hash, account_id, request_id, epoch, plan.actor,
+                       canonical_bytes(payload).decode(), self._clock_us()))
+        return plan.plan_hash
+
+    def apply_due_activation(self, account_id: str) -> str | None:
+        """Commit a scheduled plan atomically once its boundary has passed; refusals close the plan."""
+        with self.transaction() as c:
+            events = self._activation_events(account_id)
+            closed = {e['plan_hash'] for e in events if e['phase'] in ('applied', 'refused')}
+            due = [e for e in events if e['phase'] == 'scheduled' and e['plan_hash'] not in closed
+                   and e['effective_at_us'] <= self._clock_us()]
+            if not due:
+                return None
+            plan = due[0]
+            row = c.execute('SELECT * FROM account_control WHERE account_id=?', (account_id,)).fetchone()
+            current = self.active_approved(account_id)
+            unknown = c.execute("SELECT 1 FROM order_intents WHERE account_id=? AND state='unknown' LIMIT 1", (account_id,)).fetchone()
+            approved_expires = strict_json(plan['approved_json'])['bundle']['expires_at_us']
+            reason = ('ARMED' if row['permit'] != 'none' else 'PENDING_UNKNOWN_ORDER' if unknown
+                      else 'ACTIVE_CHANGED' if (current.bundle_hash if current else None) != plan['previous_hash']
+                      else 'BUNDLE_EXPIRED' if approved_expires <= self._clock_us() else None)
+            outcome = dict(plan, phase='refused' if reason else 'applied', reason=reason)
+            outcome.pop('event_id')
+            c.execute("INSERT INTO control_events VALUES (?,?,?,?,'activate_release',?,?,?)",
+                      (f"activation-{outcome['phase']}-" + plan['plan_hash'], account_id,
+                       f"activation-{outcome['phase']}-" + plan['plan_hash'], row['permit_epoch'], plan['actor'],
+                       canonical_bytes(outcome).decode(), self._clock_us()))
+            if reason:
+                return 'refused:' + reason
+            c.execute('UPDATE account_control SET active_release_hash=?,version=version+1,updated_at_us=? WHERE account_id=?',
+                      (plan['bundle_hash'], self._clock_us(), account_id))
+            c.execute("INSERT INTO release_events VALUES (?,?,?,?,?,?)",
+                      ('activation-' + plan['plan_hash'], plan['bundle_hash'], 'rollback' if plan['rollback'] else 'activation',
+                       plan['actor'], plan['plan_hash'], self._clock_us()))
+            return 'applied'
+
+    def clear_latch(self, account_id: str, latch: str, actor: str) -> str | None:
+        """Operator-only latch clearing (reached through the authenticated control path).
+
+        Returns a refusal code, or None when cleared. Clearing a hard kill requires no unresolved
+        orders and leaves the account unarmed with a new permit epoch; loss latches stay while breached."""
+        from . import risk
+        columns = {'kill': 'hard_killed', 'drawdown': 'drawdown_latched', 'daily': 'daily_halted', 'crisis': 'crisis_halted'}
+        if latch not in columns or type(actor) is not str or not actor:
+            raise ContractViolation('invalid latch clear')
+        with self.transaction() as c:
+            row = c.execute('SELECT * FROM account_control WHERE account_id=?', (account_id,)).fetchone()
+            if not row[columns[latch]]:
+                return 'NOT_LATCHED'
+            if latch == 'kill' and c.execute("SELECT 1 FROM order_intents WHERE account_id=? AND state IN "
+                                             "('dispatching','open','partial','unknown') LIMIT 1", (account_id,)).fetchone():
+                return 'UNRESOLVED_ORDERS'
+            if latch in ('drawdown', 'daily'):
+                evidence = self._account_view(account_id).exact_nav
+                if evidence is None:
+                    return 'EXACT_NAV_UNAVAILABLE'
+                drawdown, daily = risk.loss_triggers(evidence.nav.fraction(), evidence.high_water_nav.fraction(),
+                                                     evidence.day_open_nav.fraction())
+                if (drawdown if latch == 'drawdown' else daily):
+                    return 'LOSS_LIMIT_STILL_BREACHED'
+            now = self._clock_us()
+            if latch == 'kill':
+                c.execute("UPDATE account_control SET hard_killed=0,permit='none',permit_epoch=permit_epoch+1,halt_reason=NULL,"
+                          "version=version+1,updated_at_us=? WHERE account_id=?", (now, account_id))
+            else:
+                c.execute(f"UPDATE account_control SET {columns[latch]}=0,version=version+1,updated_at_us=? WHERE account_id=?",
+                          (now, account_id))
+            key = 'clear-' + content_hash((account_id, latch, now, actor))
+            c.execute("INSERT INTO control_events VALUES (?,?,?,?,?,?,?,?)",
+                      (key, account_id, key, row['permit_epoch'], 'clear_daily' if latch == 'daily' else 'recovery', actor,
+                       'operator clear ' + latch, now))
+            return None
 
     def _release_killed_reservations(self, account_id: str) -> None:
         """Reject orders that never left RESERVED. In-flight orders stay for reconciliation."""
