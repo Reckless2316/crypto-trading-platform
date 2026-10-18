@@ -90,3 +90,37 @@ correlated outcomes and adverse costs. Inert transport tests prove request
 construction, not real client-ID idempotency or IOC behavior. Calibration and
 research evidence may remain insufficient even when the software runs correctly.
 Reports must preserve that uncertainty and keep unsupported entries disabled.
+
+## Control rules (2026-10-18, Tasks 14/15)
+
+These are enforced in `bot/autonomous/ledger.py` and reached only through the
+authenticated control protocol (`bot/autonomous/control.py`).
+
+- **Latches.** DRAWDOWN is never clearable by any command (`LATCH_PERSISTENT`).
+  DAILY clears only by UTC rollover inside the ledger's loss latching
+  (`CLEARS_AT_ROLLOVER`). CRISIS is cleared only by an operator, with a non-empty
+  reason, on an account that is unarmed (`permit='none'`), ready (an exact NAV
+  mark within the maximum mark age) and has no unknown intents. KILL is cleared
+  only with no unresolved orders. Every clear leaves the account unarmed with a
+  new permit epoch and is recorded in `control_events`. Removing a `KILL` file
+  never clears the ledger kill.
+- **Single latch owner.** In ledger accounting the ledger's `account_control`
+  owns every latch. A REFLEX crisis is raised there (after that cycle's
+  protective exits), and the runtime's latch view derives from it.
+- **Arm.** Operator-only and PAPER-only; LIVE arm is refused with
+  `LIVE_ARM_REQUIRES_TASK22` whatever the role. Arming requires a reconciled
+  account, the named release active and unexpired, no unknown intents and no
+  latch. It sets a bounded deadman lease. Only the `authority` worker role can
+  renew a live lease; a lapsed lease cannot be renewed, disarms entries
+  (`reduce_only`, new epoch) and keeps a bounded reduce-only lease so exits stay
+  allowed.
+- **Activation.** Operator `activate_release` plans for the next hour. The ledger
+  itself re-checks all six gates, operator-only approvers and actor, and bound
+  hashes when scheduling and again when applying. Applying also requires the
+  account unarmed, ready and not hard-killed, the active release unchanged and
+  the bundle unexpired. Nothing activates without an operator plan.
+- **Sessions.** `python -m bot.autonomous.control issue-session --role operator`
+  mints a uid-bound, short-lived (at most 1 h) 0600 session file. Only operator
+  and reader roles are issuable. A ledger-mode runtime hosts the socket at
+  `<data-dir>/control/control.sock` (0700 directory) and reloads sessions from
+  `<data-dir>/control/sessions`.

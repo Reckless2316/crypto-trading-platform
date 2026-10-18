@@ -443,7 +443,8 @@ class ReviewFindingTests(RuntimeCase):
         # Observed in WSL: local clock ~4 s ahead of Coinbase. A wake at local close+1 s sees an exchange
         # event ~3 s before the boundary; it is the pre-close book and belongs to that close, not 57 s late.
         rt = PaperRuntime(RuntimeConfig(data_dir=self.dir, instruments=("AAVE-USD",)),
-            book_source=FakeBooks(self.clock, {"AAVE-USD": lambda: 100.0}, lag_us=4_000_000), clock_us=self.clock)
+            book_source=FakeBooks(self.clock, {"AAVE-USD": lambda: 100.0}, lag_us=4_000_000), clock_us=self.clock,
+            rules_source=FakeRules())
         self.addCleanup(rt.close)
         result = rt.cycle()["instruments"]["AAVE-USD"]
         self.assertNotIn("AWAY_FROM_CLOSE", result["reasons"])
@@ -469,10 +470,10 @@ class ReviewFindingTests(RuntimeCase):
         self.runtime().close()
         with self.assertRaisesRegex(ValueError, "config mismatch"):
             PaperRuntime(RuntimeConfig(data_dir=self.dir, instruments=("AAVE-USD",), starting_cash_usd=D("5000")),
-                         book_source=lambda p: {}, clock_us=self.clock)
+                         book_source=lambda p: {}, rules_source=FakeRules(), clock_us=self.clock)
         with self.assertRaisesRegex(ValueError, "config mismatch"):
             PaperRuntime(RuntimeConfig(data_dir=self.dir, instruments=("AAVE-USD",), candle_seconds=300),
-                         book_source=lambda p: {}, clock_us=self.clock)
+                         book_source=lambda p: {}, rules_source=FakeRules(), clock_us=self.clock)
 
     def test_every_table_refuses_update_and_delete(self):
         import sqlite3
@@ -586,7 +587,8 @@ class SecondReviewTests(RuntimeCase):
                    "BEGIN SELECT RAISE(ABORT, 'injected'); END")
         db.close()
         with self.assertRaises(sqlite3.DatabaseError):
-            PaperRuntime(RuntimeConfig(data_dir=self.dir, instruments=("AAVE-USD",)), book_source=lambda p: {}, clock_us=self.clock)
+            PaperRuntime(RuntimeConfig(data_dir=self.dir, instruments=("AAVE-USD",)), book_source=lambda p: {},
+                         rules_source=FakeRules(), clock_us=self.clock)
         db = sqlite3.connect(self.dir / "runtime.sqlite3")
         self.addCleanup(db.close)
         self.assertEqual(0, db.execute("SELECT COUNT(*) FROM meta").fetchone()[0])

@@ -35,6 +35,13 @@ An explicit ``--explore-fraction`` permits tiny labeled exploration entries
 #      methods and still need the authenticated control path.
 #   6. Warmup (fewer than 20 contiguous candles) gates entries only; exits and the crisis latch still act.
 #      Warmup decisions are stored with phase='warmup' and never labeled or used for calibration.
+#   9. Control (2026-10-18): in ledger mode every latch lives in the ledger (single owner). DRAWDOWN never clears
+#      by command, DAILY clears only at UTC rollover, CRISIS/KILL clear only by an operator clear_latch request on
+#      <data-dir>/control/control.sock (unarmed, ready, reason recorded); every clear leaves the account unarmed.
+#      Operator arm is paper-only with a bounded deadman lease renewed by the authority role; status.json shows
+#      LEDGER_AWAITING_MIDNIGHT_MARK with next_eligible_us when a midnight mark was missed. See
+#      docs/checkpoints/2026-10-17-resumed-paper-authority.md "Control rules". Still open: the dashboard panel
+#      for that state (dashboard is owned elsewhere) and an authority-worker process that renews the lease.
 #   7. Rules outages/untradable flags block entries only; exits use stale cached rules (or LOT/µUSD) and stop
 #      only on trading_disabled/cancel_only. Dust (< base increment or < min funds) is flat for the entry slot
 #      and reported as status.dust_usd; sub-increment dust is never sold. Schema runtime-v3 upgrades v2 in place;
@@ -433,6 +440,7 @@ class PaperRuntime:
         self.reflex = reflex or OfflineReflex()
         self._offline = OfflineReflex()
         self._batch: dict = {}
+        self._crisis_pending: list[str] = []
         self._batch_wires: dict[str, str] = {}
         self.jev_note = "jev_configured_unwired" if os.environ.get("JEV_API_KEY") else "jev_not_configured"
         if self.db.execute("SELECT COUNT(*) FROM equity_marks").fetchone()[0] == 0:
@@ -517,13 +525,28 @@ class PaperRuntime:
     def _last_mark(self):
         return self.db.execute("SELECT * FROM equity_marks ORDER BY mark_id DESC LIMIT 1").fetchone()
 
+    _LEDGER_LATCHES = (("hard_killed", "KILL"), ("drawdown_latched", "DRAWDOWN_LATCH"),
+                       ("daily_halted", "DAILY_HALT:"), ("crisis_halted", "CRISIS_HALT"))
+
     def latched(self) -> set[str]:
+        """Active latches. In ledger mode the ledger's account_control is the single owner of every latch."""
+        if self.authority is not None:
+            row = self.authority.ledger.connection.execute("SELECT * FROM account_control WHERE account_id=?",
+                                                           (self.authority.account_id,)).fetchone()
+            today = _day(self.clock_us())
+            return {name + today if name.endswith(":") else name for column, name in self._LEDGER_LATCHES if row[column]}
         active: set[str] = set()
         for r in self.db.execute("SELECT kind, action FROM latches ORDER BY event_id"):
             (active.add if r["action"] == "set" else active.discard)(r["kind"])
         return active
 
     def _latch(self, kind: str, reason: str, now: int) -> None:
+        if self.authority is not None:
+            # Ledger mode: losses latch inside the ledger itself; a REFLEX crisis is raised there after this cycle's
+            # protective exits (a ledger crisis halts every order until an operator clears it).
+            if kind == "CRISIS_HALT":
+                self._crisis_pending.append(reason)
+            return
         if kind not in self.latched():
             self.db.execute("INSERT INTO latches(kind,action,reason,at_us) VALUES (?,?,?,?)", (kind, "set", reason, now))
 
@@ -533,7 +556,8 @@ class PaperRuntime:
         In ledger mode latches (and the durable kill) are cleared only by an authenticated operator ``clear_latch``
         control request; the control backend mirrors it here through ``control_cleared``."""
         if self.authority is not None:
-            raise ValueError("ledger mode: clear latches through the authenticated control socket (clear_latch)")
+            raise ValueError("ledger mode: clear latches with an operator-authenticated clear_latch request on "
+                             f"{self.control_socket_path}")
         self.db.execute("INSERT INTO latches(kind,action,reason,at_us) VALUES (?,?,?,?)", (kind, "clear", reason, self.clock_us()))
 
     def resolve_escalation(self, escalation_id: str, note: str) -> None:
@@ -745,9 +769,9 @@ class PaperRuntime:
 
     # ---------- one cycle ----------
     def cycle(self) -> dict:
+        self._crisis_pending = []
         if self.authority is not None:
-            # An operator-scheduled activation commits only at its boundary; nothing here activates on its own.
-            self.authority.ledger.apply_due_activation(self.authority.account_id)
+            self.authority.ledger.enforce_lease(self.authority.account_id)  # deadman: lapsed lease disarms entries
         observed, errors = {}, {}
         for instrument in self.config.instruments:
             try:
@@ -771,10 +795,17 @@ class PaperRuntime:
                 results[instrument] = {"status": "hold", "reasons": ["DECISION_ERROR:" + type(exc).__name__]}
             account["cash"], account["positions"] = self.cash(), self.positions()
         if self.authority is not None:
+            ledger, account_id = self.authority.ledger, self.authority.account_id
+            if self._crisis_pending:
+                ledger.latch_account_crisis(account_id, "reflex-crisis-" + str(cutoff), self._crisis_pending[0][:200])
             try:
                 self.authority.mark()  # paper reconciliation each cycle keeps the ledger account's proofs current
             except Exception:
                 pass  # an unready ledger refuses orders by itself; the cycle still records state
+            # An operator-scheduled activation commits only at its boundary, on a freshly reconciled account, under
+            # the authority's account lock; nothing here activates on its own.
+            with self.authority.authority._lock(account_id):
+                ledger.apply_due_activation(account_id)
         with self._tx():
             labeled = self.label_matured(cutoff)
         return self.write_status(cutoff, results, labeled)
@@ -1047,8 +1078,7 @@ class PaperRuntime:
                   # Append-only rowid table: MAX(rowid) equals the row count without a scan.
                   "fills": self.db.execute("SELECT COALESCE(MAX(rowid), 0) FROM fills").fetchone()[0],
                   "accounting": self.config.accounting,
-                  "ledger": {k: v for k, v in self.authority.view().items() if k in ("ready", "reservations", "equity_usd_u")}
-                            if self.authority is not None else None,
+                  "ledger": self.authority.readiness(now) if self.authority is not None else None,
                   "dust_usd": {k: str(v) for k, v in self._dust.items()}, "instruments": results}
         path = self.config.data_dir / "status.json"
         tmp = path.with_suffix(".tmp")
@@ -1062,18 +1092,19 @@ class PaperRuntime:
         In ledger mode it also wakes ``MIDNIGHT_LEAD_S`` before each UTC midnight for the boundary mark."""
         cycles = attempts = 0
         step = self.config.candle_seconds
+        wait_for = lambda seconds: self._wait(seconds, sleep)
         while not stop():
             now_s = self.clock_us() / 1e6
             wait = max(0.0, step - now_s % step + offset_s) if attempts else 0.0
             to_boundary = (now_s // 86_400 + 1) * 86_400 - MIDNIGHT_LEAD_S - now_s
             if self.authority is not None and attempts and 0 <= to_boundary < wait:
-                sleep(to_boundary)
+                wait_for(to_boundary)
                 try:
                     self.midnight_boundary(sleep)
                 except Exception as exc:
                     print(json.dumps({"boundary_error": type(exc).__name__, "at_us": self.clock_us()}), file=sys.stderr, flush=True)
                 continue
-            sleep(wait)
+            wait_for(wait)
             if stop():
                 break
             attempts += 1
@@ -1104,9 +1135,81 @@ class PaperRuntime:
             except Exception:
                 continue  # a held asset without depth leaves the account unready; orders are refused, never forced
         sleep(max(0.0, (midnight - self.clock_us()) / 1e6))
-        return self.authority.boundary_mark(midnight)
+        for _ in range(3):  # retry inside the ledger's 2 s acceptance window only
+            try:
+                if self.authority.boundary_mark(midnight):
+                    return True
+            except Exception:
+                pass
+            if self.clock_us() - midnight >= 1_500_000:
+                break
+            sleep(0.2)
+        return False
+
+    # ---------- authenticated control endpoint (ledger mode) ----------
+    @property
+    def control_dir(self) -> Path:
+        return self.config.data_dir / "control"
+
+    @property
+    def control_socket_path(self) -> Path:
+        return self.control_dir / "control.sock"
+
+    @property
+    def control_sessions_dir(self) -> Path:
+        return self.control_dir / "sessions"
+
+    def open_control(self, *, release_catalog=None, release_verifier=None) -> Path:
+        """Host the authenticated Unix control socket in a 0700 data subdirectory (ledger mode only).
+
+        Sessions are the uid-bound files minted by `python -m bot.autonomous.control issue-session` into
+        ``control/sessions``; they are reloaded on every poll."""
+        from .control import FileControlJournal, UnixControlServer, _private_directory
+        if self.authority is None:
+            raise ValueError("the control endpoint requires ledger accounting")
+        _private_directory(self.control_dir)
+        _private_directory(self.control_sessions_dir)
+        self._control_backend = self.control_backend(release_catalog=release_catalog, release_verifier=release_verifier)
+        self._control_journal = FileControlJournal(self.control_dir / "journal")
+        if self.control_socket_path.exists() or self.control_socket_path.is_symlink():
+            self.control_socket_path.unlink()  # a stale socket from a previous process of this runtime
+        self._control_server = UnixControlServer(self.control_socket_path, None, timeout=1).open()
+        return self.control_socket_path
+
+    def poll_control(self, timeout_s: float) -> bool:
+        """Serve at most one control request within ``timeout_s``. Returns whether one was handled."""
+        import socket as _socket
+        from .control import ControlService, load_issued_sessions
+        server = getattr(self, "_control_server", None)
+        if server is None:
+            return False
+        sessions = load_issued_sessions(self.control_sessions_dir, boot_id=self.authority.boot_id)
+        if not sessions:
+            return False
+        server.service = ControlService(backend=self._control_backend, journal=self._control_journal, sessions=sessions,
+                                        boot_id=self.authority.boot_id, monotonic_ns=time.monotonic_ns)
+        server.socket.settimeout(max(0.01, timeout_s))
+        try:
+            server.serve_once()
+            return True
+        except (_socket.timeout, TimeoutError, BlockingIOError):
+            return False
+
+    def _wait(self, seconds: float, sleep: Callable[[float], None]) -> None:
+        """Sleep, serving control requests meanwhile when the endpoint is open."""
+        if getattr(self, "_control_server", None) is None:
+            sleep(seconds)
+            return
+        deadline = time.monotonic() + max(0.0, seconds)
+        while (remaining := deadline - time.monotonic()) > 0:
+            if not self.poll_control(min(remaining, 1.0)):
+                sleep(min(remaining, 0.25))
 
     def close(self):
+        server = getattr(self, "_control_server", None)
+        if server is not None:
+            server.close()
+            self._control_server = None
         self.db.close()
         if self._owned_ledger is not None:
             self._owned_ledger.close()
@@ -1264,6 +1367,8 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(runtime.cycle(), default=str))
         else:
             stop_file = config.data_dir / "STOP"
+            if config.accounting == "ledger":
+                print(json.dumps({"control_socket": str(runtime.open_control())}), flush=True)
             runtime.serve(lambda: stop_file.exists())
     finally:
         runtime.close()

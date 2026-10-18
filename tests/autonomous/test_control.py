@@ -224,5 +224,8 @@ class LedgerControlTests(unittest.TestCase):
         status = self.backend.dispatch(self.request('status'), role='reader', authorize=lambda: None)
         self.assertFalse(status['data']['hard_killed'])
         self.assertIn('lease_deadline_mono_ns', status['data'])
+        # Arm is implemented (Task 14) and still fails closed on this fixture; unimplemented kinds stay unavailable.
+        armed = self.backend.dispatch(self.request('arm'), role='operator', authorize=lambda: None)
+        self.assertEqual('rejected', armed['status'])
         with self.assertRaisesRegex(self.c.ControlRejected, 'HANDLER_UNAVAILABLE'):
-            self.backend.dispatch(self.request('arm'), role='operator', authorize=lambda: None)
+            self.backend.dispatch(self.request('reconcile'), role='operator', authorize=lambda: None)

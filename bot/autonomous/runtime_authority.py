@@ -140,8 +140,24 @@ class RuntimeAuthority:
         account = self.ledger.account_view(self.account_id)
         cash = sum((b.quantity for b in account.balances if b.asset == "USD"), Decimal(0))
         positions = {b.asset + "-USD": b.quantity for b in account.balances if b.asset != "USD" and b.quantity > 0}
+        state = self.ledger.connection.execute("SELECT day_start_us FROM accounting_state WHERE account_id=?",
+                                               (self.account_id,)).fetchone()
         return {"cash": cash, "positions": positions, "ready": account.ready,
-                "reservations": len(account.reservations), "equity_usd_u": account.liquidation_equity_usd_u}
+                "reservations": len(account.reservations), "equity_usd_u": account.liquidation_equity_usd_u,
+                "day_start_us": state[0] if state else None}
+
+    def readiness(self, now_us: int) -> dict:
+        """Operator-facing ledger state. A day without its exact-midnight mark waits for the next boundary."""
+        view = self.view()
+        day = now_us // 86_400_000_000 * 86_400_000_000
+        out = {"ready": view["ready"], "reservations": view["reservations"], "equity_usd_u": view["equity_usd_u"]}
+        if view["ready"]:
+            out["state"] = "READY"
+        elif view["day_start_us"] != day:
+            out.update(state="LEDGER_AWAITING_MIDNIGHT_MARK", next_eligible_us=day + 86_400_000_000)
+        else:
+            out["state"] = "UNREADY"
+        return out
 
     def last_entry_close(self, instrument: str) -> int | None:
         row = self.ledger.connection.execute(
@@ -272,6 +288,7 @@ class RuntimeAuthority:
 
     def exit(self, instrument: str, close_us: int) -> AuthorityOutcome:
         """Reduce-only IOC sell of the full accounted holding through the authority."""
+        self.ledger.enforce_lease(self.account_id)  # a lapsed deadman lease leaves exits on a bounded reduce lease
         if blocked := self.diagnose(instrument, reducing=True):
             return _refused(*blocked)
         slot = self._reduction_slot(instrument)
@@ -304,6 +321,7 @@ class RuntimeAuthority:
         """IOC limit buy through the authority; refused without a persisted formal decision (never forged)."""
         if decision is None:
             return _refused("DECISION_PROVENANCE_UNAVAILABLE")
+        self.ledger.enforce_lease(self.account_id)  # deadman: a lapsed lease disarms entries before admission
         if blocked := self.diagnose(instrument, reducing=False):
             return _refused(*blocked)
         try:

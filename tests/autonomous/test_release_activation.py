@@ -85,6 +85,11 @@ class ActivationCase(LedgerCase):
 
 
 class LedgerActivationTests(ActivationCase):
+    def apply(self):
+        """Apply requires a ready account: record the cycle's paper reconciliation first, as the runtime does."""
+        self.adapter_.mark()
+        return self.ledger.apply_due_activation(ACCOUNT)
+
     def plan(self, bundle, state=None):
         self.adapter_.mark()  # a fresh paper reconciliation; planning requires a reconciled account
         b, approvals, artifacts = self.releases.catalog[bundle.bundle_hash]
@@ -98,12 +103,12 @@ class LedgerActivationTests(ActivationCase):
         bundle = self.releases.bundle()
         plan = self.plan(bundle)
         self.assertIsInstance(plan, r.ActivationPlan, getattr(plan, "reason_codes", None))
-        self.ledger.schedule_activation(plan, "req-activate-1")
+        self.ledger.schedule_activation(plan, "req-activate-1", account_id=ACCOUNT)
         self.assertTrue(self.ledger.activation_state(ACCOUNT).boundary_in_progress)
-        self.assertIsNone(self.ledger.apply_due_activation(ACCOUNT))  # before the boundary nothing changes
+        self.assertIsNone(self.apply())  # before the boundary nothing changes
         self.assertIsNone(self.ledger.connection.execute("SELECT active_release_hash FROM account_control").fetchone()[0])
         self.clock.us = plan.effective_at_us
-        self.assertEqual("applied", self.ledger.apply_due_activation(ACCOUNT))
+        self.assertEqual("applied", self.apply())
         row = self.ledger.connection.execute("SELECT * FROM account_control").fetchone()
         self.assertEqual(bundle.bundle_hash, row["active_release_hash"])
         self.assertEqual((1, 1), (row["drawdown_latched"], row["crisis_halted"]))  # latches are never reset
@@ -120,48 +125,91 @@ class LedgerActivationTests(ActivationCase):
     def test_forward_release_and_rollback_keep_growing_history(self):
         first = self.releases.bundle()
         plan = self.plan(first)
-        self.ledger.schedule_activation(plan, "req-a")
+        self.ledger.schedule_activation(plan, "req-a", account_id=ACCOUNT)
         self.clock.us = plan.effective_at_us + 1
-        self.ledger.apply_due_activation(ACCOUNT)
+        self.apply()
         self.releases.now = self.clock.us
         child = self.releases.bundle("model-v2", parent=first.bundle_hash)
         plan = self.plan(child)
         self.assertIsInstance(plan, r.ActivationPlan, getattr(plan, "reason_codes", None))
-        self.ledger.schedule_activation(plan, "req-b")
+        self.ledger.schedule_activation(plan, "req-b", account_id=ACCOUNT)
         self.clock.us = plan.effective_at_us
-        self.ledger.apply_due_activation(ACCOUNT)
+        self.apply()
         self.assertEqual((first.bundle_hash, child.bundle_hash), self.ledger.activation_state(ACCOUNT).history)
 
     def test_apply_refuses_when_state_moved_and_never_retries(self):
         bundle = self.releases.bundle()
         plan = self.plan(bundle)
-        self.ledger.schedule_activation(plan, "req-x")
+        self.ledger.schedule_activation(plan, "req-x", account_id=ACCOUNT)
         with self.ledger.transaction() as c:
             c.execute("UPDATE account_control SET permit='entry'")  # armed after planning
         self.clock.us = plan.effective_at_us
-        self.assertEqual("refused:ARMED", self.ledger.apply_due_activation(ACCOUNT))
-        self.assertIsNone(self.ledger.apply_due_activation(ACCOUNT))  # a refused plan is closed, not re-attempted
+        self.assertEqual("refused:ARMED", self.apply())
+        self.assertIsNone(self.apply())  # a refused plan is closed, not re-attempted
         self.assertIsNone(self.ledger.connection.execute("SELECT active_release_hash FROM account_control").fetchone()[0])
+
+    def test_ledger_refuses_forged_or_model_approved_plans(self):
+        from bot.autonomous.contracts import ApprovedBundle
+        b = self.releases.bundle()
+        boundary = (self.clock.us // HOUR + 1) * HOUR
+        one = ApprovedBundle(b, (GateApproval("build", "brain", b.bundle_hash, "e" * 64, self.clock.us),), self.clock.us, "f" * 64)
+        forged = r.ActivationPlan(one, None, boundary, "brain", False, (), (), (), (b.bundle_hash,))
+        self.adapter_.mark()
+        for plan, code in ((forged, "MISSING_APPROVALS"),):
+            with self.subTest(code), self.assertRaisesRegex(Exception, code):
+                self.ledger.schedule_activation(plan, "req-forged", account_id=ACCOUNT)
+        good = self.plan(b)
+        approvals = tuple(replace(a, actor="reflex") if a.gate == "ship" else a for a in good.approved.approvals)
+        model = replace(good, approved=replace(good.approved, approvals=approvals))
+        with self.assertRaisesRegex(Exception, "NON_OPERATOR_APPROVER"):
+            self.ledger.schedule_activation(model, "req-model", account_id=ACCOUNT)
+        with self.assertRaisesRegex(Exception, "NON_OPERATOR_ACTOR"):
+            self.ledger.schedule_activation(replace(good, actor="worker:authority"), "req-actor", account_id=ACCOUNT)
+        self.assertEqual(0, self.ledger.connection.execute("SELECT COUNT(*) FROM release_bundles").fetchone()[0])
+
+    def test_schedule_rechecks_current_state(self):
+        b = self.releases.bundle()
+        plan = self.plan(b)
+        with self.ledger.transaction() as c:
+            c.execute("UPDATE account_control SET permit='entry'")
+        with self.assertRaisesRegex(Exception, "ARMED"):
+            self.ledger.schedule_activation(plan, "req-late", account_id=ACCOUNT)
+
+    def test_apply_requires_ready_and_not_killed(self):
+        b = self.releases.bundle()
+        plan = self.plan(b)
+        self.ledger.schedule_activation(plan, "req-k", account_id=ACCOUNT)
+        self.clock.us = plan.effective_at_us + 5_000_000
+        self.assertEqual("refused:UNRECONCILED", self.ledger.apply_due_activation(ACCOUNT))
+        b2 = self.releases.bundle("model-v3")
+        plan = self.plan(b2)
+        self.ledger.schedule_activation(plan, "req-k2", account_id=ACCOUNT)
+        with self.ledger.transaction() as c:
+            c.execute("UPDATE account_control SET hard_killed=1")
+        self.clock.us = plan.effective_at_us
+        self.assertEqual("refused:HARD_KILL", self.apply())
 
     def test_one_scheduled_plan_at_a_time(self):
         bundle = self.releases.bundle()
         plan = self.plan(bundle)
-        self.ledger.schedule_activation(plan, "req-1")
+        self.ledger.schedule_activation(plan, "req-1", account_id=ACCOUNT)
         with self.assertRaises(Exception):
-            self.ledger.schedule_activation(replace(plan, actor="operator:bob"), "req-2")
+            self.ledger.schedule_activation(replace(plan, actor="operator:bob"), "req-2", account_id=ACCOUNT)
 
     def test_entries_consult_entries_allowed_for_registry_releases(self):
         bundle = self.releases.bundle()
         plan = self.plan(bundle)
-        self.ledger.schedule_activation(plan, "req-e")
+        self.ledger.schedule_activation(plan, "req-e", account_id=ACCOUNT)
         self.clock.us = plan.effective_at_us
-        self.ledger.apply_due_activation(ACCOUNT)
+        self.apply()
         self.assertTrue(self.ledger.entries_allowed_now(ACCOUNT))
         self.clock.us = bundle.expires_at_us
         self.assertFalse(self.ledger.entries_allowed_now(ACCOUNT))
 
 
 class ControlActivationTests(ActivationCase):
+    apply = LedgerActivationTests.apply
+
     def test_operator_activates_through_the_authenticated_control_protocol(self):
         bundle = self.releases.bundle()
         service = self.service(operator())  # the handler records its own fresh paper reconciliation
@@ -191,7 +239,7 @@ class ControlActivationTests(ActivationCase):
     def test_no_auto_activation_without_an_operator_request(self):
         self.releases.bundle()
         self.clock.us += 2 * HOUR
-        self.assertIsNone(self.ledger.apply_due_activation(ACCOUNT))
+        self.assertIsNone(self.apply())
         self.assertEqual((), self.ledger.activation_state(ACCOUNT).history)
 
 
@@ -200,6 +248,7 @@ class LatchClearTests(ActivationCase):
         with self.ledger.transaction() as c:
             c.execute("UPDATE account_control SET crisis_halted=1")
         cleared = []
+        self.adapter_.mark()
         op, model = operator(), operator(session_id="model", role="brain", actor="brain:nightly")
         service = self.service(op, model, on_clear=cleared.append)
         path = self.dir / "control" / "sock"
@@ -231,26 +280,105 @@ class LatchClearTests(ActivationCase):
         row = self.ledger.connection.execute("SELECT hard_killed, permit FROM account_control").fetchone()
         self.assertEqual((0, "none"), tuple(row))  # cleared kill leaves the account unarmed
 
-    def test_drawdown_clear_is_refused_while_the_loss_limit_is_breached(self):
+    def test_drawdown_and_daily_latches_are_never_cleared_by_command(self):
         with self.ledger.transaction() as c:
-            c.execute("UPDATE account_control SET drawdown_latched=1")
-        from unittest import mock
-        with mock.patch("bot.autonomous.risk.loss_triggers", return_value=(True, False)):
-            receipt = self.handle(self.service(operator()), request(operator(), "clear_latch",
-                                  {"latch": "drawdown", "reason": "x"}, request_id="d1"))
-        self.assertEqual(["LOSS_LIMIT_STILL_BREACHED"], receipt["reason_codes"])
-        self.assertEqual(1, self.ledger.connection.execute("SELECT drawdown_latched FROM account_control").fetchone()[0])
+            c.execute("UPDATE account_control SET drawdown_latched=1, daily_halted=1")
+        self.adapter_.mark()
+        service = self.service(operator())
+        for latch, code in (("drawdown", "LATCH_PERSISTENT"), ("daily", "CLEARS_AT_ROLLOVER")):
+            with self.subTest(latch):
+                receipt = self.handle(service, request(operator(), "clear_latch", {"latch": latch, "reason": "x"},
+                                                       request_id="d-" + latch, nonce="n2" if latch == "daily" else "n1"))
+                self.assertEqual([code], receipt["reason_codes"])
+        row = self.ledger.connection.execute("SELECT drawdown_latched, daily_halted FROM account_control").fetchone()
+        self.assertEqual((1, 1), tuple(row))
+
+    def test_crisis_clear_requires_unarmed_ready_marked_account(self):
+        with self.ledger.transaction() as c:
+            c.execute("UPDATE account_control SET crisis_halted=1, permit='entry'")
+        self.adapter_.mark()
+        service = self.service(operator())
+        receipt = self.handle(service, request(operator(), "clear_latch", {"latch": "crisis", "reason": "reviewed"}, request_id="cr-armed"))
+        self.assertEqual(["ARMED"], receipt["reason_codes"])
+        with self.ledger.transaction() as c:
+            c.execute("UPDATE account_control SET permit='none'")
+        self.clock.us += 3_000_000  # the last mark is now older than the maximum mark age
+        receipt = self.handle(service, request(operator(), "clear_latch", {"latch": "crisis", "reason": "reviewed"},
+                                               request_id="cr-stale", nonce="n2"))
+        self.assertEqual(["UNRECONCILED"], receipt["reason_codes"])
+        self.adapter_.mark()
+        receipt = self.handle(service, request(operator(), "clear_latch", {"latch": "crisis", "reason": "reviewed"},
+                                               request_id="cr-ok", nonce="n3"))
+        self.assertEqual("completed", receipt["status"], receipt)
+        reason = self.ledger.connection.execute("SELECT reason FROM control_events WHERE reason LIKE 'operator clear crisis%'").fetchone()[0]
+        self.assertIn("reviewed", reason)
+        self.assertEqual("none", self.ledger.connection.execute("SELECT permit FROM account_control").fetchone()[0])
+
+    def test_mirror_failure_is_reported_in_the_receipt(self):
+        with self.ledger.transaction() as c:
+            c.execute("UPDATE account_control SET crisis_halted=1")
+        self.adapter_.mark()
+        def boom(latch):
+            raise RuntimeError("mirror failed")
+        receipt = self.handle(self.service(operator(), on_clear=boom), request(operator(), "clear_latch",
+                              {"latch": "crisis", "reason": "x"}, request_id="mf"))
+        self.assertEqual("completed", receipt["status"])
+        self.assertEqual(["MIRROR_FAILED:RuntimeError"], receipt["reason_codes"])
 
     def test_runtime_refuses_local_latch_clear_in_ledger_mode(self):
         rt = PaperRuntime(RuntimeConfig(data_dir=self.dir / "rt", instruments=("AAVE-USD",), accounting="ledger"),
                           book_source=self.books, clock_us=self.clock, reflex=Fixed(GOOD), rules_source=FakeRules(),
                           authority=self.adapter_)
         self.addCleanup(rt.close)
-        rt.db.execute("INSERT INTO latches(kind,action,reason,at_us) VALUES ('CRISIS_HALT','set','t',0)")
+        with self.ledger.transaction() as c:
+            c.execute("UPDATE account_control SET crisis_halted=1")
         with self.assertRaisesRegex(ValueError, "control"):
             rt.clear_latch("CRISIS_HALT")
+        self.assertIn("CRISIS_HALT", rt.latched())  # the runtime view derives from the ledger
+        self.adapter_.mark()
+        self.assertIsNone(self.ledger.clear_latch(ACCOUNT, "crisis", "operator:alice", "reviewed"))
+        self.assertNotIn("CRISIS_HALT", rt.latched())
+
+
+class SingleLatchOwnerTests(ActivationCase):
+    def runtime(self, judgment=GOOD):
+        rt = PaperRuntime(RuntimeConfig(data_dir=self.dir / "rt", instruments=("AAVE-USD",), accounting="ledger"),
+                          book_source=self.books, clock_us=self.clock, reflex=Fixed(judgment), rules_source=FakeRules(),
+                          authority=self.adapter_)
+        self.addCleanup(rt.close)
+        return rt
+
+    def test_reflex_crisis_latches_the_ledger_and_the_runtime_view_derives_from_it(self):
+        from bot.autonomous.contracts import Regime
+        rt = self.runtime(replace(GOOD, regime=Regime.CRISIS))
+        for _ in range(21):
+            self.clock.us += 60_000_000
+            rt.cycle()
+        self.assertEqual(1, self.ledger.connection.execute("SELECT crisis_halted FROM account_control").fetchone()[0])
         self.assertIn("CRISIS_HALT", rt.latched())
-        rt.control_cleared("crisis")  # the control backend's on_clear hook (operator-authenticated upstream)
+        self.assertEqual(0, rt.db.execute("SELECT COUNT(*) FROM latches WHERE kind='CRISIS_HALT'").fetchone()[0])
+
+    def test_serve_hosts_the_control_endpoint_named_in_the_refusal(self):
+        import stat
+        from bot.autonomous.control import issue_session, send_request
+        rt = self.runtime()
+        endpoint = rt.open_control()
+        self.assertEqual(self.dir / "rt" / "control" / "control.sock", endpoint)
+        self.assertEqual(0o700, stat.S_IMODE((self.dir / "rt" / "control").stat().st_mode))
+        with self.assertRaisesRegex(ValueError, str(endpoint)):
+            rt.clear_latch("CRISIS_HALT")
+        with self.ledger.transaction() as c:
+            c.execute("UPDATE account_control SET crisis_halted=1")
+        self.adapter_.mark()
+        session = issue_session(rt.control_sessions_dir, role="operator", actor="operator:alice", account_id=ACCOUNT,
+                                mode="paper", boot_id=self.adapter_.boot_id, ttl_s=600)
+        out = {}
+        thread = threading.Thread(target=lambda: out.update(r=send_request(session, endpoint, "clear_latch",
+                                                                            {"latch": "crisis", "reason": "reviewed"}, epoch=0)))
+        thread.start()
+        rt.poll_control(3.0)
+        thread.join()
+        self.assertEqual("completed", out["r"]["status"], out["r"])
         self.assertNotIn("CRISIS_HALT", rt.latched())
 
 

@@ -34,11 +34,26 @@ _HASH = re.compile(r'[0-9a-f]{64}')
 HOUR_US = 3_600_000_000
 # Process principals that produce proposals/judgments. They can never approve a
 # gate, whatever a verifier reports: a generated bundle cannot approve itself.
-_ROLE_PRINCIPALS = ('brain', 'reflex', 'reader', 'nightly', 'system', 'authority')
+_ROLE_PRINCIPALS = ('brain', 'reflex', 'reader', 'nightly', 'system', 'authority', 'worker', 'model', 'jev', 'runtime')
 
 
 def _role_principal(actor):
     return type(actor) is not str or any(actor == p or actor.startswith(p + ':') for p in _ROLE_PRINCIPALS)
+
+
+def approval_refusal(approved, actor: str | None = None) -> str | None:
+    """Commit-point check repeated by the ledger: all six gates, operator approvers only, every approval bound."""
+    approvals = getattr(approved, 'approvals', None)
+    bundle_hash = getattr(approved, 'bundle_hash', None)
+    if type(approvals) is not tuple or missing_approvals({_gate(a.gate) for a in approvals}):
+        return 'MISSING_APPROVALS'
+    if any(_role_principal(a.actor) for a in approvals):
+        return 'NON_OPERATOR_APPROVER'
+    if any(a.bundle_hash != bundle_hash for a in approvals):
+        return 'UNBOUND_APPROVAL'
+    if actor is not None and _role_principal(actor):
+        return 'NON_OPERATOR_ACTOR'
+    return None
 
 
 def missing_approvals(approved: set[str]) -> tuple[str, ...]:

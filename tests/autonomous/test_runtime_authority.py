@@ -62,7 +62,8 @@ class LedgerCase(unittest.TestCase):
     def adapter(self, ledger=None, **kw):
         kw.setdefault("limits", RiskLimits(armed=True, candidate_eligible=True, tokenizer_config_hash=HASH, calibration_config_hash=HASH))
         kw.setdefault("entry_verifier", lambda *a: True)  # test-only: the fixture decision stands in for attested sizing
-        return RuntimeAuthority(ledger or self.ledger, account_id=ACCOUNT, clock_us=self.clock, monotonic_ns=lambda: 1,
+        kw.setdefault("monotonic_ns", lambda: 1)
+        return RuntimeAuthority(ledger or self.ledger, account_id=ACCOUNT, clock_us=self.clock,
                                 boot_id="rt-boot", fee_rate=D("0.006"), **kw)
 
     def observe(self, adapter, **rules):

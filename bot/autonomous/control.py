@@ -29,14 +29,20 @@ _ROLES = {
     'reflex': frozenset({'submit_judgment'}),
     'brain': frozenset({'import_proposal', 'import_label_events'}),
     'reader': frozenset({'status'}),
+    # The authority worker's own permit: it can only renew a live deadman lease.
+    'authority': frozenset({'renew'}),
 }
+MAX_LEASE_NS = 120_000_000_000
+MAX_SESSION_TTL_S = 3_600
+# Session issuance for a separate operator CLI process. Never model/reflex/brain/authority roles.
+ISSUABLE_ROLES = ('operator', 'reader')
 _PAYLOAD_FIELDS = {
     'status': {}, 'arm': {'reason': str, 'release_hash': str},
     'disarm': {'reason': str}, 'kill': {'reason': str}, 'reduce': {'reason': str, 'incident_id': str},
     'cancel': {'intent_id': str}, 'resolve_review': {'incident_id': str, 'review_id': str,
         'finding_hash': str, 'reason': str},
     'activate_release': {'release_hash': str, 'reason': str}, 'reconcile': {'reason': str},
-    'clear_latch': {'latch': str, 'reason': str},
+    'clear_latch': {'latch': str, 'reason': str}, 'renew': {'reason': str},
     'export_session': {'cutoff_us': int}, 'submit_judgment': {'artifact_hash': str},
     'import_proposal': {'artifact_hash': str}, 'import_label_events': {'artifact_hash': str},
 }
@@ -106,13 +112,15 @@ class ControlSession:
     peer: PeerCredentials
     expires_mono_ns: int
     nonces: Mapping[str, int]
+    peer_match: str = 'pid'  # 'uid' only for sessions issued to a separate operator CLI process
 
     def __post_init__(self):
         if (any(not _text(v) for v in (self.session_id, self.actor, self.account_id, self.boot_id, self.token))
                 or self.role not in _ROLES or self.mode not in {'paper', 'live'}
                 or type(self.peer) is not PeerCredentials
                 or any(not _integer(v) for v in (self.peer.pid, self.peer.uid, self.peer.gid, self.expires_mono_ns))
-                or not self.nonces or any(not _text(k) or not _integer(v) for k, v in self.nonces.items())):
+                or not self.nonces or any(not _text(k) or not _integer(v) for k, v in self.nonces.items())
+                or self.peer_match not in ('pid', 'uid')):
             raise ControlRejected('INVALID_SESSION_CONFIGURATION')
         object.__setattr__(self, 'nonces', MappingProxyType(dict(self.nonces)))
 
@@ -277,7 +285,9 @@ class ControlService:
     def handle(self, raw: bytes, peer: PeerCredentials):
         request = decode_request(raw)
         session, now = self.sessions.get(request.session_id), self.monotonic_ns()
-        if (session is None or type(peer) is not PeerCredentials or session.peer != peer
+        peer_ok = type(peer) is PeerCredentials and session is not None and (
+            session.peer == peer if session.peer_match == 'pid' else session.peer.uid == peer.uid)
+        if (session is None or not peer_ok
                 or not secrets.compare_digest(session.token.encode(), request.token.encode())
                 or request.actor != session.actor or request.account_id != session.account_id
                 or request.mode != session.mode or request.boot_id != session.boot_id
@@ -286,6 +296,8 @@ class ControlService:
                 or now >= min(session.expires_mono_ns, request.deadline_mono_ns,
                     session.nonces.get(request.nonce, 0))):
             raise ControlRejected('AUTHENTICATION_FAILED')
+        if request.kind == 'arm' and request.mode == 'live':
+            raise ControlRejected('LIVE_ARM_REQUIRES_TASK22')  # whatever the role; live arming is Task 22
         if not command_allowed(session.role, request.kind, False):
             raise ControlRejected('ROLE_FORBIDDEN')
         def authorize():
@@ -317,7 +329,7 @@ class LedgerControlBackend:
     def __init__(self, ledger, authority, *, account_id: str, mode: str,
             handlers: Mapping[str, Callable[[ControlRequest], ControlReceipt]] | None = None,
             release_catalog: Callable[[str], tuple | None] | None = None, release_verifier=None,
-            on_clear: Callable[[str], None] | None = None):
+            on_clear: Callable[[str], None] | None = None, lease_ns: int = 30_000_000_000):
         """``release_catalog`` (release_hash -> (bundle, approvals, artifacts)) and ``release_verifier`` are trusted
         authority wiring for the built-in ``activate_release``; ``on_clear`` lets the hosting runtime mirror an
         operator latch clear into its own latch log. ``clear_latch`` is built in and operator-only."""
@@ -327,7 +339,10 @@ class LedgerControlBackend:
         self.dispatch_mutex = authority._lock(account_id)
         self.handlers = MappingProxyType(dict(handlers or {}))
         self.release_catalog, self.release_verifier, self.on_clear = release_catalog, release_verifier, on_clear
-        builtin = {'kill', 'status', 'clear_latch'} | ({'activate_release'} if release_catalog else set())
+        if type(lease_ns) is not int or lease_ns <= 0:
+            raise ControlRejected('INVALID_LEASE_CONFIGURATION')
+        self.lease_ns = min(lease_ns, MAX_LEASE_NS)
+        builtin = {'kill', 'status', 'clear_latch', 'arm', 'renew', 'disarm'} | ({'activate_release'} if release_catalog else set())
         if any(kind not in _PAYLOAD_FIELDS or kind in builtin for kind in self.handlers):
             raise ControlRejected('INVALID_HANDLER_CONFIGURATION')
         self._state()
@@ -370,6 +385,8 @@ class LedgerControlBackend:
                     reason_codes=('CANCELLATION_RECONCILIATION_REQUIRED',) if pending else ())
             if request.kind == 'clear_latch':
                 return self._clear_latch(request)
+            if request.kind in ('arm', 'renew', 'disarm'):
+                return self._lease_command(request)
             if request.kind == 'activate_release' and self.release_catalog is not None:
                 return self._activate_release(request, session)
             handler = self.handlers.get(request.kind)
@@ -380,17 +397,43 @@ class LedgerControlBackend:
                 raise ControlRejected('INVALID_HANDLER_RECEIPT')
             return response(request, receipt.status.value, receipt.control_epoch, reason_codes=receipt.reason_codes)
 
+    def _authority_boot(self, request):
+        config = getattr(self.ledger, '_risk_config', None)
+        return config[3] if config else request.boot_id
+
+    def _lease_command(self, request):
+        """Operator paper arm / disarm and authority-role lease renewal; all bounded and durable in the ledger."""
+        boot = self._authority_boot(request)
+        if boot != request.boot_id:
+            raise ControlRejected('BOOT_MISMATCH')
+        if request.kind == 'arm':
+            refusal = self.ledger.arm(self.account_id, request.actor, mode=self.mode, boot_id=boot,
+                lease_ns=self.lease_ns, release_hash=request.payload.get('release_hash'))
+        elif request.kind == 'renew':
+            refusal = self.ledger.renew_lease(self.account_id, request.actor, boot_id=boot, lease_ns=self.lease_ns)
+        else:
+            refusal = self.ledger.disarm(self.account_id, request.actor)
+        after = self._state()
+        if refusal is not None:
+            return response(request, 'rejected', after['permit_epoch'], reason_codes=(refusal,))
+        return response(request, 'completed', after['permit_epoch'], data={
+            'permit': after['permit'], 'lease_deadline_mono_ns': after['lease_deadline_mono_ns']})
+
     def _clear_latch(self, request):
         latch = request.payload.get('latch')
         if latch not in ('kill', 'drawdown', 'daily', 'crisis'):
             raise ControlRejected('INVALID_PAYLOAD')
-        refusal = self.ledger.clear_latch(self.account_id, latch, request.actor)
+        refusal = self.ledger.clear_latch(self.account_id, latch, request.actor, request.payload.get('reason', ''))
         after = self._state()
         if refusal is not None:
             return response(request, 'rejected', after['permit_epoch'], reason_codes=(refusal,))
+        notes = ()
         if self.on_clear is not None:
-            self.on_clear(latch)
-        return response(request, 'completed', after['permit_epoch'], data={'cleared': latch})
+            try:
+                self.on_clear(latch)
+            except Exception as exc:  # the ledger clear is committed; report the mirror failure, never hide it
+                notes = ('MIRROR_FAILED:' + type(exc).__name__,)
+        return response(request, 'completed', after['permit_epoch'], reason_codes=notes, data={'cleared': latch})
 
     def _activate_release(self, request, session):
         """Plan (never apply) an operator activation at the next hourly boundary; the ledger applies it there."""
@@ -409,7 +452,10 @@ class LedgerControlBackend:
             session=session, boundary_us=(now // release.HOUR_US + 1) * release.HOUR_US)
         if type(plan) is not release.ActivationPlan:
             return response(request, 'rejected', row['permit_epoch'], reason_codes=plan.reason_codes)
-        self.ledger.schedule_activation(plan, request.request_id)
+        try:
+            self.ledger.schedule_activation(plan, request.request_id, account_id=self.account_id)
+        except Exception as exc:
+            return response(request, 'rejected', row['permit_epoch'], reason_codes=(str(exc)[:64] or type(exc).__name__,))
         return response(request, 'pending', row['permit_epoch'], reason_codes=('SCHEDULED_AT_BOUNDARY',),
             data={'plan_hash': plan.plan_hash, 'effective_at_us': plan.effective_at_us, 'bundle_hash': plan.approved.bundle_hash})
 
@@ -513,3 +559,114 @@ class UnixControlClient:
                 raise ControlRejected('WRONG_SERVER_PEER')
             _send(connection, raw)
             return _json(_receive(connection))
+
+
+# ---------- uid-bound session issuance for a separate operator CLI process ----------
+
+def issue_session(directory: Path, *, role: str, actor: str, account_id: str, mode: str, boot_id: str,
+        ttl_s: int, nonces: int = 16) -> Path:
+    """Mint a short-lived session bound to the requesting uid (not pid) in a private 0600 file.
+
+    Only operator/reader roles are issuable; model, reflex, brain and the authority worker never are.
+    The hosting authority loads these with ``load_issued_sessions``."""
+    import time
+    if role not in ISSUABLE_ROLES or not _text(actor) or not actor.startswith(role + ':'):
+        raise ControlRejected('ROLE_NOT_ISSUABLE')
+    if type(ttl_s) is not int or not 0 < ttl_s <= MAX_SESSION_TTL_S or type(nonces) is not int or not 0 < nonces <= 256:
+        raise ControlRejected('INVALID_SESSION_LIFETIME')
+    if mode not in ('paper', 'live') or not _text(account_id) or not _text(boot_id):
+        raise ControlRejected('INVALID_SESSION_CONFIGURATION')
+    directory = Path(directory)
+    _private_directory(directory)
+    expires = time.monotonic_ns() + ttl_s * 1_000_000_000
+    session = {'session_id': 'issued-' + secrets.token_hex(12), 'token': secrets.token_urlsafe(32), 'actor': actor,
+        'role': role, 'account_id': account_id, 'mode': mode, 'boot_id': boot_id, 'uid': os.getuid(), 'gid': os.getgid(),
+        'expires_mono_ns': expires, 'nonces': [secrets.token_hex(8) for _ in range(nonces)]}
+    path = directory / (session['session_id'] + '.session.json')
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(descriptor, 'wb') as handle:
+        handle.write(_encoded(session))
+        handle.flush()
+        os.fsync(handle.fileno())
+    return path
+
+
+def _read_private(path: Path) -> dict:
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    with os.fdopen(descriptor, 'rb') as handle:
+        info = os.fstat(handle.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+            raise ControlRejected('UNSAFE_SESSION_FILE')
+        return _json(handle.read(MAX_MESSAGE_BYTES + 1))
+
+
+def load_issued_sessions(directory: Path, *, boot_id: str) -> list[ControlSession]:
+    """Unexpired issued sessions for this boot, owned by this uid with 0600 files; anything else is ignored."""
+    import time
+    now, sessions = time.monotonic_ns(), []
+    for path in sorted(Path(directory).glob('*.session.json')):
+        try:
+            raw = _read_private(path)
+            if raw['boot_id'] != boot_id or raw['expires_mono_ns'] <= now or raw['role'] not in ISSUABLE_ROLES:
+                continue
+            sessions.append(ControlSession(raw['session_id'], raw['actor'], raw['role'], raw['account_id'], raw['mode'],
+                raw['boot_id'], raw['token'], PeerCredentials(0, raw['uid'], raw['gid']), raw['expires_mono_ns'],
+                {nonce: raw['expires_mono_ns'] for nonce in raw['nonces']}, peer_match='uid'))
+        except (ControlRejected, KeyError, TypeError, OSError):
+            continue
+    return sessions
+
+
+def send_request(session_file: Path, socket_path: Path, kind: str, payload: dict, *, epoch: int,
+        request_id: str | None = None) -> dict:
+    """Operator CLI client: one authenticated request with the next unused nonce of an issued session."""
+    session_file = Path(session_file)
+    issued = _read_private(session_file)
+    used_path = session_file.parent / (session_file.name + '.used')
+    used = _read_private(used_path) if used_path.exists() else []
+    nonce = next((n for n in issued['nonces'] if n not in used), None)
+    if nonce is None:
+        raise ControlRejected('SESSION_NONCES_EXHAUSTED')
+    descriptor = os.open(used_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(descriptor, 'wb') as handle:
+        handle.write(_encoded(used + [nonce]))
+        handle.flush()
+        os.fsync(handle.fileno())
+    raw = _encoded({'version': 1, 'request_id': request_id or ('cli-' + secrets.token_hex(8)),
+        'account_id': issued['account_id'], 'mode': issued['mode'], 'kind': kind, 'actor': issued['actor'],
+        'expected_epoch': epoch, 'boot_id': issued['boot_id'], 'deadline_mono_ns': issued['expires_mono_ns'],
+        'session_id': issued['session_id'], 'token': issued['token'], 'nonce': nonce, 'payload': payload})
+    return UnixControlClient(socket_path).request(raw)
+
+
+def main(argv: list[str] | None = None) -> int:
+    import argparse
+    parser = argparse.ArgumentParser(description='Local authenticated control: session issuance and operator requests.')
+    sub = parser.add_subparsers(dest='command', required=True)
+    issue = sub.add_parser('issue-session', help='mint a short-lived uid-bound operator/reader session file (0600)')
+    issue.add_argument('--role', choices=ISSUABLE_ROLES, required=True)
+    issue.add_argument('--actor', required=True)
+    issue.add_argument('--account', required=True)
+    issue.add_argument('--mode', choices=('paper', 'live'), default='paper')
+    issue.add_argument('--boot-id', required=True)
+    issue.add_argument('--ttl-s', type=int, default=900)
+    issue.add_argument('--dir', required=True)
+    req = sub.add_parser('request', help='send one authenticated request using an issued session')
+    req.add_argument('--session', required=True)
+    req.add_argument('--socket', required=True)
+    req.add_argument('--kind', required=True)
+    req.add_argument('--payload', default='{}')
+    req.add_argument('--epoch', type=int, required=True)
+    args = parser.parse_args(argv)
+    if args.command == 'issue-session':
+        path = issue_session(Path(args.dir), role=args.role, actor=args.actor, account_id=args.account, mode=args.mode,
+            boot_id=args.boot_id, ttl_s=args.ttl_s)
+        print(json.dumps({'session_file': str(path)}))
+    else:
+        print(json.dumps(send_request(Path(args.session), Path(args.socket), args.kind, json.loads(args.payload),
+            epoch=args.epoch)))
+    return 0
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())
