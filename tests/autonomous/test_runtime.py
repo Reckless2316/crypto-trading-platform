@@ -9,6 +9,7 @@ from pathlib import Path
 
 from bot.autonomous.contracts import AdvisoryRisk, Direction, Regime
 from bot.autonomous.runtime import (
+    _day,
     Judgment, OfflineReflex, PaperRuntime, RuntimeConfig, Snapshot, Unavailable, main, nightly_review, open_db,
     paper_fill,
 )
@@ -245,7 +246,7 @@ class RuntimeTests(RuntimeCase):
         self.assertFalse(status["live"])
         self.assertFalse(status["reflex_calibrated"])
         self.assertIn("AAVE-USD", status["instruments"])
-        report = nightly_review(self.dir / "runtime.sqlite3", self.dir / "reviews", now_us=self.clock.us)
+        report = nightly_review(self.dir / "runtime.sqlite3", self.dir / "reviews", now_us=self.clock.us, day=_day(self.clock.us))
         self.assertFalse(report["applied"])
         self.assertGreater(report["metrics"]["fills"], 0)
         self.assertIsNotNone(report["metrics"]["brier"])
@@ -293,7 +294,9 @@ def seed_labels(rt, hits, misses, magnitude=0.015, gate_open=1, instrument="AAVE
     for k in range(hits + misses):
         decision_id = "seed-%d-%d" % (gate_open, k)
         hit = k < hits
-        rt.db.execute("INSERT INTO decisions VALUES (?,?,?,?,0,'trending','long',0.85,0,2,'safe',?,'hold','[]',100,0)",
+        rt.db.execute("INSERT INTO decisions(decision_id,instrument,candle_close_us,reflex_id,calibrated,regime,direction,confidence,"
+                      "toxic,quality,risk_state,gate_open,action,reasons,mid,created_us) "
+                      "VALUES (?,?,?,?,0,'trending','long',0.85,0,2,'safe',?,'hold','[]',100,0)",
                       (decision_id, instrument, k * 60_000_000, reflex_id, gate_open))
         rt.db.execute("INSERT INTO labels(decision_id,instrument,direction,confidence,entry_mid,exit_mid,net_return,hit,labeled_us,status) "
                       "VALUES (?,?,?,?,?,?,?,?,?,?)", (decision_id, instrument, "long", 0.85, 100.0, 100.0,
@@ -462,7 +465,7 @@ class ReviewFindingTests(RuntimeCase):
         rt = self.runtime(GOOD, explore_fraction=0.001, horizon_candles=3)
         seed_labels(rt, 1, 1)  # epoch-day rows must not enter today's review
         self.advance(rt, 30, drift=0.004)
-        report = nightly_review(self.dir / "runtime.sqlite3", self.dir / "reviews", now_us=self.clock.us, fill_cap=1)
+        report = nightly_review(self.dir / "runtime.sqlite3", self.dir / "reviews", now_us=self.clock.us, day=_day(self.clock.us), fill_cap=1)
         self.assertNotIn("seed-1-0", [m["decision_id"] for m in report["misses"]])
         self.assertTrue(all(not d.startswith("seed") for d in report["metrics"]["decision_ids_sample"]))
         self.assertEqual(1, len(report["fills"]))
@@ -473,6 +476,101 @@ class ReviewFindingTests(RuntimeCase):
         names = {r[0] for r in rt.db.execute("SELECT name FROM sqlite_master WHERE type='index'")}
         for index in ("decisions_close", "labels_labeled", "fills_instrument", "escalations_created"):
             self.assertIn(index, names)
+
+
+class SecondReviewTests(RuntimeCase):
+    def open_position(self, **config):
+        rt = self.runtime(GOOD, explore_fraction=0.001, **config)
+        self.assertEqual("buy", self.advance(rt, 21)["instruments"]["AAVE-USD"]["status"])
+        good_source = rt.book_source
+        def failing(product):
+            raise ConnectionError("public book outage")
+        rt.book_source = failing
+        self.assertEqual(["ConnectionError"], self.advance(rt, 1)["instruments"]["AAVE-USD"]["reasons"])
+        rt.book_source = good_source
+        return rt
+
+    def test_reduce_exits_during_warmup_after_one_missed_candle(self):
+        rt = self.open_position()
+        rt.reflex = Fixed(replace(GOOD, risk_state=AdvisoryRisk.REDUCE))
+        result = self.advance(rt, 1)["instruments"]["AAVE-USD"]
+        self.assertEqual("sell", result["status"], result["reasons"])
+        self.assertIn("WARMUP", result["reasons"])
+        self.assertEqual({}, rt.positions())
+
+    def test_crisis_exits_during_warmup_and_latches(self):
+        rt = self.open_position()
+        rt.reflex = Fixed(replace(GOOD, regime=Regime.CRISIS))
+        result = self.advance(rt, 1)["instruments"]["AAVE-USD"]
+        self.assertEqual("sell", result["status"], result["reasons"])
+        self.assertIn("CRISIS_HALT", rt.latched())
+
+    def test_time_stop_exits_during_warmup(self):
+        rt = self.open_position(horizon_candles=3)
+        self.advance(rt, 1)
+        self.assertEqual("sell", self.advance(rt, 1)["instruments"]["AAVE-USD"]["status"])
+
+    def test_warmup_never_enters_and_still_latches_crisis(self):
+        rt = self.runtime(replace(GOOD, regime=Regime.CRISIS), explore_fraction=0.001)
+        result = self.advance(rt, 3)["instruments"]["AAVE-USD"]
+        self.assertEqual("warmup", result["status"])
+        self.assertIn("CRISIS_HALT", rt.latched())
+        self.assertEqual(0, rt.db.execute("SELECT COUNT(*) FROM fills").fetchone()[0])
+        rt.reflex = Fixed(GOOD)
+        self.advance(rt, 3)
+        self.assertEqual(0, rt.db.execute("SELECT COUNT(*) FROM fills").fetchone()[0])
+        # Warmup decisions never become calibration labels.
+        self.advance(rt, 70)
+        warm = rt.db.execute("SELECT COUNT(*) FROM labels l JOIN decisions d USING(decision_id) WHERE d.phase='warmup'").fetchone()[0]
+        self.assertEqual(0, warm)
+
+    def test_nightly_review_defaults_to_previous_complete_day(self):
+        rt = self.runtime(GOOD, explore_fraction=0.001, horizon_candles=3)
+        self.advance(rt, 30, drift=0.004)
+        day = _day(self.clock.us)
+        start = int(datetime.strptime(day, "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp()) * 1_000_000
+        run_at = start + 86_400_000_000 + (6 * 60 + 10) * 60_000_000
+        report = nightly_review(self.dir / "runtime.sqlite3", self.dir / "reviews", now_us=run_at)
+        self.assertEqual(day, report["metrics"]["day"])
+        self.assertGreater(report["metrics"]["decisions"], 0)
+        self.assertGreater(report["metrics"]["fills"], 0)
+        self.assertTrue((self.dir / "reviews" / f"nightly-{day}.json").exists())
+        explicit = nightly_review(self.dir / "runtime.sqlite3", self.dir / "reviews", now_us=run_at, day=_day(run_at))
+        self.assertEqual(0, explicit["metrics"]["decisions"])
+
+    def test_first_open_meta_is_atomic(self):
+        import sqlite3
+        db = open_db(self.dir / "runtime.sqlite3")
+        db.execute("CREATE TRIGGER boom BEFORE INSERT ON meta WHEN NEW.key='candle_seconds' "
+                   "BEGIN SELECT RAISE(ABORT, 'injected'); END")
+        db.close()
+        with self.assertRaises(sqlite3.DatabaseError):
+            PaperRuntime(RuntimeConfig(data_dir=self.dir, instruments=("AAVE-USD",)), book_source=lambda p: {}, clock_us=self.clock)
+        db = sqlite3.connect(self.dir / "runtime.sqlite3")
+        self.addCleanup(db.close)
+        self.assertEqual(0, db.execute("SELECT COUNT(*) FROM meta").fetchone()[0])
+
+    def test_calibration_ignores_labels_not_yet_known(self):
+        rt = self.runtime(GOOD)
+        seed_labels(rt, 72, 48)
+        rt.db.execute("DROP TRIGGER labels_no_update")  # test-only: move seeded labels into the future
+        rt.db.execute("UPDATE labels SET labeled_us=?", (self.clock.us + 10**12,))
+        self.assertIn("CALIBRATION_INSUFFICIENT", self.advance(rt, 21)["instruments"]["AAVE-USD"]["reasons"])
+
+    def test_low_confidence_escalations_collapse_per_instrument_hour(self):
+        rt = self.runtime(replace(GOOD, direction_confidence=0.5))
+        self.advance(rt, 40)
+        self.assertEqual(1, rt.db.execute("SELECT COUNT(*) FROM escalations WHERE code='LOW_CONFIDENCE'").fetchone()[0])
+        self.advance(rt, 61)
+        self.assertEqual(2, rt.db.execute("SELECT COUNT(*) FROM escalations WHERE code='LOW_CONFIDENCE'").fetchone()[0])
+
+    def test_status_counts_use_indexes(self):
+        rt = self.runtime()
+        for sql in ("SELECT COUNT(*) FROM labels WHERE status='resolved'",):
+            plan = " ".join(r[3] for r in rt.db.execute("EXPLAIN QUERY PLAN " + sql))
+            self.assertIn("INDEX", plan.upper(), plan)
+        plan = " ".join(r[3] for r in rt.db.execute("EXPLAIN QUERY PLAN " + rt.PENDING_ESCALATIONS_SQL, (0,)))
+        self.assertIn("escalations_created", plan)
 
 
 if __name__ == "__main__":
