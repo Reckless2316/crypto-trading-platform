@@ -20,8 +20,10 @@ An explicit ``--explore-fraction`` permits tiny labeled exploration entries
 #      enforced on Content-Length and while streaming. After the REFLEX the book age is re-checked: exits re-fetch
 #      once (EXIT_BOOK_REFETCHED / EXIT_STALE_BOOK), entries hold STALE_AFTER_REFLEX. Brier is per reflex_id.
 #      Not yet: authenticated provider evaluation, tokenizer proof, measured latency/calibration (vendor claims).
-#   2. Route paper orders through OrderAuthority/Ledger (Task 12/16) instead of this
-#      runtime's own append-only fill table, so paper and live share one accounting path.
+#   2. PARTIAL: `--accounting ledger` routes exits/reduces through OrderAuthority/PaperVenue/Ledger with paper-mark
+#      reconciliation (bot/autonomous/runtime_authority.py); cash/positions read back from the ledger and fills
+#      are mirrored for review. Entries are refused (AUTHORITY_REFUSED:DECISION_PROVENANCE_UNAVAILABLE) until formal
+#      decisions + calibration attestation, release activation and permits exist. Default stays `runtime`.
 #   3. DONE: public Coinbase product details (increments, min funds, status) drive rounding and tradability
 #      (TTL cache). The fee bound stays an ESTIMATE (0.6% taker); account-specific fee tiers need
 #      authenticated evidence (Task 13) before any live use.
@@ -66,6 +68,7 @@ from .sizing import kelly_loss_budget
 from .state import book_metrics, require_token_budget
 
 REFLEX_ID = "offline-reflex-v1"
+LEDGER_ACCOUNT_ID = "runtime-paper"
 SNAPSHOT_VERSION = "paper-snapshot-v1"
 SCHEMA_VERSION = "runtime-v3"
 UPGRADABLE_SCHEMAS = ("runtime-v2",)  # additive migrations only
@@ -107,6 +110,7 @@ class RuntimeConfig:
     close_tolerance_us: int = 10_000_000
     market_rules_ttl_us: int = 3_600_000_000
     reflex_fallback: str = "none"  # "offline" only by explicit operator flag; rows are then labeled offline
+    accounting: str = "runtime"  # "ledger": orders through OrderAuthority/Ledger (bot/autonomous/runtime_authority.py)
     brier_window: int = 2_000
     paper_armed: bool = False
 
@@ -114,6 +118,8 @@ class RuntimeConfig:
         if not (0 < self.max_drawdown <= DRAWDOWN_CEILING and 0 < self.max_daily_loss <= DAILY_LOSS_CEILING
                 and 0 < self.max_position_fraction <= POSITION_CEILING and 0 <= self.explore_fraction <= EXPLORE_CEILING):
             raise ValueError("risk configuration exceeds a hard ceiling")
+        if self.accounting not in ("runtime", "ledger"):
+            raise ValueError("accounting must be runtime or ledger")
         if self.reflex_fallback not in ("none", "offline"):
             raise ValueError("reflex fallback must be none or offline")
         if not self.instruments or any(not i or "/" in i for i in self.instruments):
@@ -399,8 +405,10 @@ class PaperRuntime:
 
     def __init__(self, config: RuntimeConfig, *, book_source: Callable[[str], dict] | None = None,
                  clock_us: Callable[[], int] | None = None, reflex: ReflexPort | None = None,
-                 rules_source: Callable[[str], dict] | None = None):
+                 rules_source: Callable[[str], dict] | None = None, authority=None):
         self.config = config
+        if authority is not None and config.accounting != "ledger":
+            raise ValueError("an authority adapter is only valid with ledger accounting")
         self.clock_us = clock_us or (lambda: time.time_ns() // 1000)
         config.data_dir.mkdir(parents=True, exist_ok=True)
         self.db = open_db(config.data_dir / "runtime.sqlite3")
@@ -409,6 +417,14 @@ class PaperRuntime:
         except Exception:
             self.db.close()
             raise
+        self._owned_ledger = None
+        if config.accounting == "ledger" and authority is None:
+            try:
+                authority = self._open_authority()
+            except Exception:
+                self.db.close()
+                raise
+        self.authority = authority
         self.book_source = book_source or _public_book_source(config.data_dir)
         self.rules_source = rules_source or _public_rules_source(config.data_dir)
         self._rules: dict[str, MarketRules] = {}
@@ -427,10 +443,20 @@ class PaperRuntime:
                                     "WHERE l.decision_id IS NULL AND d.phase='live'").fetchone()[0]
         self._label_floor_us = unlabeled if unlabeled is not None else 0
 
+    def _open_authority(self):
+        from .ledger import Ledger
+        from .runtime_authority import RuntimeAuthority, open_paper_account
+        ledger = Ledger.open(self.config.data_dir / "ledger.sqlite3")
+        self._owned_ledger = ledger
+        ledger._clock_us = self.clock_us
+        open_paper_account(ledger, LEDGER_ACCOUNT_ID, self.config.starting_cash_usd)
+        return RuntimeAuthority(ledger, account_id=LEDGER_ACCOUNT_ID, clock_us=self.clock_us, fee_rate=self.config.fee_rate,
+                                limit_slippage_bps=self.config.max_slippage_bps)
+
     def _bind_meta(self) -> None:
-        """Accounting depends on starting cash and candle cadence; a restart may not silently change them."""
+        """Accounting depends on starting cash, candle cadence and the accounting path; a restart may not change them."""
         expected = {"schema": SCHEMA_VERSION, "starting_cash_usd": str(self.config.starting_cash_usd),
-                    "candle_seconds": str(self.config.candle_seconds)}
+                    "candle_seconds": str(self.config.candle_seconds), "accounting": self.config.accounting}
         with self._tx():  # first-open inserts are all-or-nothing; a concurrent opener sees all rows or none
             stored = {r["key"]: r["value"] for r in self.db.execute("SELECT key, value FROM meta")}
             if not stored:
@@ -443,6 +469,9 @@ class PaperRuntime:
                 schema = SCHEMA_VERSION
             elif schema != SCHEMA_VERSION:
                 raise ValueError(f"unknown runtime schema {schema!r}; refusing to open")
+            if "accounting" not in stored:  # databases from before the ledger path were runtime-accounted
+                self.db.execute("INSERT INTO meta VALUES ('accounting','runtime')")
+                stored["accounting"] = "runtime"
         wrong = sorted(k for k, v in expected.items() if k != "schema" and stored.get(k) != v)
         if wrong:
             raise ValueError("config mismatch with stored runtime meta: " + ", ".join(wrong))
@@ -467,6 +496,8 @@ class PaperRuntime:
 
     # ---------- accounting (derived from append-only rows) ----------
     def positions(self) -> dict[str, Decimal]:
+        if self.authority is not None:
+            return self.authority.view()["positions"]  # the formal ledger is the only accounting source
         held: dict[str, Decimal] = {}
         for r in self.db.execute("SELECT instrument, side, qty FROM fills"):
             q = Decimal(r["qty"])
@@ -474,6 +505,8 @@ class PaperRuntime:
         return {k: v for k, v in held.items() if v > 0}
 
     def cash(self) -> Decimal:
+        if self.authority is not None:
+            return self.authority.view()["cash"]
         cash = self.config.starting_cash_usd
         for r in self.db.execute("SELECT side, notional_usd, fee_usd FROM fills"):
             n, f = Decimal(r["notional_usd"]), Decimal(r["fee_usd"])
@@ -780,6 +813,8 @@ class PaperRuntime:
                 entry_block = "MARKET_UNAVAILABLE"
         except Unavailable as exc:
             rules, entry_block = self._rules.get(instrument), str(exc)
+        if self.authority is not None and rules is not None:
+            self.authority.observe(instrument, bids, asks, event_us, rules)
         warm = snap.history < MIN_HISTORY
         held = account["positions"].get(instrument, Decimal(0))
         bid = Decimal(str(best_bid))
@@ -812,6 +847,8 @@ class PaperRuntime:
         fill, exploration = None, False
         if (self.config.data_dir / "KILL").exists():
             reasons.append("KILL_SWITCH")  # armed kill file: no order path is entered at all
+            if self.authority is not None:
+                self.authority.kill()  # durable in the ledger; removing the file never clears it
         elif sellable and (exit_reason := self._exit_reason(instrument, judgment, snap.candle_close_us, account)):
             # Exits are evaluated independently of escalation, warmup and rules outages; those only block entries.
             if entry_block:
@@ -820,11 +857,22 @@ class PaperRuntime:
                 reasons += ["EXIT_REFUSED_MARKET_HALT", exit_reason]
             elif blocked := self.risk_check("sell", instrument, Decimal(0), account):
                 reasons += blocked
-            elif not book_fresh and (bids := self._refetch_bids(instrument)) is None:
+            elif not book_fresh and (refetched := self._refetch_book(instrument)) is None:
                 reasons += ["EXIT_STALE_BOOK", exit_reason]
+            elif self.authority is not None:
+                if not book_fresh:
+                    reasons.append("EXIT_BOOK_REFETCHED")
+                    self.authority.observe(instrument, *refetched, rules)
+                outcome = self.authority.exit(instrument, snap.candle_close_us)
+                if outcome.ok:
+                    fill, action = (outcome.qty, outcome.avg_price, outcome.notional, outcome.fee), "sell"
+                    reasons += ["EXIT", exit_reason, "LEDGER"]
+                else:
+                    reasons += ["AUTHORITY_REFUSED:" + r for r in outcome.reasons] + [exit_reason]
             else:
                 if not book_fresh:
                     reasons.append("EXIT_BOOK_REFETCHED")
+                    bids = refetched[0]
                     bid = Decimal(str(max(p for p, _ in bids)))
                 raw_limit = bid * (1 - self.config.max_slippage_bps / Decimal(10_000))
                 limit = rules.round_limit(raw_limit, "sell") if rules else raw_limit
@@ -859,6 +907,15 @@ class PaperRuntime:
             if notional > 0:
                 if blocked := self.risk_check("buy", instrument, notional, account):
                     reasons += blocked
+                elif self.authority is not None:
+                    # HANDOFF(claude-opus-5.5 2026-10-17): runtime judgments are not formal decisions; entries on the
+                    # ledger path stay refused until a persisted decision + recorded calibration attestation exist.
+                    outcome = self.authority.entry(instrument, notional, snap.candle_close_us, decision=None)
+                    if outcome.ok:
+                        fill, action = (outcome.qty, outcome.avg_price, outcome.notional, outcome.fee), "buy"
+                        reasons.append("LEDGER")
+                    else:
+                        reasons += ["AUTHORITY_REFUSED:" + r for r in outcome.reasons]
                 else:
                     limit = rules.round_limit(Decimal(str(best_ask)) * (1 + self.config.max_slippage_bps / Decimal(10_000)), "buy")
                     fill = paper_fill(asks, "buy", notional * (1 + self.config.fee_rate), None, limit, self.config.fee_rate, rules)
@@ -883,15 +940,16 @@ class PaperRuntime:
                 "judgment": _judgment_dict(judgment) if judgment else None, "history": snap.history,
                 "gate_open": gate and not warm, "snapshot": json.loads(snap.wire()), "token_estimate": snap.token_estimate()}
 
-    def _refetch_bids(self, instrument: str):
-        """One fresh public book for an exit whose decision book aged during the REFLEX call; None if still stale."""
+    def _refetch_book(self, instrument: str):
+        """One fresh public book (bids, asks, event_us) for an exit whose decision book aged during the REFLEX call;
+        None if it is still stale."""
         try:
             book, event_us, _ = self.observe(instrument)
             now = self.clock_us()
-            bids = _levels(book.get("bids"))
-            if not bids or event_us > now or now - event_us > self.config.max_book_age_us:
+            bids, asks = _levels(book.get("bids")), _levels(book.get("asks"))
+            if not bids or not asks or event_us > now or now - event_us > self.config.max_book_age_us:
                 return None
-            return bids
+            return bids, asks, event_us
         except Exception:
             return None
 
@@ -916,10 +974,14 @@ class PaperRuntime:
         return notional, False, ["SIZE_CAPPED"] if notional < kelly else []
 
     def _exit_reason(self, instrument, judgment: Judgment | None, close_us: int, account) -> str | None:
-        last_buy = self.db.execute("SELECT d.candle_close_us FROM fills f JOIN decisions d USING(decision_id) "
-                                   "WHERE f.instrument=? AND f.side='buy' ORDER BY f.created_us DESC LIMIT 1", (instrument,)).fetchone()
+        if self.authority is not None:
+            entry_close = self.authority.last_entry_close(instrument)
+        else:
+            row = self.db.execute("SELECT d.candle_close_us FROM fills f JOIN decisions d USING(decision_id) "
+                                  "WHERE f.instrument=? AND f.side='buy' ORDER BY f.created_us DESC LIMIT 1", (instrument,)).fetchone()
+            entry_close = row["candle_close_us"] if row else None
         horizon = self.config.horizon_candles * self.config.candle_seconds * 1_000_000
-        if last_buy is not None and close_us - last_buy["candle_close_us"] >= horizon:
+        if entry_close is not None and close_us - entry_close >= horizon:
             return "TIME_STOP"
         if "DRAWDOWN_LATCH" in self.latched() or account["drawdown"] >= self.config.max_drawdown:
             return "DRAWDOWN"
@@ -952,6 +1014,9 @@ class PaperRuntime:
                   "pending_escalations_window_days": PENDING_WINDOW_US // _DAY_US,
                   # Append-only rowid table: MAX(rowid) equals the row count without a scan.
                   "fills": self.db.execute("SELECT COALESCE(MAX(rowid), 0) FROM fills").fetchone()[0],
+                  "accounting": self.config.accounting,
+                  "ledger": {k: v for k, v in self.authority.view().items() if k in ("ready", "reservations", "equity_usd_u")}
+                            if self.authority is not None else None,
                   "dust_usd": {k: str(v) for k, v in self._dust.items()}, "instruments": results}
         path = self.config.data_dir / "status.json"
         tmp = path.with_suffix(".tmp")
@@ -981,6 +1046,8 @@ class PaperRuntime:
 
     def close(self):
         self.db.close()
+        if self._owned_ledger is not None:
+            self._owned_ledger.close()
 
 
 def nightly_review(db_path: Path, out_dir: Path, *, now_us: int | None = None, brain=None, fill_cap: int = 10_000,
@@ -1097,6 +1164,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--review-day", help="UTC day YYYY-MM-DD for --report (default: previous complete day)")
     parser.add_argument("--clear-latch", help="operator: clear one latch kind")
     parser.add_argument("--reflex", choices=("offline", "jev"), default="offline")
+    parser.add_argument("--accounting", choices=("runtime", "ledger"), default="runtime",
+                        help="ledger: route orders through OrderAuthority/Ledger (entries refused until formal evidence exists)")
     parser.add_argument("--reflex-fallback", choices=("none", "offline"), default="none",
                         help="explicit opt-in: judge with the labeled offline reflex when Jev is unavailable")
     parser.add_argument("--jev-model", default=None, help="exact Jev model version (default jev-1.14.0)")
@@ -1105,7 +1174,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     config = RuntimeConfig(tuple(i.strip() for i in args.instruments.split(",") if i.strip()), Path(args.data_dir),
                            args.candle_seconds, args.horizon_candles, explore_fraction=args.explore_fraction,
-                           paper_armed=args.arm_paper, reflex_fallback=args.reflex_fallback)
+                           paper_armed=args.arm_paper, reflex_fallback=args.reflex_fallback,
+                           accounting=args.accounting)
     if args.report:
         print(json.dumps(nightly_review(config.data_dir / "runtime.sqlite3", config.data_dir / "reviews", day=args.review_day)["metrics"], default=str))
         return 0
