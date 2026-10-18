@@ -11,8 +11,11 @@
 | `9492575` | Fixes for 6 Important + minor findings from the independent review |
 | `f735c2d` | Fixes for 2 Important regressions from the re-review (exits during warmup, nightly reviews the previous day) |
 | `16a4d6e` | Live-run bug: local clock ~4 s ahead of Coinbase starved every snapshot; now snapshots the nearest close |
+| `2c294cb` | Preserved untracked Codex live_venue/release/dashboard-authority WIP (NOT ACCEPTED) |
+| `a0001ca` | Public Coinbase product rules (adverse rounding), executable-price labels net of fees, per-regime cohorts |
+| `1f2b02d` | Review fixes: rules outages never block exits, dust frees the slot, short label math, schema runtime-v3 |
 
-Verification: the full suite passes (`.venv/bin/python -m unittest discover -s tests`, 629+ tests on Python 3.14). Two independent contrarian reviews: the first found 6 Important issues; the re-review passed all 6 and found 2 regressions, both now fixed. The live paper process is running against public Coinbase books and accumulating contiguous minute snapshots.
+Verification: the full suite passes (`.venv/bin/python -m unittest discover -s tests`, 652 tests on Python 3.14). Two independent contrarian reviews: the first found 6 Important issues; the re-review passed all 6 and found 2 regressions, both now fixed. The live paper process is running against public Coinbase books and accumulating contiguous minute snapshots.
 
 ## Loop (one cycle per minute close)
 1. **State (code):** public L2 book → mid, spread, imbalance, realized vol, momentum, inventory, drawdown. Observations after the cutoff are rejected, features require contiguous candles, and the snapshot is about 60–70 *estimated* tokens (bytes/3, not a provider tokenizer), well under the 400 limit.
@@ -46,7 +49,7 @@ Verification: the full suite passes (`.venv/bin/python -m unittest discover -s t
 - **Organic vs incentive:** no candidate has a proven organic-demand decomposition. Token-level theses stay research-only.
 - **Priced in:** no catalyst has synchronized announcement/price/positioning evidence. Assume anything known is priced in.
 - **Value accrual:** no candidate clears the entitlement and cash-flow gates. Protocol activity is not token value.
-- **Costs and slippage:** paper fills execute at zero latency against the same book that produced the signal and take all displayed depth. This is optimistic. Labels subtract fees but not spread or market impact, so the Kelly edge is overstated until that is fixed.
+- **Costs and slippage:** labels now use the best ask in and the best bid out, net of an *estimated* 0.6% taker fee per side. They still ignore depth beyond the top of book, latency and market impact, and paper fills execute against the same book that produced the signal. The edge is still somewhat overstated.
 - **Calibration sample:** 100 labels per cohort is a floor, not proof. Minute-candle labels overlap and are autocorrelated, so the effective sample size is much smaller than the row count.
 - **Clock:** the local clock was ~4 s off the venue. The runtime now tolerates ±10 s, but a larger skew silently holds forever. Monitor `AWAY_FROM_CLOSE` and `FUTURE_OBSERVATION` rates.
 - **Hard limits delegated to the model?** None: the drawdown, daily, position, kill and arm checks are all in code and tighten-only. The model can trigger a crisis halt but cannot clear one. The KILL file blocks exits too, so a killed account with an open position stays exposed until the operator acts. That trade-off is set by the project's global constraints.
