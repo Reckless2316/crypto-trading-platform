@@ -326,7 +326,7 @@ def seed_labels(rt, hits, misses, magnitude=0.015, gate_open=1, instrument="AAVE
                       (decision_id, instrument, k * 60_000_000, reflex_id, regime, gate_open))
         mid = magnitude if mid_magnitude is None else mid_magnitude
         rt.db.execute("INSERT INTO labels(decision_id,instrument,direction,confidence,entry_mid,exit_mid,net_return,hit,labeled_us,"
-                      "status,mid_return,exec_return,regime) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                      "status,mid_return,exec_return,regime,label_version) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,'exec-v1')",
                       (decision_id, instrument, "long", 0.85, 100.0, 100.0, magnitude if hit else -magnitude, int(hit), 0,
                        "resolved", mid if hit else -mid, magnitude if hit else -magnitude, regime))
 
@@ -658,7 +658,7 @@ class MarketRulesAndCostLabelTests(RuntimeCase):
 
     def test_fill_rounds_to_base_increment_tick_and_min_funds(self):
         from bot.autonomous.runtime import MarketRules
-        rules = MarketRules.parse(online_rules(base_increment="0.001", quote_increment="0.05", min_market_funds="10"), 0)
+        rules = MarketRules.parse(online_rules(base_increment="0.001", quote_increment="0.05", min_market_funds="10"), 0, "AAVE-USD")
         asks = [(100.0, 0.3337), (100.05, 10.0)]
         qty, avg, notional, fee = paper_fill(asks, "buy", D("50.30"), None, D("100.07"), D("0.006"), rules)
         self.assertEqual(qty, qty.quantize(D("0.001")))
@@ -717,6 +717,154 @@ class MarketRulesAndCostLabelTests(RuntimeCase):
         self.assertIn("phase", {r["name"] for r in rt.db.execute("PRAGMA table_info(decisions)")})
         old = rt.db.execute("SELECT * FROM labels WHERE decision_id='old'").fetchone()
         self.assertIsNone(old["exec_return"])  # legacy mid-only labels never feed executable calibration
+
+
+class RulesOutageAndDustTests(RuntimeCase):
+    def held(self, **config):
+        config.setdefault("explore_fraction", 0.001)
+        rt = self.runtime(GOOD, **config)
+        self.assertEqual("buy", self.advance(rt, 21)["instruments"]["AAVE-USD"]["status"])
+        return rt
+
+    def test_rules_outage_never_blocks_crisis_or_reduce_exit(self):
+        for judgment, latched in ((replace(GOOD, regime=Regime.CRISIS), True), (replace(GOOD, risk_state=AdvisoryRisk.REDUCE), False)):
+            with self.subTest(judgment.regime):
+                self.tmp = tempfile.TemporaryDirectory(); self.addCleanup(self.tmp.cleanup); self.dir = Path(self.tmp.name)
+                rt = self.held(market_rules_ttl_us=60_000_000)
+                self.rules.fail = True
+                rt.reflex = Fixed(judgment)
+                before = rt.db.execute("SELECT COUNT(*) FROM decisions").fetchone()[0]
+                result = self.advance(rt, 2)["instruments"]["AAVE-USD"]
+                self.assertEqual({}, rt.positions(), result["reasons"])
+                self.assertEqual("sell", rt.db.execute("SELECT side FROM fills ORDER BY created_us DESC LIMIT 1").fetchone()[0])
+                self.assertEqual(latched, "CRISIS_HALT" in rt.latched())
+                self.assertGreater(rt.db.execute("SELECT COUNT(*) FROM decisions").fetchone()[0], before)
+
+    def test_rules_outage_with_no_cache_exits_with_default_rounding(self):
+        rt = self.held()
+        rt._rules.clear()
+        self.rules.fail = True
+        rt.reflex = Fixed(replace(GOOD, risk_state=AdvisoryRisk.REDUCE))
+        result = self.advance(rt, 1)["instruments"]["AAVE-USD"]
+        self.assertEqual("sell", result["status"], result["reasons"])
+        self.assertIn("MARKET_RULES_UNAVAILABLE", result["reasons"])
+
+    def test_untradable_flags_block_entries_but_only_real_halts_block_exits(self):
+        rt = self.held()
+        rt._rules.clear()
+        self.rules.changes = dict(status="delisted")
+        rt.reflex = Fixed(replace(GOOD, risk_state=AdvisoryRisk.REDUCE))
+        self.assertEqual("sell", self.advance(rt, 1)["instruments"]["AAVE-USD"]["status"])  # status alone does not trap
+        rt.reflex = Fixed(GOOD)
+        result = self.advance(rt, 1)["instruments"]["AAVE-USD"]
+        self.assertIn("MARKET_UNAVAILABLE", result["reasons"])
+        self.assertIn("decision_id", result)  # the decision is still recorded
+        for flag in ("trading_disabled", "cancel_only"):
+            with self.subTest(flag):
+                self.tmp = tempfile.TemporaryDirectory(); self.addCleanup(self.tmp.cleanup); self.dir = Path(self.tmp.name)
+                rt = self.held()
+                rt._rules.clear()
+                self.rules.changes = {flag: True}
+                rt.reflex = Fixed(replace(GOOD, risk_state=AdvisoryRisk.REDUCE))
+                result = self.advance(rt, 1)["instruments"]["AAVE-USD"]
+                self.assertEqual("hold", result["status"])
+                self.assertIn("EXIT_REFUSED_MARKET_HALT", result["reasons"])
+
+    def test_dust_below_increment_does_not_pin_the_entry_slot(self):
+        rt = self.held()
+        rt._rules.clear()
+        self.rules.changes = dict(base_increment="0.01")
+        rt.reflex = Fixed(replace(GOOD, risk_state=AdvisoryRisk.REDUCE))
+        self.assertEqual("sell", self.advance(rt, 1)["instruments"]["AAVE-USD"]["status"])
+        remainder = rt.positions()["AAVE-USD"]
+        self.assertTrue(D(0) < remainder < D("0.01"))
+        rt.reflex = Fixed(GOOD)
+        status = self.advance(rt, 1)
+        self.assertEqual("buy", status["instruments"]["AAVE-USD"]["status"], status["instruments"]["AAVE-USD"]["reasons"])
+        self.assertIn("AAVE-USD", status["dust_usd"])
+
+    def test_sub_minimum_value_is_flat_for_entries_and_still_sellable(self):
+        rt = self.held(rules=FakeRules(min_market_funds="5"))
+        self.price["v"] *= 0.45
+        status = self.advance(rt, 1)
+        self.assertNotIn("ENTRY_SLOT_OCCUPIED", status["instruments"]["AAVE-USD"]["reasons"])
+        self.assertIn("AAVE-USD", status["dust_usd"])
+        self.tmp = tempfile.TemporaryDirectory(); self.addCleanup(self.tmp.cleanup); self.dir = Path(self.tmp.name)
+        self.price["v"] = 100.0
+        rt = self.held(rules=FakeRules(min_market_funds="5"))
+        self.price["v"] *= 0.45
+        rt.reflex = Fixed(replace(GOOD, risk_state=AdvisoryRisk.REDUCE))
+        result = self.advance(rt, 1)["instruments"]["AAVE-USD"]
+        self.assertEqual("sell", result["status"], result["reasons"])  # reduce-only sells ignore min funds
+        self.assertEqual({}, rt.positions())
+
+    def test_short_label_is_relative_to_entry_proceeds(self):
+        rt = self.runtime(replace(GOOD, direction=Direction.SHORT), horizon_candles=3)
+        rt.book_source.spread = 0.0018
+        self.advance(rt, 25)
+        row = rt.db.execute("SELECT * FROM labels WHERE status='resolved' LIMIT 1").fetchone()
+        self.assertAlmostEqual(1 - 1.0009 / 0.9991 - 0.012, row["exec_return"], places=9)
+
+    def test_entry_refreshes_rules_older_than_five_minutes(self):
+        rt = self.runtime(GOOD, explore_fraction=0.001)
+        self.advance(rt, 20)
+        calls = self.rules.calls
+        self.assertEqual(1, calls)
+        self.assertEqual("buy", self.advance(rt, 1)["instruments"]["AAVE-USD"]["status"])
+        self.assertEqual(2, self.rules.calls)
+
+    def test_rules_identity_and_flags_are_validated(self):
+        from bot.autonomous.runtime import MarketRules
+        with self.assertRaises(Unavailable):
+            MarketRules.parse(online_rules(id="ETH-USD"), 0, "AAVE-USD")
+        missing = online_rules()
+        del missing["cancel_only"]
+        with self.assertRaises(Unavailable):
+            MarketRules.parse(missing, 0, "AAVE-USD")
+
+    def test_exploration_below_min_funds_holds(self):
+        rt = self.runtime(GOOD, explore_fraction=0.001, rules=FakeRules(min_market_funds="20"))
+        result = self.advance(rt, 21)["instruments"]["AAVE-USD"]
+        self.assertIn("BELOW_MIN_FUNDS", result["reasons"])
+        self.assertEqual(0, rt.db.execute("SELECT COUNT(*) FROM fills").fetchone()[0])
+
+    def test_legacy_mid_labels_never_enter_brier(self):
+        rt = self.runtime()
+        rt.db.execute("INSERT INTO labels(decision_id,instrument,direction,confidence,hit,labeled_us,status) "
+                      "VALUES ('legacy','AAVE-USD','long',0.9,0,0,'resolved')")
+        self.assertEqual((None, 0), rt.brier())
+        report = nightly_review(self.dir / "runtime.sqlite3", self.dir / "reviews", now_us=86_400_000_000, day="1970-01-01")
+        self.assertEqual(0, report["metrics"]["resolved_labels"])
+
+    def test_schema_upgrade_from_v2_is_accepted_and_unknown_refused(self):
+        import sqlite3
+        db = open_db(self.dir / "runtime.sqlite3")
+        for k, v in (("schema", "runtime-v2"), ("starting_cash_usd", "10000"), ("candle_seconds", "60")):
+            db.execute("INSERT INTO meta VALUES (?,?)", (k, v))
+        db.close()
+        rt = self.runtime()
+        self.assertEqual("runtime-v3", rt.schema_version())
+        rt.close()
+        other = self.dir / "other"
+        db = open_db(other / "runtime.sqlite3")
+        db.execute("INSERT INTO meta VALUES ('schema','runtime-v9')")
+        db.close()
+        with self.assertRaisesRegex(ValueError, "schema"):
+            PaperRuntime(RuntimeConfig(data_dir=other, instruments=("AAVE-USD",)), book_source=lambda p: {},
+                         rules_source=FakeRules(), clock_us=self.clock)
+
+    def test_failed_product_fetch_is_logged(self):
+        from data.public_metrics import fetch_coinbase_product
+        seen = []
+        class Log:
+            def record(self, **kw): seen.append(kw)
+        def getter(url, **kw):
+            raise ConnectionError("down")
+        with self.assertRaises(ConnectionError):
+            fetch_coinbase_product(Log(), "AAVE-USD", getter=getter)
+        self.assertEqual([False], [r["ok"] for r in seen])
+        from bot.autonomous.runtime import MarketRules
+        self.assertFalse(hasattr(MarketRules, "ceil_fee"))
 
 
 if __name__ == "__main__":

@@ -814,10 +814,16 @@ def fetch_coinbase_product(log: DataCallLog, product: str, *, getter: Callable =
         raise ValueError("invalid product")
     url = PRODUCT_URL.format(product=product)
     started = time.time()
-    response = getter(url, timeout=timeout, headers={"User-Agent": "SURGE-paper-platform/1.0"})
+    try:
+        response = getter(url, timeout=timeout, headers={"User-Agent": "SURGE-paper-platform/1.0"})
+        response.raise_for_status()
+        payload = response.json()
+    except Exception as exc:
+        log.record(source="coinbase-product", symbol=product, timeframe=None, started_at=started,
+                   elapsed_ms=int((time.time() - started) * 1000), ok=False, row_count=0,
+                   status_code=getattr(getattr(exc, "response", None), "status_code", None), body=str(exc)[:500].encode())
+        raise
     elapsed = int((time.time() - started) * 1000)
-    response.raise_for_status()
-    payload = response.json()
     log.record(source="coinbase-product", symbol=product, timeframe=None, started_at=started, elapsed_ms=elapsed,
                ok=isinstance(payload, dict), row_count=1, status_code=response.status_code, body=response.content)
     if not isinstance(payload, dict):

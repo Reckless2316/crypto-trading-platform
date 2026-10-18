@@ -28,7 +28,11 @@ An explicit ``--explore-fraction`` permits tiny labeled exploration entries
 #      methods and still need the authenticated control path.
 #   6. Warmup (fewer than 20 contiguous candles) gates entries only; exits and the crisis latch still act.
 #      Warmup decisions are stored with phase='warmup' and never labeled or used for calibration.
-#   7. A database created before `runtime-v2` meta adopts the current config on first open; it is not
+#   7. Rules outages/untradable flags block entries only; exits use stale cached rules (or LOT/µUSD) and stop
+#      only on trading_disabled/cancel_only. Dust (< base increment or < min funds) is flat for the entry slot
+#      and reported as status.dust_usd; sub-increment dust is never sold. Schema runtime-v3 upgrades v2 in place;
+#      Brier/nightly read label_version='exec-v1' only.
+#   8. A database created before `runtime-v2` meta adopts the current config on first open; it is not
 #      re-validated against the config that produced its historical rows.
 """
 from __future__ import annotations
@@ -58,7 +62,10 @@ from .state import book_metrics, require_token_budget
 
 REFLEX_ID = "offline-reflex-v1"
 SNAPSHOT_VERSION = "paper-snapshot-v1"
-SCHEMA_VERSION = "runtime-v2"
+SCHEMA_VERSION = "runtime-v3"
+UPGRADABLE_SCHEMAS = ("runtime-v2",)  # additive migrations only
+LABEL_VERSION = "exec-v1"
+ENTRY_RULES_MAX_AGE_US = 5 * 60 * 1_000_000
 _DAY_US = 86_400 * 1_000_000
 _HOUR_US = 3_600 * 1_000_000
 PENDING_WINDOW_US = 7 * _DAY_US
@@ -208,21 +215,32 @@ class MarketRules:
     fetched_us: int
 
     @classmethod
-    def parse(cls, raw: dict, fetched_us: int) -> "MarketRules":
+    def parse(cls, raw: dict, fetched_us: int, instrument: str) -> "MarketRules":
+        if not isinstance(raw, dict) or raw.get("id") != instrument:
+            raise Unavailable("MARKET_RULES_UNAVAILABLE")
         try:
             increments = [Decimal(str(raw[k])) for k in ("base_increment", "quote_increment", "min_market_funds")]
         except Exception as exc:
             raise Unavailable("MARKET_RULES_UNAVAILABLE") from exc
-        flags = [raw.get(k, False) for k in ("trading_disabled", "post_only", "limit_only", "cancel_only")]
+        flags = [raw.get(k) for k in ("trading_disabled", "post_only", "limit_only", "cancel_only")]  # required, never defaulted
         if (any(not x.is_finite() or x < 0 for x in increments) or increments[0] <= 0 or increments[1] <= 0
                 or any(type(f) is not bool for f in flags) or not isinstance(raw.get("status"), str)):
             raise Unavailable("MARKET_RULES_UNAVAILABLE")
-        return cls(str(raw.get("id")), *increments, raw["status"], *flags, fetched_us)
+        return cls(instrument, *increments, raw["status"], *flags, fetched_us)
 
     @property
     def tradable(self) -> bool:
         # limit_only is compatible with IOC limit orders; post_only cannot take liquidity; cancel_only cannot trade.
         return self.status == "online" and not (self.trading_disabled or self.post_only or self.cancel_only)
+
+    @property
+    def halted(self) -> bool:
+        """A real venue halt: no order of any kind, exits included."""
+        return self.trading_disabled or self.cancel_only
+
+    def is_dust(self, qty: Decimal, bid: Decimal) -> bool:
+        """Below one base increment, or worth less than the venue minimum: flat for the entry slot."""
+        return qty < self.base_increment or qty * bid < self.min_market_funds
 
     @staticmethod
     def _step(value: Decimal, step: Decimal, rounding) -> Decimal:
@@ -237,9 +255,6 @@ class MarketRules:
 
     def floor_quote(self, usd: Decimal) -> Decimal:
         return self._step(usd, self.quote_increment, ROUND_FLOOR)
-
-    def ceil_fee(self, usd: Decimal) -> Decimal:
-        return self._step(usd, self.quote_increment, ROUND_CEILING)
 
 
 _SCHEMA = """
@@ -256,7 +271,7 @@ CREATE TABLE IF NOT EXISTS equity_marks(mark_id INTEGER PRIMARY KEY AUTOINCREMEN
   cash_usd TEXT, high_water_usd TEXT, day_open_usd TEXT, day TEXT);
 CREATE TABLE IF NOT EXISTS labels(decision_id TEXT PRIMARY KEY, instrument TEXT, direction TEXT, confidence REAL,
   entry_mid REAL, exit_mid REAL, net_return REAL, hit INTEGER, labeled_us INTEGER, status TEXT DEFAULT 'resolved',
-  mid_return REAL, exec_return REAL, regime TEXT);
+  mid_return REAL, exec_return REAL, regime TEXT, label_version TEXT);
 CREATE TABLE IF NOT EXISTS escalations(escalation_id TEXT PRIMARY KEY, decision_id TEXT, code TEXT, payload TEXT,
   status TEXT, created_us INTEGER);
 CREATE TABLE IF NOT EXISTS escalation_resolutions(escalation_id TEXT PRIMARY KEY, note TEXT, resolved_us INTEGER);
@@ -269,6 +284,7 @@ CREATE INDEX IF NOT EXISTS decisions_created ON decisions(created_us);
 CREATE INDEX IF NOT EXISTS labels_labeled ON labels(labeled_us);
 CREATE INDEX IF NOT EXISTS labels_instrument ON labels(instrument, direction);
 CREATE INDEX IF NOT EXISTS labels_status ON labels(status);
+CREATE INDEX IF NOT EXISTS labels_version ON labels(label_version, status, labeled_us);
 CREATE INDEX IF NOT EXISTS labels_cohort ON labels(instrument, direction, regime);
 CREATE INDEX IF NOT EXISTS fills_instrument ON fills(instrument, created_us);
 CREATE INDEX IF NOT EXISTS fills_created ON fills(created_us);
@@ -290,6 +306,7 @@ def open_db(path: Path) -> sqlite3.Connection:
     # returns and regimes, so they can never enter cost-aware, per-regime calibration.
     for table, column, decl in (("labels", "status", "TEXT DEFAULT 'resolved'"), ("labels", "mid_return", "REAL"),
                                 ("labels", "exec_return", "REAL"), ("labels", "regime", "TEXT"),
+                                ("labels", "label_version", "TEXT"),
                                 ("decisions", "phase", "TEXT DEFAULT 'live'")):
         if column not in {r["name"] for r in db.execute(f"PRAGMA table_info({table})")}:
             db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
@@ -324,7 +341,7 @@ def _levels(rows) -> list[tuple[float, float]]:
 def paper_fill(levels, side: str, budget_usd: Decimal | None, qty: Decimal | None, limit: Decimal, fee_rate: Decimal,
                rules: MarketRules | None = None):
     """Adverse IOC paper fill. Walk levels to the limit; round qty down to the base increment and the fee up to the
-    quote increment (µUSD without rules). Fills below the venue's minimum funds do not happen.
+    quote increment (µUSD without rules). Buys below the venue's minimum funds do not happen.
 
     Buys spend at most ``budget_usd`` including fee. Sells sell at most ``qty``.
     Returns (qty, avg_price, notional, fee) or None when nothing fills.
@@ -349,7 +366,8 @@ def paper_fill(levels, side: str, budget_usd: Decimal | None, qty: Decimal | Non
     if filled <= 0:
         return None
     fee = MarketRules._step(notional * fee_rate, fee_step, ROUND_CEILING)
-    if (side == "buy" and notional + fee > budget_usd) or (rules and notional < rules.min_market_funds):
+    # Minimum funds bind entries only; a reduce-only sell may close a position worth less than the minimum.
+    if side == "buy" and (notional + fee > budget_usd or (rules and notional < rules.min_market_funds)):
         return None
     return filled, (notional / filled), notional, fee
 
@@ -376,6 +394,7 @@ class PaperRuntime:
         self.book_source = book_source or _public_book_source(config.data_dir)
         self.rules_source = rules_source or _public_rules_source(config.data_dir)
         self._rules: dict[str, MarketRules] = {}
+        self._dust: dict[str, Decimal] = {}
         self.reflex = reflex or OfflineReflex()
         self.jev_note = "jev_configured_unwired" if os.environ.get("JEV_API_KEY") else "jev_not_configured"
         if self.db.execute("SELECT COUNT(*) FROM equity_marks").fetchone()[0] == 0:
@@ -397,9 +416,23 @@ class PaperRuntime:
                 for key, value in expected.items():
                     self.db.execute("INSERT INTO meta VALUES (?,?)", (key, value))
                 return
-        wrong = sorted(k for k, v in expected.items() if stored.get(k) != v)
+            schema = self._stored_schema(stored)
+            if schema in UPGRADABLE_SCHEMAS:
+                self.db.execute("INSERT INTO meta VALUES (?,?)", ("schema@" + SCHEMA_VERSION, schema))  # append-only upgrade record
+                schema = SCHEMA_VERSION
+            elif schema != SCHEMA_VERSION:
+                raise ValueError(f"unknown runtime schema {schema!r}; refusing to open")
+        wrong = sorted(k for k, v in expected.items() if k != "schema" and stored.get(k) != v)
         if wrong:
             raise ValueError("config mismatch with stored runtime meta: " + ", ".join(wrong))
+
+    @staticmethod
+    def _stored_schema(stored: dict) -> str | None:
+        upgrades = [k.partition("@")[2] for k in stored if k.startswith("schema@")]
+        return max(upgrades) if upgrades else stored.get("schema")
+
+    def schema_version(self) -> str | None:
+        return self._stored_schema({r["key"]: r["value"] for r in self.db.execute("SELECT key, value FROM meta")})
 
     @contextmanager
     def _tx(self):
@@ -478,13 +511,14 @@ class PaperRuntime:
         received = self.clock_us()
         return book, parse_event_us(book.get("exchange_time")), received
 
-    def market_rules(self, instrument: str, now: int) -> MarketRules:
+    def market_rules(self, instrument: str, now: int, max_age_us: int | None = None) -> MarketRules:
         """Cached public product details; a failed refresh never extends a cache past its TTL."""
         cached = self._rules.get(instrument)
-        if cached is not None and now - cached.fetched_us < self.config.market_rules_ttl_us:
+        age_limit = min(self.config.market_rules_ttl_us, max_age_us or self.config.market_rules_ttl_us)
+        if cached is not None and now - cached.fetched_us < age_limit:
             return cached
         try:
-            rules = MarketRules.parse(self.rules_source(instrument), now)
+            rules = MarketRules.parse(self.rules_source(instrument), now, instrument)
         except Exception as exc:
             raise Unavailable("MARKET_RULES_UNAVAILABLE") from exc
         self._rules[instrument] = rules
@@ -535,7 +569,7 @@ class PaperRuntime:
         with no wins returns p=0; with no losses the loss per dollar is floored at the round-trip fee."""
         rows = self.db.execute("SELECT l.hit, l.exec_return FROM labels l JOIN decisions d USING(decision_id) "
                                "WHERE l.instrument=? AND l.direction='long' AND l.regime=? AND l.status='resolved' "
-                               "AND l.exec_return IS NOT NULL AND d.reflex_id=? AND d.gate_open=1 AND d.phase='live' "
+                               "AND l.exec_return IS NOT NULL AND l.label_version='" + LABEL_VERSION + "' AND d.reflex_id=? AND d.gate_open=1 AND d.phase='live' "
                                "AND l.labeled_us<=?", (instrument, regime, reflex_id, now_us)).fetchall()
         n = len(rows)
         if n < self.config.min_labels:
@@ -549,7 +583,7 @@ class PaperRuntime:
         return Decimal(str(wilson_lower(len(wins), n))), Decimal(str(statistics.fmean(wins))), max(loss, cost), n
 
     _LABEL_INSERT = ("INSERT INTO labels(decision_id,instrument,direction,confidence,entry_mid,exit_mid,net_return,hit,"
-                     "labeled_us,status,mid_return,exec_return,regime) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)")
+                     "labeled_us,status,mid_return,exec_return,regime,label_version) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
 
     def label_matured(self, now: int) -> int:
         """Label each decision from the snapshot at exactly close+horizon; a missing close is UNRESOLVABLE.
@@ -573,7 +607,7 @@ class PaperRuntime:
                     pending.append(d["candle_close_us"])
                     continue
                 self.db.execute(self._LABEL_INSERT, (d["decision_id"], d["instrument"], d["direction"], d["confidence"], d["mid"],
-                                None, None, None, now, "unresolvable", None, None, d["regime"]))
+                                None, None, None, now, "unresolvable", None, None, d["regime"], LABEL_VERSION))
                 count += 1
                 continue
             mid_return = later["mid"] / d["mid"] - 1
@@ -581,12 +615,12 @@ class PaperRuntime:
                 exec_return = later["best_bid"] / entry["best_ask"] - 1 - cost
                 net, hit = exec_return, exec_return > 0
             elif d["direction"] == "short":
-                exec_return = entry["best_bid"] / later["best_ask"] - 1 - cost
+                exec_return = 1 - later["best_ask"] / entry["best_bid"] - cost  # sell at bid0, buy back at ask_h
                 net, hit = exec_return, exec_return > 0
             else:  # neutral is not a trade: it is right when the move stays inside the round-trip cost
                 exec_return, net, hit = None, -abs(mid_return), abs(mid_return) < cost
             self.db.execute(self._LABEL_INSERT, (d["decision_id"], d["instrument"], d["direction"], d["confidence"], d["mid"],
-                            later["mid"], net, int(hit), now, "resolved", mid_return, exec_return, d["regime"]))
+                            later["mid"], net, int(hit), now, "resolved", mid_return, exec_return, d["regime"], LABEL_VERSION))
             count += 1
         self._label_floor_us = min(pending) if pending else max(self._label_floor_us, now - horizon - step)
         return count
@@ -594,7 +628,7 @@ class PaperRuntime:
     def brier(self, kind: str = "all") -> tuple[float | None, int]:
         """Binary Brier of the predicted choice over the last ``brier_window`` resolved labels."""
         where = {"all": "", "directional": "AND direction IN ('long','short')", "neutral": "AND direction='neutral'"}[kind]
-        rows = self.db.execute(f"SELECT confidence, hit FROM labels WHERE status='resolved' {where} "
+        rows = self.db.execute(f"SELECT confidence, hit FROM labels WHERE label_version='{LABEL_VERSION}' AND status='resolved' {where} "
                                "ORDER BY labeled_us DESC LIMIT ?", (self.config.brier_window,)).fetchall()
         if not rows:
             return None, 0
@@ -659,18 +693,26 @@ class PaperRuntime:
                             content_hash(snap.wire())))
         except sqlite3.IntegrityError:
             raise Unavailable("DUPLICATE_CANDLE")
-        # The snapshot is kept for feature continuity even when no order could be placed.
+        # Missing or untradable rules block the ENTRY path only. Exits use the last cached rules even when expired
+        # (default LOT/µUSD rounding without any) and are refused only by a real venue halt.
+        entry_block = None
         try:
             rules = self.market_rules(instrument, cutoff)
+            if not rules.tradable:
+                entry_block = "MARKET_UNAVAILABLE"
         except Unavailable as exc:
-            return {"status": "hold", "reasons": [str(exc)], "snapshot": json.loads(snap.wire())}
-        if not rules.tradable:
-            return {"status": "hold", "reasons": ["MARKET_UNAVAILABLE"], "market_status": rules.status,
-                    "snapshot": json.loads(snap.wire())}
+            rules, entry_block = self._rules.get(instrument), str(exc)
         warm = snap.history < MIN_HISTORY
         held = account["positions"].get(instrument, Decimal(0))
+        bid = Decimal(str(best_bid))
+        dust = held > 0 and (rules.is_dust(held, bid) if rules else held < LOT)
+        sellable = held > 0 and (rules.floor_qty(held) if rules else MarketRules._step(held, LOT, ROUND_FLOOR)) > 0
+        if dust:
+            self._dust[instrument] = held * bid
+        else:
+            self._dust.pop(instrument, None)
         judgment = self.reflex.judge(snap)
-        if warm and held <= 0 and judgment.regime is not Regime.CRISIS:
+        if warm and (held <= 0 or dust) and judgment.regime is not Regime.CRISIS:
             # Warmup gates entries only: with no position and no crisis there is nothing for code to do.
             return {"status": "warmup", "reasons": ["WARMUP"], "history": snap.history, "snapshot": json.loads(snap.wire())}
         decision_id = content_hash((instrument, snap.candle_close_us, judgment.reflex_id))
@@ -686,26 +728,43 @@ class PaperRuntime:
         fill, exploration = None, False
         if (self.config.data_dir / "KILL").exists():
             reasons.append("KILL_SWITCH")  # armed kill file: no order path is entered at all
-        elif held > 0:
-            # Exits are evaluated independently of escalation; escalation only blocks entries.
-            exit_reason = self._exit_reason(instrument, judgment, snap.candle_close_us, account)
-            if exit_reason is None:
-                if not escalate:
-                    reasons.append("ENTRY_SLOT_OCCUPIED")  # one entry per instrument until its exit
+        elif sellable and (exit_reason := self._exit_reason(instrument, judgment, snap.candle_close_us, account)):
+            # Exits are evaluated independently of escalation, warmup and rules outages; those only block entries.
+            if entry_block:
+                reasons.append(entry_block)
+            if rules is not None and rules.halted:
+                reasons += ["EXIT_REFUSED_MARKET_HALT", exit_reason]
             elif blocked := self.risk_check("sell", instrument, Decimal(0), account):
                 reasons += blocked
             else:
-                limit = rules.round_limit(Decimal(str(best_bid)) * (1 - self.config.max_slippage_bps / Decimal(10_000)), "sell")
-                fill = paper_fill(bids, "sell", None, rules.floor_qty(held), limit, self.config.fee_rate, rules)
+                raw_limit = bid * (1 - self.config.max_slippage_bps / Decimal(10_000))
+                limit = rules.round_limit(raw_limit, "sell") if rules else raw_limit
+                qty = rules.floor_qty(held) if rules else MarketRules._step(held, LOT, ROUND_FLOOR)
+                fill = paper_fill(bids, "sell", None, qty, limit, self.config.fee_rate, rules)
                 action = "sell" if fill else "hold"
                 reasons += ["EXIT", exit_reason] if fill else ["EXIT_UNFILLED", exit_reason]
+        elif held > 0 and not dust:
+            if not escalate:
+                reasons.append("ENTRY_SLOT_OCCUPIED")  # one entry per instrument until its exit
         elif escalate or warm:
             pass
+        elif entry_block:
+            reasons.append(entry_block)
         elif not gate:
             reasons.append("ENTRY_GATE_REFUSED")
         else:
-            notional, exploration, sizing = self._entry_notional(instrument, judgment, account, rules)
+            try:  # entries never act on product rules older than five minutes
+                rules = self.market_rules(instrument, cutoff, max_age_us=ENTRY_RULES_MAX_AGE_US)
+            except Unavailable as exc:
+                rules, notional, sizing = None, Decimal(0), [str(exc)]
+            else:
+                notional, exploration, sizing = self._entry_notional(instrument, judgment, account, rules)
+                if rules.tradable is False:
+                    notional, sizing = Decimal(0), ["MARKET_UNAVAILABLE"]
             reasons += sizing
+            if notional > 0 and notional < rules.min_market_funds * (1 + self.config.fee_rate):
+                notional = Decimal(0)
+                reasons.append("BELOW_MIN_FUNDS")
             if notional > 0:
                 if blocked := self.risk_check("buy", instrument, notional, account):
                     reasons += blocked
@@ -778,13 +837,14 @@ class PaperRuntime:
                   "day_open_usd": mark["day_open_usd"], "positions": {k: str(v) for k, v in self.positions().items()},
                   "latches": sorted(self.latched()), "brier": brier, "brier_window_labels": resolved,
                   "brier_directional": self.brier("directional")[0], "brier_neutral": self.brier("neutral")[0],
-                  "resolved_labels": self.db.execute("SELECT COUNT(*) FROM labels WHERE status='resolved'").fetchone()[0],  # index-only
-                  "unresolvable_labels": self.db.execute("SELECT COUNT(*) FROM labels WHERE status='unresolvable'").fetchone()[0],
+                  "resolved_labels": self.db.execute("SELECT COUNT(*) FROM labels WHERE label_version=? AND status='resolved'", (LABEL_VERSION,)).fetchone()[0],  # index-only
+                  "unresolvable_labels": self.db.execute("SELECT COUNT(*) FROM labels WHERE label_version=? AND status='unresolvable'", (LABEL_VERSION,)).fetchone()[0],
                   "labeled_this_cycle": labeled,
                   "pending_escalations": self.db.execute(self.PENDING_ESCALATIONS_SQL, (now - PENDING_WINDOW_US,)).fetchone()[0],
                   "pending_escalations_window_days": PENDING_WINDOW_US // _DAY_US,
                   # Append-only rowid table: MAX(rowid) equals the row count without a scan.
-                  "fills": self.db.execute("SELECT COALESCE(MAX(rowid), 0) FROM fills").fetchone()[0], "instruments": results}
+                  "fills": self.db.execute("SELECT COALESCE(MAX(rowid), 0) FROM fills").fetchone()[0],
+                  "dust_usd": {k: str(v) for k, v in self._dust.items()}, "instruments": results}
         path = self.config.data_dir / "status.json"
         tmp = path.with_suffix(".tmp")
         tmp.write_text(json.dumps(status, indent=2, default=str))
@@ -831,7 +891,9 @@ def nightly_review(db_path: Path, out_dir: Path, *, now_us: int | None = None, b
                                              (*window, fill_cap + 1))]
         decisions = [dict(r) for r in db.execute("SELECT * FROM decisions WHERE created_us>=? AND created_us<? ORDER BY created_us",
                                                  window)]
-        labels = [dict(r) for r in db.execute("SELECT * FROM labels WHERE labeled_us>=? AND labeled_us<?", window)]
+        # Legacy mid-based labels (no label_version) are never mixed into executable metrics.
+        labels = [dict(r) for r in db.execute("SELECT * FROM labels WHERE label_version=? AND labeled_us>=? AND labeled_us<?",
+                                              (LABEL_VERSION, *window))]
         escalations = db.execute("SELECT code, COUNT(*) n FROM escalations WHERE created_us>=? AND created_us<? GROUP BY code",
                                  window).fetchall()
     finally:
