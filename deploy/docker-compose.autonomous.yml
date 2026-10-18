@@ -1,0 +1,83 @@
+# Autonomous PAPER runtime overlay. Use it only together with the base file:
+#   docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.autonomous.yml --project-directory . config
+# Runbook: docs/runbooks/autonomous-paper.md
+#
+# Safety contract (verified statically by tests/test_autonomous_deployment.py):
+#   - the runtime is paper-only (`--paper`, no `--arm-paper` by default) and gets NO venue/provider secrets;
+#   - it runs as the non-root image user with a read-only root filesystem, all capabilities dropped,
+#     and exactly one writable volume (the runtime data dir);
+#   - it publishes no ports and sits on its own egress-only network (public Coinbase books), not the dashboard's;
+#   - the dashboard gets that volume READ-ONLY and reads status.json via AUTONOMOUS_RUNTIME_DIR.
+# Deploying this overlay never arms paper fills and cannot arm live trading.
+#
+# HANDOFF(claude-opus-5.5 2026-10-17): the plan's four-role split (authority / reflex / brain / dashboard with
+# file-mounted, role-specific secrets) is not packaged here. This overlay packages only the credential-free
+# paper runtime that exists today. `--reflex jev` is deliberately unsupported in this container (no JEV_API_KEY);
+# it needs a separate REFLEX role with a Docker secret once Tasks 13/18 land.
+
+services:
+  surge:
+    environment:
+      AUTONOMOUS_RUNTIME_DIR: /var/lib/surge-runtime/runtime
+    volumes:
+      - autonomous-runtime:/var/lib/surge-runtime:ro
+
+  surge-paper-runtime:
+    # Same image the base `surge` service builds; never pulled from a registry.
+    # Build first: docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.autonomous.yml --project-directory . build surge
+    image: surge-paper:local
+    pull_policy: never
+    container_name: surge-paper-runtime
+    # A STOP-file exit is a clean exit (code 0) and must stay stopped; crashes restart.
+    restart: on-failure
+    user: surge
+    working_dir: /app
+    # Mirrors deploy/autonomous/surge-paper-runtime.service: clear a stale STOP, keep KILL.
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - rm -f /var/lib/surge/runtime/STOP && exec python -m bot.autonomous.runtime --paper --data-dir /var/lib/surge/runtime
+    environment:
+      PYTHONDONTWRITEBYTECODE: "1"
+      PYTHONUNBUFFERED: "1"
+      HOME: /tmp
+      TZ: UTC
+    # /var/lib/surge exists in the image owned by `surge`, so a fresh named volume inherits that ownership.
+    # This volume is the runtime's ONLY writable path (runtime.sqlite3, ledger.sqlite3, public_calls.sqlite3,
+    # status.json, reviews/, STOP, KILL, jev_schema.*.json). It is not the dashboard's surge-data volume.
+    volumes:
+      - autonomous-runtime:/var/lib/surge
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    networks:
+      - autonomous-egress
+    # SIGINT runs the runtime's `finally: runtime.close()`; SQLite commits are atomic either way.
+    stop_signal: SIGINT
+    stop_grace_period: 90s
+    healthcheck:
+      # Healthy only when status.json was written within the last 180 s (one cycle per 60 s candle close).
+      test:
+        - CMD
+        - python
+        - -c
+        - "import json,sys,time; s=json.load(open('/var/lib/surge/runtime/status.json')); age=time.time()-s['at_us']/1e6; sys.exit(0 if s.get('mode')=='paper' and s.get('live') is False and -30<age<180 else 1)"
+      interval: 60s
+      timeout: 5s
+      retries: 3
+      start_period: 180s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+networks:
+  autonomous-egress:
+    driver: bridge
+
+volumes:
+  autonomous-runtime:

@@ -5,3 +5,6 @@ Description=SURGE nightly review (fills, misses, Brier, schema proposal; never a
 Type=oneshot
 WorkingDirectory=%h/crypto-trading-platform
 ExecStart=%h/crypto-trading-platform/.venv/bin/python -m bot.autonomous.runtime --paper --report --data-dir data/autonomous/runtime
+# The nightly review needs no secrets; strip anything inherited.
+UnsetEnvironment=COINBASE_API_KEY COINBASE_API_SECRET SURGE_COINBASE_API_KEY SURGE_COINBASE_API_SECRET SURGE_BINANCE_API_KEY SURGE_BINANCE_API_SECRET BINANCE_API_KEY BINANCE_API_SECRET KRAKEN_API_KEY KRAKEN_API_SECRET JEV_API_KEY ANTHROPIC_API_KEY OPENAI_API_KEY SURGE_LIVE_TRADING_ENABLED SURGE_LIVE_TRADING_ARMED SURGE_LIVE_EXCHANGE SURGE_LIVE_MAX_ORDER_QUOTE
+NoNewPrivileges=true
