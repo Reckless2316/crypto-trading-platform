@@ -1,0 +1,1243 @@
+{
+  "regime": {
+    "coinbase_BTC-USD": {
+      "last_completed_open": "2026-10-17T00:00:00Z",
+      "last_close": 81378.21,
+      "completed_rows": 349,
+      "gaps": 0,
+      "sma20": 83403.2555,
+      "sma50": 81320.4764,
+      "sma200": 72424.50945,
+      "ret_7d": -0.018484805357082523,
+      "ret_30d": 0.0658749574649169,
+      "ret_90d": 0.2581318881453172,
+      "rv30_annualized": 0.378827026714423,
+      "high_90d": 86594.94,
+      "source": "coinbase_candles_BTC-USD",
+      "url": "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=86400",
+      "retrieved_at": "2026-10-18T12:55:55.697986+00:00",
+      "status": 200,
+      "sha256": "ec5ab6cbd3beaed8a0ed5ce92f95c89b013ccd1cd2fc148d1e84cf93f50cde8a"
+    },
+    "coinbase_ETH-USD": {
+      "last_completed_open": "2026-10-17T00:00:00Z",
+      "last_close": 2399.68,
+      "completed_rows": 349,
+      "gaps": 0,
+      "sma20": 2571.462,
+      "sma50": 2551.427,
+      "sma200": 2146.1882,
+      "ret_7d": -0.041607757622231345,
+      "ret_30d": -0.018712378958387954,
+      "ret_90d": 0.28264088214699945,
+      "rv30_annualized": 0.43487457302796395,
+      "high_90d": 2775.58,
+      "source": "coinbase_candles_ETH-USD",
+      "url": "https://api.exchange.coinbase.com/products/ETH-USD/candles?granularity=86400",
+      "retrieved_at": "2026-10-18T12:55:56.127882+00:00",
+      "status": 200,
+      "sha256": "dba93a777ae5c8ed25818a554b9770b4fa49b47fc4836b12a854060b914a86a4"
+    },
+    "kraken_XBTUSD": {
+      "last_completed_open": "2026-10-17T00:00:00Z",
+      "last_close": 81382.0,
+      "sma20": 83404.81999999999,
+      "sma50": 81322.02,
+      "sma200": 72425.02,
+      "ret_7d": -0.01846158670505238,
+      "ret_30d": 0.06583999958090381,
+      "error": [],
+      "source": "kraken_ohlc_XBTUSD",
+      "url": "https://api.kraken.com/0/public/OHLC?pair=XBTUSD&interval=1440",
+      "retrieved_at": "2026-10-18T12:55:57.031208+00:00",
+      "status": 200,
+      "sha256": "c83572c052465e73821ff0b9601324aba9f776acacef7a75e92f9656e7405157"
+    },
+    "kraken_ETHUSD": {
+      "last_completed_open": "2026-10-17T00:00:00Z",
+      "last_close": 2399.7,
+      "sma20": 2571.4685,
+      "sma50": 2551.4426000000003,
+      "sma200": 2146.1828,
+      "ret_7d": -0.041687798761226746,
+      "ret_30d": -0.018664071253895242,
+      "error": [],
+      "source": "kraken_ohlc_ETHUSD",
+      "url": "https://api.kraken.com/0/public/OHLC?pair=ETHUSD&interval=1440",
+      "retrieved_at": "2026-10-18T12:55:57.656394+00:00",
+      "status": 200,
+      "sha256": "a434387ddbfe8bba3eafb8a79b1e57fd342da5193e084a6e94cae8f6be6cde45"
+    },
+    "dominance": {
+      "btc_pct": 60.06077644203637,
+      "eth_pct": 10.76383441923923,
+      "total_mcap_usd": 2731446978839.1616,
+      "mcap_change_24h_pct": -3.5017977387333366,
+      "updated_at": "2026-10-18T12:47:54Z",
+      "classification": "secondary aggregate",
+      "source": "coingecko_global",
+      "url": "https://api.coingecko.com/api/v3/global",
+      "retrieved_at": "2026-10-18T12:55:58.121096+00:00",
+      "status": 200,
+      "sha256": "641b98dfd46682b850215b699638b51f090f26fa521df31ecf637ded8ac09404"
+    },
+    "stablecoins": {
+      "as_of": "2026-10-18T00:00:00Z",
+      "pegged_usd": 304583783932.55,
+      "chg_7d": -0.004863632104284754,
+      "chg_30d": 0.0052871882530372005,
+      "chg_90d": 0.011424653848143729,
+      "classification": "secondary aggregate",
+      "source": "defillama_stablecoincharts_all",
+      "url": "https://stablecoins.llama.fi/stablecoincharts/all",
+      "retrieved_at": "2026-10-18T12:55:58.702857+00:00",
+      "status": 200,
+      "sha256": "b77a60b038e9bfcf88f18a933d3809dbf67060eb134f3963804d2f5bf8103b4a"
+    },
+    "circle": {
+      "usdc-in-circulation": 72.48,
+      "usdc-issued-7": 10.9,
+      "usdc-redeemed-7": 11.43,
+      "usdc-issued-30": 43.85,
+      "usdc-redeemed-30": 44.98,
+      "as_of_label": "Oct 15, 2026",
+      "net_7d_derived_B": -0.53,
+      "net_30d_derived_B": -1.13,
+      "unit": "USD billions (issuer page)",
+      "source": "circle_transparency",
+      "url": "https://www.circle.com/transparency",
+      "retrieved_at": "2026-10-18T12:55:59.242613+00:00",
+      "status": 200,
+      "sha256": "03fdf2ff9a34ef87d66afdf1ecd201b3e1db75aa2b44f497345057055ca304bb"
+    },
+    "deribit_BTC": {
+      "oi_usd": 842914190,
+      "funding_8h_projected": 4.091e-05,
+      "current_funding": 0.0,
+      "creation_timestamp": "2026-10-18T12:55:58.010000Z",
+      "hist_points": 720,
+      "hist_first": "2026-09-18T13:00:00Z",
+      "hist_last": "2026-10-18T12:00:00Z",
+      "mean_interest_8h_30d": 4.566056934591362e-05,
+      "mean_interest_8h_7d": 5.026359274823554e-05,
+      "summary": {
+        "source": "deribit_summary_BTC",
+        "url": "https://www.deribit.com/api/v2/public/get_book_summary_by_currency?currency=BTC&kind=future",
+        "retrieved_at": "2026-10-18T12:55:59.780399+00:00",
+        "status": 200,
+        "sha256": "527f4b230f4ce829302affff2d098286e6a30b22ebaf25218c53373eb46cde93"
+      },
+      "history": {
+        "source": "deribit_funding_history_BTC",
+        "url": "https://www.deribit.com/api/v2/public/get_funding_rate_history?instrument_name=BTC-PERPETUAL&start_timestamp=1789736155000&end_timestamp=1792328155000",
+        "retrieved_at": "2026-10-18T12:56:00.739931+00:00",
+        "status": 200,
+        "sha256": "8d1238d333293eb50e342f76d3fbf1dcb696ac7d2ac570664ef999c6caf35e3c"
+      }
+    },
+    "okx_BTC": {
+      "funding_current": 4.42678673826e-05,
+      "next_funding_time": "2026-10-18T16:00:00Z",
+      "settled_points": 100,
+      "settled_first": "2026-09-15T08:00:00Z",
+      "settled_last": "2026-10-18T08:00:00Z",
+      "mean_settled_last21": 4.332725176164762e-05,
+      "mean_settled_all": 4.2675931485359e-05,
+      "oi_contracts": "3044683.07000001006",
+      "oi_ccy": "30446.8307000001006",
+      "oi_usd": "2494764592.62888824300304",
+      "oi_ts": "2026-10-18T12:56:05.524000Z",
+      "oi_hist_last_day": "2026-10-17T16:00:00Z",
+      "oi_hist_usd_last": 3330882020.9391,
+      "oi_chg_7d": 0.008469195223895332,
+      "oi_chg_30d": 0.14212820555880867,
+      "funding": {
+        "source": "okx_funding_BTC-USDT-SWAP",
+        "url": "https://www.okx.com/api/v5/public/funding-rate?instId=BTC-USDT-SWAP",
+        "retrieved_at": "2026-10-18T12:56:05.054904+00:00",
+        "status": 200,
+        "sha256": "9576dbad583acdd6eef7efbb7945f84fa78bc932bcab2082ab471ad855de55eb"
+      },
+      "history": {
+        "source": "okx_funding_history_BTC-USDT-SWAP",
+        "url": "https://www.okx.com/api/v5/public/funding-rate-history?instId=BTC-USDT-SWAP&limit=100",
+        "retrieved_at": "2026-10-18T12:56:05.615295+00:00",
+        "status": 200,
+        "sha256": "3f52ad506a293ce01ec8e7202b5a56b6a947feddbed1236c7864bcad575a1d2d"
+      },
+      "oi": {
+        "source": "okx_oi_BTC-USDT-SWAP",
+        "url": "https://www.okx.com/api/v5/public/open-interest?instType=SWAP&instId=BTC-USDT-SWAP",
+        "retrieved_at": "2026-10-18T12:56:06.174951+00:00",
+        "status": 200,
+        "sha256": "58bedad1ac26a2ec19e10700b83b6f7a26fc138263766c4fa48bb03dfba7a186"
+      },
+      "oi_history": {
+        "source": "okx_oi_history_BTC",
+        "url": "https://www.okx.com/api/v5/rubik/stat/contracts/open-interest-volume?ccy=BTC&period=1D",
+        "retrieved_at": "2026-10-18T12:56:08.401885+00:00",
+        "status": 200,
+        "sha256": "7c1181142a3e599ee7289091195938c094429e46fc26d7a0a2fdf8c3c21d2657"
+      }
+    },
+    "deribit_ETH": {
+      "oi_usd": 244469054,
+      "funding_8h_projected": 7.3e-05,
+      "current_funding": 0.000123,
+      "creation_timestamp": "2026-10-18T12:55:59.086000Z",
+      "hist_points": 720,
+      "hist_first": "2026-09-18T13:00:00Z",
+      "hist_last": "2026-10-18T12:00:00Z",
+      "mean_interest_8h_30d": 3.369834664428569e-05,
+      "mean_interest_8h_7d": 3.633192102176691e-05,
+      "summary": {
+        "source": "deribit_summary_ETH",
+        "url": "https://www.deribit.com/api/v2/public/get_book_summary_by_currency?currency=ETH&kind=future",
+        "retrieved_at": "2026-10-18T12:56:01.280007+00:00",
+        "status": 200,
+        "sha256": "eb13aca2ec2f677e45ad4f5fca86b7066069978a9316024edfe5fe30bc3bea2c"
+      },
+      "history": {
+        "source": "deribit_funding_history_ETH",
+        "url": "https://www.deribit.com/api/v2/public/get_funding_rate_history?instrument_name=ETH-PERPETUAL&start_timestamp=1789736155000&end_timestamp=1792328155000",
+        "retrieved_at": "2026-10-18T12:56:01.823677+00:00",
+        "status": 200,
+        "sha256": "4a802345fac26983fa1ccf2bd31159bff5e3546e8d6e77b3da14e3259306d7ad"
+      }
+    },
+    "okx_ETH": {
+      "funding_current": 9.2465926792e-05,
+      "next_funding_time": "2026-10-18T16:00:00Z",
+      "settled_points": 100,
+      "settled_first": "2026-09-15T08:00:00Z",
+      "settled_last": "2026-10-18T08:00:00Z",
+      "mean_settled_last21": 3.289035023227619e-05,
+      "mean_settled_all": 3.2980833721483e-05,
+      "oi_contracts": "5895504.3300000243",
+      "oi_ccy": "589550.43300000243",
+      "oi_usd": "1424766531.431105872581",
+      "oi_ts": "2026-10-18T12:56:07.182000Z",
+      "oi_hist_last_day": "2026-10-17T16:00:00Z",
+      "oi_hist_usd_last": 1731763440.1912,
+      "oi_chg_7d": -0.045108674913881486,
+      "oi_chg_30d": -0.025637157508732078,
+      "funding": {
+        "source": "okx_funding_ETH-USDT-SWAP",
+        "url": "https://www.okx.com/api/v5/public/funding-rate?instId=ETH-USDT-SWAP",
+        "retrieved_at": "2026-10-18T12:56:06.723924+00:00",
+        "status": 200,
+        "sha256": "92c47c48a500b617a9b3d4f5bf855f5757746198beb2c7784ef5d8483fe254a7"
+      },
+      "history": {
+        "source": "okx_funding_history_ETH-USDT-SWAP",
+        "url": "https://www.okx.com/api/v5/public/funding-rate-history?instId=ETH-USDT-SWAP&limit=100",
+        "retrieved_at": "2026-10-18T12:56:07.282232+00:00",
+        "status": 200,
+        "sha256": "6bcbedb6f55f62dcbb8b61431d2ccfddfadb3995efe8be74b07ad1a38e0e3c96"
+      },
+      "oi": {
+        "source": "okx_oi_ETH-USDT-SWAP",
+        "url": "https://www.okx.com/api/v5/public/open-interest?instType=SWAP&instId=ETH-USDT-SWAP",
+        "retrieved_at": "2026-10-18T12:56:07.840072+00:00",
+        "status": 200,
+        "sha256": "c76f99feca9aff0ea6c2f70c4c12ff050273f01931638c6529c5bceaa60c5e50"
+      },
+      "oi_history": {
+        "source": "okx_oi_history_ETH",
+        "url": "https://www.okx.com/api/v5/rubik/stat/contracts/open-interest-volume?ccy=ETH&period=1D",
+        "retrieved_at": "2026-10-18T12:56:08.960545+00:00",
+        "status": 200,
+        "sha256": "2b94488ebe98f6326116dae3c5dce3def1799b815da48cfc828a02148b859758"
+      }
+    },
+    "fed_calendar_2026_text": {
+      "text": " January 27-28 Statement: PDF | HTML Implementation Note Press Conference Statement on Longer-Run Goals and Monetary Policy Strategy Minutes: PDF | HTML (Released February 18, 2026) March 17-18* Statement: PDF | HTML Implementation Note Press Conference Projection Materials PDF | HTML Minutes: PDF | HTML (Released April 08, 2026) April 28-29 Statement: PDF | HTML Implementation Note Press Conference Minutes: PDF | HTML (Released May 20, 2026) June 16-17* Statement: PDF | HTML Implementation Note Press Conference Projection Materials PDF | HTML Minutes: PDF | HTML (Released July 08, 2026) July 28-29 Statement: PDF | HTML Implementation Note Press Conference Minutes: PDF | HTML (Released August 19, 2026) September 15-16* Statement: PDF | HTML Implementation Note Press Conference Projection Materials PDF | HTML Minutes: PDF | HTML (Released October 07, 2026) October 27-28 December 8-9* * Meeting associated with a Summary of Economic Projections. 2025 FOMC Meetings January 28-29 Statement: PDF | HTML Implementation Note Press Conference Minutes: PDF | HTML (Released February 19, 2025) March 18-19* Statement: PDF | HTML Implementation Note Press Conference Projection Materials PDF | HTM",
+      "source": "fed_fomc_calendar",
+      "url": "https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm",
+      "retrieved_at": "2026-10-18T12:56:09.494840+00:00",
+      "status": 200,
+      "sha256": "4533e3f81df875e1af20d22136b087983daf057c159bfa193aa7db6259942bb6"
+    },
+    "fed_h15_text": {
+      "release": null,
+      "excerpt": "Federal funds (effective) 1 2 3 3.88 3.88 3.88 3.88 3.88 Commercial Paper 3 4 5 6 Nonfinancial 1-month 3.96 3.96 3.96 3.97 2-month 4.03 4.02 n.a. 4.01 3-month 4.09 4.09 n.a. n.a. Financial 1-month n.a. n.a. n.a. n.a. 2-month n.a. n.a. n.a. 4.09 3-month n.a. 4.08 n.a. n.a. Bank prime loan 2 3 7 7.00 7.00 7.00 7.00 7.00 Discount window primary credit 2 8 4.00 4.00 4.00 4.00 4.00 U.S. government securities Treasury bills (secondary market) 3 4 4-week 3.96 3.91 3.93 4.00 3-month 4.06 4.09 4.10 4.10 6-month 4.18 4.20 4.23 4.21 1-year 4.26 4.27 4.30 4.27 Treasury constant maturities Nominal 9 1-month 4.13 4.10 4.11 4.17 3-month 4.25 4.26 4.28 4.28 6-month 4.32 4.34 4.37 4.35 1-year 4.47 4.48 4.53 4.49 2-year 4.80 4.79 4.82 4.77 3-year 4.89 4.90 4.92 4.85 5-year 5.02 5.00 5.00 4.91 7-year 5.13 5.11 5.09 5.00 10-year 5.24 5.21 5.19 5.10 20-year 5.65 5.60 5.57 5.48 30-year 5.60 5.56 5.52 5.43 Inflation indexed 10 5-year 2.68 2.67 2.64 2.58 7-year 2.79 2.77 2.73 2.67 10-year 2.91 2.88 2.84 2.78 20-year 3.17 3.13 3.09 3.03 30-year 3.32 3.28 3.24 3.18 Inflation-indexed long-term average 11 3.32 3.27 3.23 3.17 * Markets closed. n.a. Not available. Footnotes 1. As of March 1, 2016, the daily effective federal funds rate (EFFR) is a volume-weighted median of transaction-level data collected from depository institutions in the Report of Selected Money Market Rates (FR 2420). Prior to March 1, 2016, the EFFR was a volume-weighted mean of rates on brokered trades. 2. Weekly figures are average",
+      "source": "fed_h15",
+      "url": "https://www.federalreserve.gov/releases/h15/",
+      "retrieved_at": "2026-10-18T12:56:10.013829+00:00",
+      "status": 200,
+      "sha256": "ed6e4b2600b2e8da6bc480fc37e4e64cc1dfc9c648376ad38e244f1f55728b00"
+    }
+  },
+  "candidates": {
+    "AAVE": {
+      "price": {
+        "last": 153.62,
+        "trade_time": "2026-10-18T12:55:57.510429343Z",
+        "source": "coinbase_ticker_AAVE",
+        "url": "https://api.exchange.coinbase.com/products/AAVE-USD/ticker",
+        "retrieved_at": "2026-10-18T12:56:10.494794+00:00",
+        "status": 200,
+        "sha256": "349fd224d066e8358c8758a26278dc816b4036e3a2a2f1b4ec97fe04bd0e7f63"
+      },
+      "daily": {
+        "last_completed_open": "2026-10-17T00:00:00Z",
+        "last_close": 151.65,
+        "completed_rows": 349,
+        "gaps": 0,
+        "sma20": 166.5885,
+        "sma50": 146.7294,
+        "sma200": 104.85715,
+        "ret_7d": -0.09903754752851701,
+        "ret_30d": 0.17997198879551823,
+        "ret_90d": 0.6953605366126328,
+        "rv30_annualized": 0.8355961164236524,
+        "high_90d": 184.1,
+        "source": "coinbase_candles_AAVE",
+        "url": "https://api.exchange.coinbase.com/products/AAVE-USD/candles?granularity=86400",
+        "retrieved_at": "2026-10-18T12:56:10.924224+00:00",
+        "status": 200,
+        "sha256": "a821f51a3838b74925f3d781974b6a08f05e1d1542b2effbe643f5f6e8a3d676"
+      },
+      "fees": {
+        "dailyFees": {
+          "total24h": 1153917,
+          "total7d": 8715221,
+          "total30d": 38454072,
+          "total1y": 683021607.26,
+          "annualized1y": 683021607.26,
+          "totalAllTime": 2334991802.26,
+          "methodology": null,
+          "source": "defillama_fees_aave_dailyFees",
+          "url": "https://api.llama.fi/summary/fees/aave?dataType=dailyFees&excludeTotalDataChart=true&excludeTotalDataChartBreakdown=true",
+          "retrieved_at": "2026-10-18T12:56:23.959741+00:00",
+          "status": 200,
+          "sha256": "d7395b33480d79a700374b2fd394e76173705e3593ce183eba72c61716845598"
+        },
+        "dailyRevenue": {
+          "total24h": 148841,
+          "total7d": 1217577,
+          "total30d": 5034362,
+          "total1y": 88313133.43,
+          "annualized1y": 88313133.43,
+          "totalAllTime": 315832573.43,
+          "methodology": null,
+          "source": "defillama_fees_aave_dailyRevenue",
+          "url": "https://api.llama.fi/summary/fees/aave?dataType=dailyRevenue&excludeTotalDataChart=true&excludeTotalDataChartBreakdown=true",
+          "retrieved_at": "2026-10-18T12:56:25.082527+00:00",
+          "status": 200,
+          "sha256": "f2476ab128802cfda650cfbd876c9f770f90f18ee3fb1d5c1c06aceaa257a3d0"
+        },
+        "dailyHoldersRevenue": {
+          "total24h": 0,
+          "total7d": 0,
+          "total30d": 0,
+          "total1y": 17786404,
+          "annualized1y": 17786404,
+          "totalAllTime": 42944371,
+          "methodology": null,
+          "source": "defillama_fees_aave_dailyHoldersRevenue",
+          "url": "https://api.llama.fi/summary/fees/aave?dataType=dailyHoldersRevenue&excludeTotalDataChart=true&excludeTotalDataChartBreakdown=true",
+          "retrieved_at": "2026-10-18T12:56:26.157853+00:00",
+          "status": 200,
+          "sha256": "0deedce168b6251cf98dece60ef16980bdfbcd73d4cbfda2d13573d61b35bbb6"
+        }
+      },
+      "tvl": {
+        "children": [
+          [
+            "Aave V3",
+            "aave-v3",
+            16970338505.301056,
+            "Lending"
+          ],
+          [
+            "Aave V4",
+            "aave-v4",
+            658506452.9025538,
+            "Lending"
+          ],
+          [
+            "Aave Horizon RWA",
+            "aave-horizon-rwa",
+            254295129.77744085,
+            "Lending"
+          ],
+          [
+            "Aave V2",
+            "aave-v2",
+            106782252.1802302,
+            "Lending"
+          ],
+          [
+            "Aave V1",
+            "aave-v1",
+            7590697.610569812,
+            "Lending"
+          ],
+          [
+            "Aave Aptos",
+            "aave-aptos",
+            386729.16550294595,
+            "Lending"
+          ],
+          [
+            "Aave Arc",
+            "aave-arc",
+            57248.73026183101,
+            "Lending"
+          ]
+        ],
+        "sum_reported": 17997957015.667614,
+        "null_children": [],
+        "classification": "secondary aggregate",
+        "source": "defillama_protocols",
+        "url": "https://api.llama.fi/protocols",
+        "retrieved_at": "2026-10-18T12:56:42.929502+00:00",
+        "status": 200,
+        "sha256": "ed79fbc0f31cef5f4f200b17d52e296d6a86365d16d37b0a47e1b2cd73a44423"
+      },
+      "chain_supply": {
+        "symbol": "AAVE",
+        "decimals": 18,
+        "total_supply": 16000000.0,
+        "chain": "ethereum",
+        "address": "0x7Fc66500c84A76Ad7e9c93437bFc5Ac33E2DDaE9",
+        "source": "rpc_AAVE_totalSupply",
+        "url": "https://ethereum-rpc.publicnode.com",
+        "retrieved_at": "2026-10-18T12:56:46.200557+00:00",
+        "status": 200,
+        "sha256": "ba6c2a3b1dbdae6e26fe332c05ba3f4230c67272bbe607f818fc9beeea140823"
+      },
+      "gecko": {
+        "circulating": 15436325.280222055,
+        "total": 16000000.0,
+        "max": 16000000.0,
+        "mcap_usd": 2371813480,
+        "fdv_usd": 2458422907,
+        "last_updated": "2026-10-18T12:55:49.000Z",
+        "classification": "secondary aggregate",
+        "source": "coingecko_coin_aave",
+        "url": "https://api.coingecko.com/api/v3/coins/aave?localization=false&tickers=false&market_data=true&community_data=false&developer_data=false&sparkline=false",
+        "retrieved_at": "2026-10-18T12:56:43.405923+00:00",
+        "status": 200,
+        "sha256": "d522cf1d16f02521a4fe500152961110d5b364567385ebf2413e0d4d29d62a2e"
+      },
+      "top_holders": {
+        "top10_share_pct": 44.07,
+        "top1_share_pct": 15.46,
+        "addresses": [
+          "0x4da27a545c0c5b758a6ba100e3a049001de870f5",
+          "0xa700b4eb416be35b2911fd5dee80678ff64ff6c9",
+          "0x494aa25fa055d370424ed9db3839e76ee3e9e945",
+          "0xf977814e90da44bfa03b6295a0616a897441acec",
+          "0x25f2226b597e8f9514b3f68f00f494cf4f286491",
+          "0x5a52e96bacdabb82fd05763e25335261b270efcb",
+          "0x47ac0fb4f2d84898e4d9e7b4dab3c24507a6d503",
+          "0xc9480602f77769c7a1e67011edea533bc8ac9fbe",
+          "0x1d48963dd8fada6ab5c2c7b92eba81ecc5030270",
+          "0x46e946468f747d0e563527bd069d4ded731f33a4"
+        ],
+        "classification": "secondary indexer; address-level, not entity-adjusted",
+        "source": "ethplorer_top_holders_AAVE",
+        "url": "https://api.ethplorer.io/getTopTokenHolders/0x7Fc66500c84A76Ad7e9c93437bFc5Ac33E2DDaE9?apiKey=freekey&limit=10",
+        "retrieved_at": "2026-10-18T12:56:53.822742+00:00",
+        "status": 200,
+        "sha256": "212865348529376607b224f3e6e9ed0320f0c96384bffc3e16b667725a556d5a"
+      }
+    },
+    "HYPE": {
+      "price": {
+        "last": 78.66,
+        "trade_time": "2026-10-18T12:56:09.336073234Z",
+        "source": "coinbase_ticker_HYPE",
+        "url": "https://api.exchange.coinbase.com/products/HYPE-USD/ticker",
+        "retrieved_at": "2026-10-18T12:56:11.348889+00:00",
+        "status": 200,
+        "sha256": "12738cd130d00b21a674cf4162848e3b15e26a9c62ccaaaacebb02fba0916e71"
+      },
+      "daily": {
+        "last_completed_open": "2026-10-17T00:00:00Z",
+        "last_close": 77.99,
+        "completed_rows": 255,
+        "gaps": 0,
+        "sma20": 85.9575,
+        "sma50": 85.9692,
+        "sma200": 63.661049999999996,
+        "ret_7d": -0.08687507317644305,
+        "ret_30d": -0.08344106240451299,
+        "ret_90d": 0.27789611666393577,
+        "rv30_annualized": 0.6127555539705751,
+        "high_90d": 97.23,
+        "source": "coinbase_candles_HYPE",
+        "url": "https://api.exchange.coinbase.com/products/HYPE-USD/candles?granularity=86400",
+        "retrieved_at": "2026-10-18T12:56:11.906729+00:00",
+        "status": 200,
+        "sha256": "e23d7b29020d7bf832fad882f5edd6c829407cfff19c2f37e444e8aac0f9698b"
+      },
+      "fees": {
+        "dailyFees": {
+          "total24h": 1569486,
+          "total7d": 20331081,
+          "total30d": 86825287,
+          "total1y": 905724616.6899998,
+          "annualized1y": 905724616.6899998,
+          "totalAllTime": 1672215771.6900005,
+          "methodology": null,
+          "source": "defillama_fees_hyperliquid_dailyFees",
+          "url": "https://api.llama.fi/summary/fees/hyperliquid?dataType=dailyFees&excludeTotalDataChart=true&excludeTotalDataChartBreakdown=true",
+          "retrieved_at": "2026-10-18T12:56:27.244232+00:00",
+          "status": 200,
+          "sha256": "43e7c2fe0934d940cff0518ee0ea1984932c57281e6877024e2f72a8e52c99bb"
+        },
+        "dailyRevenue": {
+          "total24h": 1300885,
+          "total7d": 16072592,
+          "total30d": 69938325,
+          "total1y": 689131773,
+          "annualized1y": 689131773,
+          "totalAllTime": 1352978583,
+          "methodology": null,
+          "source": "defillama_fees_hyperliquid_dailyRevenue",
+          "url": "https://api.llama.fi/summary/fees/hyperliquid?dataType=dailyRevenue&excludeTotalDataChart=true&excludeTotalDataChartBreakdown=true",
+          "retrieved_at": "2026-10-18T12:56:28.322351+00:00",
+          "status": 200,
+          "sha256": "ace7c07cc6d6dc0689659c4624bcd64513866a37643b2130ad73f706d6fe2bab"
+        },
+        "dailyHoldersRevenue": {
+          "total24h": 1300885,
+          "total7d": 16072592,
+          "total30d": 69938325,
+          "total1y": 689131773,
+          "annualized1y": 689131773,
+          "totalAllTime": 1352978583,
+          "methodology": null,
+          "source": "defillama_fees_hyperliquid_dailyHoldersRevenue",
+          "url": "https://api.llama.fi/summary/fees/hyperliquid?dataType=dailyHoldersRevenue&excludeTotalDataChart=true&excludeTotalDataChartBreakdown=true",
+          "retrieved_at": "2026-10-18T12:56:29.391964+00:00",
+          "status": 200,
+          "sha256": "ace7c07cc6d6dc0689659c4624bcd64513866a37643b2130ad73f706d6fe2bab"
+        }
+      },
+      "tvl": {
+        "children": [
+          [
+            "Hyperliquid Bridge",
+            "hyperliquid-bridge",
+            6759514707.462444,
+            "Bridge"
+          ],
+          [
+            "Hyperliquid HLP",
+            "hyperliquid-hlp",
+            177999966.84849226,
+            "Derivatives"
+          ],
+          [
+            "Hyperliquid Spot Orderbook",
+            "hyperliquid-spot-orderbook",
+            128906228.03505316,
+            "Dexs"
+          ],
+          [
+            "Hyperliquid Perps",
+            "hyperliquid-perps",
+            null,
+            "Derivatives"
+          ],
+          [
+            "Hyperliquid Outcomes",
+            "hyperliquid-outcomes",
+            null,
+            "Prediction Market"
+          ]
+        ],
+        "sum_reported": 7066420902.34599,
+        "null_children": [
+          "Hyperliquid Perps",
+          "Hyperliquid Outcomes"
+        ],
+        "classification": "secondary aggregate",
+        "source": "defillama_protocols",
+        "url": "https://api.llama.fi/protocols",
+        "retrieved_at": "2026-10-18T12:56:42.929502+00:00",
+        "status": 200,
+        "sha256": "ed79fbc0f31cef5f4f200b17d52e296d6a86365d16d37b0a47e1b2cd73a44423"
+      },
+      "chain_supply": {
+        "maxSupply": "1000000000.0",
+        "totalSupply": "998847686.2491278648",
+        "circulatingSupply": "302078232.4361847043",
+        "futureEmissions": "410657626.5329045653",
+        "deployTime": "2024-11-29T06:45:52.532",
+        "nonCirculatingUserBalances": [
+          [
+            "0x43e9abea1910387c4292bca4b94de81462f8a251",
+            "238000934.5518226326"
+          ],
+          [
+            "0xfefefefefefefefefefefefefefefefefefefefe",
+            "48109216.2247392312"
+          ],
+          [
+            "0x0000000000000000000000000000000000000000",
+            "1673.78676325"
+          ],
+          [
+            "0x000000000000000000000000000000000000dead",
+            "2.71671343"
+          ]
+        ],
+        "source": "hyperliquid_token_details_HYPE",
+        "url": "https://api.hyperliquid.xyz/info",
+        "retrieved_at": "2026-10-18T12:56:58.499605+00:00",
+        "status": 200,
+        "sha256": "95f2f7c21012482e45db88a8a0afe8a730da31482c13b95703f162ecd2ec21f5"
+      },
+      "gecko": {
+        "circulating": 222445714.07414138,
+        "total": 955307079.4341414,
+        "max": 1000000000.0,
+        "mcap_usd": 17489677363,
+        "fdv_usd": 75110517062,
+        "last_updated": "2026-10-18T12:55:49.000Z",
+        "classification": "secondary aggregate",
+        "source": "coingecko_coin_hyperliquid",
+        "url": "https://api.coingecko.com/api/v3/coins/hyperliquid?localization=false&tickers=false&market_data=true&community_data=false&developer_data=false&sparkline=false",
+        "retrieved_at": "2026-10-18T12:56:43.872667+00:00",
+        "status": 200,
+        "sha256": "686c887e7eda06a5edb95cc0033ace8709fcbe62ba67b1d19968b5d4f6c06f15"
+      }
+    },
+    "PENDLE": {
+      "price": {
+        "last": 2.0199,
+        "trade_time": "2026-10-18T12:48:27.455243124Z",
+        "source": "coinbase_ticker_PENDLE",
+        "url": "https://api.exchange.coinbase.com/products/PENDLE-USD/ticker",
+        "retrieved_at": "2026-10-18T12:56:12.471527+00:00",
+        "status": 200,
+        "sha256": "17a673d7c8a6e996cf94ebab4ffd9d2d6086a06afdddc3afadedd38157a12027"
+      },
+      "daily": {
+        "last_completed_open": "2026-10-17T00:00:00Z",
+        "last_close": 2.0659,
+        "completed_rows": 349,
+        "gaps": 0,
+        "sma20": 2.24028,
+        "sma50": 2.227276,
+        "sma200": 1.653334,
+        "ret_7d": -0.060698372283349844,
+        "ret_30d": -0.118342437692045,
+        "ret_90d": 0.3075316455696202,
+        "rv30_annualized": 0.8272076947348235,
+        "high_90d": 2.7168,
+        "source": "coinbase_candles_PENDLE",
+        "url": "https://api.exchange.coinbase.com/products/PENDLE-USD/candles?granularity=86400",
+        "retrieved_at": "2026-10-18T12:56:12.902468+00:00",
+        "status": 200,
+        "sha256": "dd4e351c10fb985dae35a125b3d84498f9064ee5c7535ce4148a5b54dae9d553"
+      },
+      "fees": {
+        "dailyFees": {
+          "total24h": 7482,
+          "total7d": 139556,
+          "total30d": 489436,
+          "total1y": 15043924,
+          "annualized1y": 15043924,
+          "totalAllTime": 67888574,
+          "methodology": null,
+          "source": "defillama_fees_pendle_dailyFees",
+          "url": "https://api.llama.fi/summary/fees/pendle?dataType=dailyFees&excludeTotalDataChart=true&excludeTotalDataChartBreakdown=true",
+          "retrieved_at": "2026-10-18T12:56:30.477782+00:00",
+          "status": 200,
+          "sha256": "e8a3c071c91d9d3e9fca6c2aa8cd8e3486a7a80d796f2ee345dd52c5a114851b"
+        },
+        "dailyRevenue": {
+          "total24h": 7352,
+          "total7d": 137682,
+          "total30d": 482462,
+          "total1y": 14746863,
+          "annualized1y": 14746863,
+          "totalAllTime": 65163329,
+          "methodology": null,
+          "source": "defillama_fees_pendle_dailyRevenue",
+          "url": "https://api.llama.fi/summary/fees/pendle?dataType=dailyRevenue&excludeTotalDataChart=true&excludeTotalDataChartBreakdown=true",
+          "retrieved_at": "2026-10-18T12:56:31.571924+00:00",
+          "status": 200,
+          "sha256": "086ba596e1d779bf5b68e0f2619d8ae35939fba3e3d76aaa09be47dcaa150516"
+        },
+        "dailyHoldersRevenue": {
+          "total24h": 4924,
+          "total7d": 102837,
+          "total30d": 360123,
+          "total1y": 11286581,
+          "annualized1y": 11286581,
+          "totalAllTime": 56734353,
+          "methodology": null,
+          "source": "defillama_fees_pendle_dailyHoldersRevenue",
+          "url": "https://api.llama.fi/summary/fees/pendle?dataType=dailyHoldersRevenue&excludeTotalDataChart=true&excludeTotalDataChartBreakdown=true",
+          "retrieved_at": "2026-10-18T12:56:32.659805+00:00",
+          "status": 200,
+          "sha256": "b09455b07c5c7d0ee99d61935d129617623238e793525ba6424fd77df8f85ad6"
+        }
+      },
+      "tvl": {
+        "children": [
+          [
+            "Pendle V2",
+            "pendle-v2",
+            1103581814.797488,
+            "Yield"
+          ],
+          [
+            "Boros",
+            "boros",
+            7450246.524063502,
+            "Interest Rate Derivatives"
+          ]
+        ],
+        "sum_reported": 1111032061.3215516,
+        "null_children": [],
+        "classification": "secondary aggregate",
+        "source": "defillama_protocols",
+        "url": "https://api.llama.fi/protocols",
+        "retrieved_at": "2026-10-18T12:56:42.929502+00:00",
+        "status": 200,
+        "sha256": "ed79fbc0f31cef5f4f200b17d52e296d6a86365d16d37b0a47e1b2cd73a44423"
+      },
+      "chain_supply": {
+        "symbol": "PENDLE",
+        "decimals": 18,
+        "total_supply": 281527448.45853144,
+        "chain": "ethereum",
+        "address": "0x808507121B80c02388fAd14726482e061B8da827",
+        "source": "rpc_PENDLE_totalSupply",
+        "url": "https://ethereum-rpc.publicnode.com",
+        "retrieved_at": "2026-10-18T12:56:49.069397+00:00",
+        "status": 200,
+        "sha256": "ca53fd052caf641c37071ff942d691f958d0f48cf85b3fbdf1e8c6c58c3441c6"
+      },
+      "gecko": {
+        "circulating": 173852947.55239594,
+        "total": 281527448.45853144,
+        "max": null,
+        "mcap_usd": 351198352,
+        "fdv_usd": 568710380,
+        "last_updated": "2026-10-18T12:55:49.000Z",
+        "classification": "secondary aggregate",
+        "source": "coingecko_coin_pendle",
+        "url": "https://api.coingecko.com/api/v3/coins/pendle?localization=false&tickers=false&market_data=true&community_data=false&developer_data=false&sparkline=false",
+        "retrieved_at": "2026-10-18T12:56:44.358537+00:00",
+        "status": 200,
+        "sha256": "7f1aa74e5fa072607ce6755148ad53121045f3f51cd510eef2e933caf225b034"
+      },
+      "top_holders": {
+        "top10_share_pct": 67.35,
+        "top1_share_pct": 22.53,
+        "addresses": [
+          "0x4f30a9d41b80ecc5b94306ab4364951ae3170210",
+          "0x999999999991e178d52cd95afd4b00d066664144",
+          "0x8119ec16f0573b7dac7c0cb94eb504fb32456ee1",
+          "0xf977814e90da44bfa03b6295a0616a897441acec",
+          "0x399be606db281a054e359eb709df9f21e922ec9a",
+          "0xa3a7b6f88361f48403514059f1f16c8e78d60eec",
+          "0x5a52e96bacdabb82fd05763e25335261b270efcb",
+          "0x918cf6b16d1426b5aa0edf0492ced1aa89f9659a",
+          "0x2081411ed407f2364e5162e641a2db7575ef6f7b",
+          "0x187c9fbf5bd0f266883c03f320260c407c7b4100"
+        ],
+        "classification": "secondary indexer; address-level, not entity-adjusted",
+        "source": "ethplorer_top_holders_PENDLE",
+        "url": "https://api.ethplorer.io/getTopTokenHolders/0x808507121B80c02388fAd14726482e061B8da827?apiKey=freekey&limit=10",
+        "retrieved_at": "2026-10-18T12:56:55.297869+00:00",
+        "status": 200,
+        "sha256": "79af849433267b2719ccb17abf37ae8165b1e39997d9f297a1c2f00644a0e915"
+      }
+    },
+    "AERO": {
+      "price": {
+        "last": 0.83497,
+        "trade_time": "2026-10-18T12:56:03.956772821Z",
+        "source": "coinbase_ticker_AERO",
+        "url": "https://api.exchange.coinbase.com/products/AERO-USD/ticker",
+        "retrieved_at": "2026-10-18T12:56:13.362418+00:00",
+        "status": 200,
+        "sha256": "55452d696c1f825580990548b5c754f9eea6c8f4e6edbe19cc20721e4de74707"
+      },
+      "daily": {
+        "last_completed_open": "2026-10-17T00:00:00Z",
+        "last_close": 0.84303,
+        "completed_rows": 349,
+        "gaps": 0,
+        "sma20": 0.8533160000000001,
+        "sma50": 0.7011803999999999,
+        "sma200": 0.5021544,
+        "ret_7d": -0.1024721062941828,
+        "ret_30d": 0.4378816305645572,
+        "ret_90d": 0.8637499170959253,
+        "rv30_annualized": 1.1614367597529185,
+        "high_90d": 0.94347,
+        "source": "coinbase_candles_AERO",
+        "url": "https://api.exchange.coinbase.com/products/AERO-USD/candles?granularity=86400",
+        "retrieved_at": "2026-10-18T12:56:13.784429+00:00",
+        "status": 200,
+        "sha256": "29225c5d8ed725edf876cb7687da50108a41031f65ee70ac682d3a4ebbb1a4cb"
+      },
+      "fees": {
+        "dailyFees": {
+          "total24h": 208656,
+          "total7d": 2704550,
+          "total30d": 11888163,
+          "total1y": 124510546,
+          "annualized1y": 124510546,
+          "totalAllTime": 559622885,
+          "methodology": null,
+          "source": "defillama_fees_aerodrome_dailyFees",
+          "url": "https://api.llama.fi/summary/fees/aerodrome?dataType=dailyFees&excludeTotalDataChart=true&excludeTotalDataChartBreakdown=true",
+          "retrieved_at": "2026-10-18T12:56:33.761023+00:00",
+          "status": 200,
+          "sha256": "a7f7c7cb32e04f13fc2affe549ecf769fee941ae0e1c0fbe48d7572119811b69"
+        },
+        "dailyRevenue": {
+          "total24h": 146831,
+          "total7d": 1875157,
+          "total30d": 7952325,
+          "total1y": 87784678,
+          "annualized1y": 87784678,
+          "totalAllTime": 488163937,
+          "methodology": null,
+          "source": "defillama_fees_aerodrome_dailyRevenue",
+          "url": "https://api.llama.fi/summary/fees/aerodrome?dataType=dailyRevenue&excludeTotalDataChart=true&excludeTotalDataChartBreakdown=true",
+          "retrieved_at": "2026-10-18T12:56:34.851161+00:00",
+          "status": 200,
+          "sha256": "29888e5c3edfee065f291be2d2fd4a3e0a4a2fdd51a9811af0a7ca64a715eca8"
+        },
+        "dailyHoldersRevenue": {
+          "total24h": 146831,
+          "total7d": 1875157,
+          "total30d": 7952325,
+          "total1y": 87784678,
+          "annualized1y": 87784678,
+          "totalAllTime": 488166544,
+          "methodology": null,
+          "source": "defillama_fees_aerodrome_dailyHoldersRevenue",
+          "url": "https://api.llama.fi/summary/fees/aerodrome?dataType=dailyHoldersRevenue&excludeTotalDataChart=true&excludeTotalDataChartBreakdown=true",
+          "retrieved_at": "2026-10-18T12:56:35.926911+00:00",
+          "status": 200,
+          "sha256": "541d985d2fd36de559b551298f77d6b48b806166ab4f51ca3fa184c66787c99f"
+        }
+      },
+      "tvl": {
+        "children": [
+          [
+            "Aerodrome Slipstream",
+            "aerodrome-slipstream",
+            229356973.13886914,
+            "Dexs"
+          ],
+          [
+            "Aerodrome V1",
+            "aerodrome-v1",
+            138320603.77501842,
+            "Dexs"
+          ],
+          [
+            "Aerodrome Ignition",
+            "aerodrome-ignition",
+            21878028.73444567,
+            "Launchpad"
+          ],
+          [
+            "Aero Lite",
+            "aero-lite",
+            3354159.266762088,
+            "Dexs"
+          ]
+        ],
+        "sum_reported": 392909764.9150953,
+        "null_children": [],
+        "classification": "secondary aggregate",
+        "source": "defillama_protocols",
+        "url": "https://api.llama.fi/protocols",
+        "retrieved_at": "2026-10-18T12:56:42.929502+00:00",
+        "status": 200,
+        "sha256": "ed79fbc0f31cef5f4f200b17d52e296d6a86365d16d37b0a47e1b2cd73a44423"
+      },
+      "chain_supply": {
+        "symbol": "AERO",
+        "decimals": 18,
+        "total_supply": 2002379493.9209132,
+        "chain": "base",
+        "address": "0x940181a94A35A4569E4529A3CDfB74e38FD98631",
+        "source": "rpc_AERO_totalSupply",
+        "url": "https://base-rpc.publicnode.com",
+        "retrieved_at": "2026-10-18T12:56:51.982685+00:00",
+        "status": 200,
+        "sha256": "7845634e8490f20201d04b6c376e650e4079ff6669a63f190c7a038d9e06ea7f"
+      },
+      "gecko": {
+        "circulating": 1003887931.7155279,
+        "total": 2002379493.9209132,
+        "max": null,
+        "mcap_usd": 836408127,
+        "fdv_usd": 1668320167,
+        "last_updated": "2026-10-18T12:54:46.000Z",
+        "classification": "secondary aggregate",
+        "source": "coingecko_coin_aerodrome-finance",
+        "url": "https://api.coingecko.com/api/v3/coins/aerodrome-finance?localization=false&tickers=false&market_data=true&community_data=false&developer_data=false&sparkline=false",
+        "retrieved_at": "2026-10-18T12:56:44.839061+00:00",
+        "status": 200,
+        "sha256": "12eca1eb4df05f31801ebb3e5e4dbcd6f0ef4dce82d7ab1792b9c2e4d4b25550"
+      }
+    },
+    "LDO": {
+      "price": {
+        "last": 0.3842,
+        "trade_time": "2026-10-18T12:50:27.993160253Z",
+        "source": "coinbase_ticker_LDO",
+        "url": "https://api.exchange.coinbase.com/products/LDO-USD/ticker",
+        "retrieved_at": "2026-10-18T12:56:14.207643+00:00",
+        "status": 200,
+        "sha256": "ba099d5efb2dd318875a38ce3011a603a8381614c51e6ebb7b0ed027c5a63070"
+      },
+      "daily": {
+        "last_completed_open": "2026-10-17T00:00:00Z",
+        "last_close": 0.38919,
+        "completed_rows": 349,
+        "gaps": 0,
+        "sma20": 0.4353915,
+        "sma50": 0.4106738,
+        "sma200": 0.35032785,
+        "ret_7d": -0.0969650563831268,
+        "ret_30d": 0.08138371769936081,
+        "ret_90d": 0.10252124645892358,
+        "rv30_annualized": 1.2221778055495005,
+        "high_90d": 0.49438,
+        "source": "coinbase_candles_LDO",
+        "url": "https://api.exchange.coinbase.com/products/LDO-USD/candles?granularity=86400",
+        "retrieved_at": "2026-10-18T12:56:14.639574+00:00",
+        "status": 200,
+        "sha256": "61323ca98faad0f2f091fa99becf907e9f10d7360395a5859d2d512bb863f6ce"
+      },
+      "fees": {
+        "dailyFees": {
+          "total24h": 1578165,
+          "total7d": 11311383,
+          "total30d": 51963475,
+          "total1y": 599552517,
+          "annualized1y": 599552517,
+          "totalAllTime": 3392630654,
+          "methodology": {
+            "UserFees": "Lido takes no fees from users.",
+            "Fees": "Staking rewards earned by all staked ETH",
+            "Revenue": "Lido takes a 10% fee on staking rewards; Revenue is only the DAO-treasury portion of that fee (net of the node-operator share, which is a cost of production booked as SupplySideRevenue). From Lido V2 (2023-05-15) the treasury/operator split is the validator-share-weighted aggregate read live from the StakingRouter; before V2 the split was a fixed 5%/5%, so half the fee is treasury.",
+            "ProtocolRevenue": "DAO-treasury portion of the 10% fee, minus the LDO bought back under the LDO Accumulation Program; excludes the node-operator share.",
+            "SupplySideRevenue": "Staking rewards earned by stETH holders plus the node-operator share of the 10% fee (paid to operators for running validators).",
+            "HoldersRevenue": "Tracks LIDO bought back by the DAO as part of the LDO Accumulation Program"
+          },
+          "source": "defillama_fees_lido_dailyFees",
+          "url": "https://api.llama.fi/summary/fees/lido?dataType=dailyFees&excludeTotalDataChart=true&excludeTotalDataChartBreakdown=true",
+          "retrieved_at": "2026-10-18T12:56:37.003716+00:00",
+          "status": 200,
+          "sha256": "ae89de55038429d9635f8b7dc52188dc72cf61133a6faed51427bbba8801dc8d"
+        },
+        "dailyRevenue": {
+          "total24h": 96206,
+          "total7d": 690538,
+          "total30d": 3199468,
+          "total1y": 35013707,
+          "annualized1y": 35013707,
+          "totalAllTime": 173826120,
+          "methodology": {
+            "UserFees": "Lido takes no fees from users.",
+            "Fees": "Staking rewards earned by all staked ETH",
+            "Revenue": "Lido takes a 10% fee on staking rewards; Revenue is only the DAO-treasury portion of that fee (net of the node-operator share, which is a cost of production booked as SupplySideRevenue). From Lido V2 (2023-05-15) the treasury/operator split is the validator-share-weighted aggregate read live from the StakingRouter; before V2 the split was a fixed 5%/5%, so half the fee is treasury.",
+            "ProtocolRevenue": "DAO-treasury portion of the 10% fee, minus the LDO bought back under the LDO Accumulation Program; excludes the node-operator share.",
+            "SupplySideRevenue": "Staking rewards earned by stETH holders plus the node-operator share of the 10% fee (paid to operators for running validators).",
+            "HoldersRevenue": "Tracks LIDO bought back by the DAO as part of the LDO Accumulation Program"
+          },
+          "source": "defillama_fees_lido_dailyRevenue",
+          "url": "https://api.llama.fi/summary/fees/lido?dataType=dailyRevenue&excludeTotalDataChart=true&excludeTotalDataChartBreakdown=true",
+          "retrieved_at": "2026-10-18T12:56:38.078899+00:00",
+          "status": 200,
+          "sha256": "232ed8470dbbc88e6aad0e5b1fe13f7fe6e028f9f0b799ccbf7c3ae42cead9b3"
+        },
+        "dailyHoldersRevenue": {
+          "total24h": 0,
+          "total7d": 0,
+          "total30d": 2252874,
+          "total1y": 7061751,
+          "annualized1y": 18543446.870503597,
+          "totalAllTime": 7061751,
+          "methodology": {
+            "UserFees": "Lido takes no fees from users.",
+            "Fees": "Staking rewards earned by all staked ETH",
+            "Revenue": "Lido takes a 10% fee on staking rewards; Revenue is only the DAO-treasury portion of that fee (net of the node-operator share, which is a cost of production booked as SupplySideRevenue). From Lido V2 (2023-05-15) the treasury/operator split is the validator-share-weighted aggregate read live from the StakingRouter; before V2 the split was a fixed 5%/5%, so half the fee is treasury.",
+            "ProtocolRevenue": "DAO-treasury portion of the 10% fee, minus the LDO bought back under the LDO Accumulation Program; excludes the node-operator share.",
+            "SupplySideRevenue": "Staking rewards earned by stETH holders plus the node-operator share of the 10% fee (paid to operators for running validators).",
+            "HoldersRevenue": "Tracks LIDO bought back by the DAO as part of the LDO Accumulation Program"
+          },
+          "source": "defillama_fees_lido_dailyHoldersRevenue",
+          "url": "https://api.llama.fi/summary/fees/lido?dataType=dailyHoldersRevenue&excludeTotalDataChart=true&excludeTotalDataChartBreakdown=true",
+          "retrieved_at": "2026-10-18T12:56:39.147690+00:00",
+          "status": 200,
+          "sha256": "1d0492d494de9f2cc1b9f0d474283d14a4ed2b77f69d04f5e5d0a6b271a99356"
+        }
+      },
+      "tvl": {
+        "children": [
+          [
+            "Lido",
+            "lido",
+            23444449359.29284,
+            "Liquid Staking"
+          ]
+        ],
+        "sum_reported": 23444449359.29284,
+        "null_children": [],
+        "classification": "secondary aggregate",
+        "source": "defillama_protocols",
+        "url": "https://api.llama.fi/protocols",
+        "retrieved_at": "2026-10-18T12:56:42.929502+00:00",
+        "status": 200,
+        "sha256": "ed79fbc0f31cef5f4f200b17d52e296d6a86365d16d37b0a47e1b2cd73a44423"
+      },
+      "chain_supply": {
+        "symbol": "LDO",
+        "decimals": 18,
+        "total_supply": 1000000000.0,
+        "chain": "ethereum",
+        "address": "0x5A98FcBEA516Cf06857215779Fd812CA3beF1B32",
+        "source": "rpc_LDO_totalSupply",
+        "url": "https://ethereum-rpc.publicnode.com",
+        "retrieved_at": "2026-10-18T12:56:47.639253+00:00",
+        "status": 200,
+        "sha256": "0c627c930a221e59a3e8557b2651ca5251c87b4819b98b4a1d5f0d21a70d04d7"
+      },
+      "gecko": {
+        "circulating": 829567764.2043006,
+        "total": 1000000000.0,
+        "max": 1000000000.0,
+        "mcap_usd": 318978680,
+        "fdv_usd": 384511904,
+        "last_updated": "2026-10-18T12:55:49.000Z",
+        "classification": "secondary aggregate",
+        "source": "coingecko_coin_lido-dao",
+        "url": "https://api.coingecko.com/api/v3/coins/lido-dao?localization=false&tickers=false&market_data=true&community_data=false&developer_data=false&sparkline=false",
+        "retrieved_at": "2026-10-18T12:56:45.298410+00:00",
+        "status": 200,
+        "sha256": "efb2b31be69ff46746e1e00903ce8fa9b44a7afab3deae2bbac22487960fa600"
+      },
+      "top_holders": {
+        "top10_share_pct": 50.46,
+        "top1_share_pct": 12.15,
+        "addresses": [
+          "0x3e40d73eb977dc6a537af587d48316fee66e9c8c",
+          "0xf977814e90da44bfa03b6295a0616a897441acec",
+          "0x695c388153bea0fbe3e1c049c149bad3bc917740",
+          "0x945755de7eac99008c8c57bda96772d50872168b",
+          "0xa2dfc431297aee387c05beef507e5335e684fbcd",
+          "0x1597d19659f3de52abd475f7d2314dcca29359bd",
+          "0x5a52e96bacdabb82fd05763e25335261b270efcb",
+          "0x8fa129f87b8a11ee1ca35abd46674f8b66984d4a",
+          "0xb8d83908aab38a159f3da47a59d84db8e1838712",
+          "0x611f7bf868a6212f871e89f7e44684045ddfb09d"
+        ],
+        "classification": "secondary indexer; address-level, not entity-adjusted",
+        "source": "ethplorer_top_holders_LDO",
+        "url": "https://api.ethplorer.io/getTopTokenHolders/0x5A98FcBEA516Cf06857215779Fd812CA3beF1B32?apiKey=freekey&limit=10",
+        "retrieved_at": "2026-10-18T12:56:54.715852+00:00",
+        "status": 200,
+        "sha256": "ef82954382848eea063ea35724a46020a554a4e0b261dab29be447a8459d6853"
+      }
+    },
+    "ONDO": {
+      "price": {
+        "last": 0.43747,
+        "trade_time": "2026-10-18T12:56:09.094086102Z",
+        "source": "coinbase_ticker_ONDO",
+        "url": "https://api.exchange.coinbase.com/products/ONDO-USD/ticker",
+        "retrieved_at": "2026-10-18T12:56:15.138046+00:00",
+        "status": 200,
+        "sha256": "2086f2fc1ae8aa91b6abda569b14ac15d9b6b7422485a44af80f0075d1d70a46"
+      },
+      "daily": {
+        "last_completed_open": "2026-10-17T00:00:00Z",
+        "last_close": 0.4381,
+        "completed_rows": 349,
+        "gaps": 0,
+        "sma20": 0.4840965,
+        "sma50": 0.43113819999999997,
+        "sma200": 0.36188384999999995,
+        "ret_7d": -0.11596747180014932,
+        "ret_30d": 0.17743496022360783,
+        "ret_90d": 0.2684946579031182,
+        "rv30_annualized": 1.2554893282038275,
+        "high_90d": 0.58807,
+        "source": "coinbase_candles_ONDO",
+        "url": "https://api.exchange.coinbase.com/products/ONDO-USD/candles?granularity=86400",
+        "retrieved_at": "2026-10-18T12:56:15.571108+00:00",
+        "status": 200,
+        "sha256": "40a96995a19b246c713de85ccab33d7eed7178044501f089344dc0fb0fe13b17"
+      },
+      "fees": {
+        "dailyFees": {
+          "total24h": 227162,
+          "total7d": 1578311,
+          "total30d": 5729016,
+          "total1y": 62900951,
+          "annualized1y": 63952220.37604457,
+          "totalAllTime": 90649693,
+          "methodology": null,
+          "source": "defillama_fees_ondo-finance_dailyFees",
+          "url": "https://api.llama.fi/summary/fees/ondo-finance?dataType=dailyFees&excludeTotalDataChart=true&excludeTotalDataChartBreakdown=true",
+          "retrieved_at": "2026-10-18T12:56:40.231525+00:00",
+          "status": 200,
+          "sha256": "817061b1e0e0723131edaf7a44504eb30d7833975ab499432ca29f909edd1cc0"
+        },
+        "dailyRevenue": {
+          "total24h": 0,
+          "total7d": 0,
+          "total30d": 0,
+          "total1y": 0,
+          "annualized1y": null,
+          "totalAllTime": 0,
+          "methodology": null,
+          "source": "defillama_fees_ondo-finance_dailyRevenue",
+          "url": "https://api.llama.fi/summary/fees/ondo-finance?dataType=dailyRevenue&excludeTotalDataChart=true&excludeTotalDataChartBreakdown=true",
+          "retrieved_at": "2026-10-18T12:56:41.346156+00:00",
+          "status": 200,
+          "sha256": "3c0dc15c73dd9b104a60d38da8a336e4557ab1d076ef0ad0b600e3310aa1e3af"
+        },
+        "dailyHoldersRevenue": {
+          "total24h": 0,
+          "total7d": 0,
+          "total30d": 0,
+          "total1y": 0,
+          "annualized1y": null,
+          "totalAllTime": 0,
+          "methodology": null,
+          "source": "defillama_fees_ondo-finance_dailyHoldersRevenue",
+          "url": "https://api.llama.fi/summary/fees/ondo-finance?dataType=dailyHoldersRevenue&excludeTotalDataChart=true&excludeTotalDataChartBreakdown=true",
+          "retrieved_at": "2026-10-18T12:56:42.413727+00:00",
+          "status": 200,
+          "sha256": "3c0dc15c73dd9b104a60d38da8a336e4557ab1d076ef0ad0b600e3310aa1e3af"
+        }
+      },
+      "tvl": {
+        "children": [
+          [
+            "Ondo Yield Assets",
+            "ondo-yield-assets",
+            null,
+            "RWA"
+          ],
+          [
+            "Ondo Global Markets",
+            "ondo-global-markets",
+            null,
+            "RWA"
+          ],
+          [
+            "Ondo Perps",
+            "ondo-perps",
+            null,
+            "Derivatives"
+          ]
+        ],
+        "sum_reported": 0,
+        "null_children": [
+          "Ondo Yield Assets",
+          "Ondo Global Markets",
+          "Ondo Perps"
+        ],
+        "classification": "secondary aggregate",
+        "source": "defillama_protocols",
+        "url": "https://api.llama.fi/protocols",
+        "retrieved_at": "2026-10-18T12:56:42.929502+00:00",
+        "status": 200,
+        "sha256": "ed79fbc0f31cef5f4f200b17d52e296d6a86365d16d37b0a47e1b2cd73a44423"
+      },
+      "chain_supply": {
+        "symbol": "ONDO",
+        "decimals": 18,
+        "total_supply": 10000000000.0,
+        "chain": "ethereum",
+        "address": "0xfAbA6f8e4a5E8Ab82F62fe7C39859FA577269BE3",
+        "source": "rpc_ONDO_totalSupply",
+        "url": "https://ethereum-rpc.publicnode.com",
+        "retrieved_at": "2026-10-18T12:56:50.525396+00:00",
+        "status": 200,
+        "sha256": "7f833e5967a7f584f6b4167ae7a60b84fc4a428d86e194799f040406f350211b"
+      },
+      "gecko": {
+        "error": "HTTP 429",
+        "source": "coingecko_coin_ondo-finance",
+        "url": "https://api.coingecko.com/api/v3/coins/ondo-finance?localization=false&tickers=false&market_data=true&community_data=false&developer_data=false&sparkline=false",
+        "retrieved_at": "2026-10-18T12:57:32.613819+00:00",
+        "status": 429,
+        "sha256": "6529e19eb4c125e9bf94e997ea53c292ea8f4d6d0a8f8c25fb400947c088da2e"
+      },
+      "top_holders": {
+        "top10_share_pct": 67.82,
+        "top1_share_pct": 51.79,
+        "addresses": [
+          "0x677fd4ed8ae623f2f625deb2d64f2070e46ca1a1",
+          "0x460ae5a6666fcb9635ba99b541b31279e5966537",
+          "0xa63eace47618b9677261b09b32e3ca2b5c0a0182",
+          "0xf977814e90da44bfa03b6295a0616a897441acec",
+          "0xd2e6e930e25456ffcd4df0124563cc334f3284f4",
+          "0xb829e684df8e31b402a4d4aedf3bbc18a52e7589",
+          "0xac7dc31d7eab8a15267a386151d851c992f14690",
+          "0xf197c6f2ac14d25ee2789a73e4847732c7f16bc9",
+          "0xf02bb1617b3252ff5cec9a9d1f7bd1a12977833b",
+          "0xe002402ccf13371b6f6cb1eb4b78686030de62b1"
+        ],
+        "classification": "secondary indexer; address-level, not entity-adjusted",
+        "source": "ethplorer_top_holders_ONDO",
+        "url": "https://api.ethplorer.io/getTopTokenHolders/0xfAbA6f8e4a5E8Ab82F62fe7C39859FA577269BE3?apiKey=freekey&limit=10",
+        "retrieved_at": "2026-10-18T12:56:55.873773+00:00",
+        "status": 200,
+        "sha256": "8ac5d0f5873e664a8350fb913fc5fdea5571841022f4702fab83a877dbdf685a"
+      }
+    }
+  },
+  "gaps": [
+    {
+      "source": "binance_premium_BTCUSDT",
+      "status": 451,
+      "body": "{\n  \"code\": 0,\n  \"msg\": \"Service unavailable from a restricted location according to 'b. Eligibility' in https://www.binance.com/en/terms. Please contact customer service if you believe you received t",
+      "url": "https://fapi.binance.com/fapi/v1/premiumIndex?symbol=BTCUSDT"
+    },
+    {
+      "source": "binance_oi_BTCUSDT",
+      "status": 451,
+      "body": "{\n  \"code\": 0,\n  \"msg\": \"Service unavailable from a restricted location according to 'b. Eligibility' in https://www.binance.com/en/terms. Please contact customer service if you believe you received t",
+      "url": "https://fapi.binance.com/fapi/v1/openInterest?symbol=BTCUSDT"
+    },
+    {
+      "source": "binance_funding_BTCUSDT",
+      "status": 451,
+      "body": "{\n  \"code\": 0,\n  \"msg\": \"Service unavailable from a restricted location according to 'b. Eligibility' in https://www.binance.com/en/terms. Please contact customer service if you believe you received t",
+      "url": "https://fapi.binance.com/fapi/v1/fundingRate?symbol=BTCUSDT&limit=90"
+    },
+    {
+      "source": "binance_premium_ETHUSDT",
+      "status": 451,
+      "body": "{\n  \"code\": 0,\n  \"msg\": \"Service unavailable from a restricted location according to 'b. Eligibility' in https://www.binance.com/en/terms. Please contact customer service if you believe you received t",
+      "url": "https://fapi.binance.com/fapi/v1/premiumIndex?symbol=ETHUSDT"
+    },
+    {
+      "source": "binance_oi_ETHUSDT",
+      "status": 451,
+      "body": "{\n  \"code\": 0,\n  \"msg\": \"Service unavailable from a restricted location according to 'b. Eligibility' in https://www.binance.com/en/terms. Please contact customer service if you believe you received t",
+      "url": "https://fapi.binance.com/fapi/v1/openInterest?symbol=ETHUSDT"
+    },
+    {
+      "source": "binance_funding_ETHUSDT",
+      "status": 451,
+      "body": "{\n  \"code\": 0,\n  \"msg\": \"Service unavailable from a restricted location according to 'b. Eligibility' in https://www.binance.com/en/terms. Please contact customer service if you believe you received t",
+      "url": "https://fapi.binance.com/fapi/v1/fundingRate?symbol=ETHUSDT&limit=90"
+    }
+  ]
+}

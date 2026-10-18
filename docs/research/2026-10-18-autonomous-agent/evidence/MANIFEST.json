@@ -1,0 +1,513 @@
+{
+  "version": 1,
+  "prepared": "2026-10-18",
+  "retrieval_window_utc": [
+    "2026-10-18T12:55:55Z",
+    "2026-10-18T12:57:33Z"
+  ],
+  "note": "sha256 of each stored file; for gzip files raw_sha256 equals the retrieval-ledger sha256 of the fetched body (gzip mtime=0, so reproducible)",
+  "files": [
+    {
+      "file": "binance_funding_BTCUSDT.json",
+      "bytes": 224,
+      "sha256": "79c1db471a4cdc1c8565b5dfc52e0ed2d29962738ee4d28597696fcd0920e348"
+    },
+    {
+      "file": "binance_funding_ETHUSDT.json",
+      "bytes": 224,
+      "sha256": "79c1db471a4cdc1c8565b5dfc52e0ed2d29962738ee4d28597696fcd0920e348"
+    },
+    {
+      "file": "binance_oi_BTCUSDT.json",
+      "bytes": 224,
+      "sha256": "79c1db471a4cdc1c8565b5dfc52e0ed2d29962738ee4d28597696fcd0920e348"
+    },
+    {
+      "file": "binance_oi_ETHUSDT.json",
+      "bytes": 224,
+      "sha256": "79c1db471a4cdc1c8565b5dfc52e0ed2d29962738ee4d28597696fcd0920e348"
+    },
+    {
+      "file": "binance_premium_BTCUSDT.json",
+      "bytes": 224,
+      "sha256": "79c1db471a4cdc1c8565b5dfc52e0ed2d29962738ee4d28597696fcd0920e348"
+    },
+    {
+      "file": "binance_premium_ETHUSDT.json",
+      "bytes": 224,
+      "sha256": "79c1db471a4cdc1c8565b5dfc52e0ed2d29962738ee4d28597696fcd0920e348"
+    },
+    {
+      "file": "circle_transparency.html.gz",
+      "bytes": 53761,
+      "sha256": "839ff79140090211d5eb6268f78d86765f25f00491dce18a462e45f499088dc3",
+      "raw_bytes": 466467,
+      "raw_sha256": "03fdf2ff9a34ef87d66afdf1ecd201b3e1db75aa2b44f497345057055ca304bb",
+      "compression": "gzip"
+    },
+    {
+      "file": "coinbase_candles_AAVE.json",
+      "bytes": 17029,
+      "sha256": "a821f51a3838b74925f3d781974b6a08f05e1d1542b2effbe643f5f6e8a3d676"
+    },
+    {
+      "file": "coinbase_candles_AERO.json",
+      "bytes": 18937,
+      "sha256": "29225c5d8ed725edf876cb7687da50108a41031f65ee70ac682d3a4ebbb1a4cb"
+    },
+    {
+      "file": "coinbase_candles_BTC-USD.json",
+      "bytes": 21456,
+      "sha256": "ec5ab6cbd3beaed8a0ed5ce92f95c89b013ccd1cd2fc148d1e84cf93f50cde8a"
+    },
+    {
+      "file": "coinbase_candles_ETH-USD.json",
+      "bytes": 20727,
+      "sha256": "dba93a777ae5c8ed25818a554b9770b4fa49b47fc4836b12a854060b914a86a4"
+    },
+    {
+      "file": "coinbase_candles_HYPE.json",
+      "bytes": 12111,
+      "sha256": "e23d7b29020d7bf832fad882f5edd6c829407cfff19c2f37e444e8aac0f9698b"
+    },
+    {
+      "file": "coinbase_candles_LDO.json",
+      "bytes": 16808,
+      "sha256": "61323ca98faad0f2f091fa99becf907e9f10d7360395a5859d2d512bb863f6ce"
+    },
+    {
+      "file": "coinbase_candles_ONDO.json",
+      "bytes": 19533,
+      "sha256": "40a96995a19b246c713de85ccab33d7eed7178044501f089344dc0fb0fe13b17"
+    },
+    {
+      "file": "coinbase_candles_PENDLE.json",
+      "bytes": 16422,
+      "sha256": "dd4e351c10fb985dae35a125b3d84498f9064ee5c7535ce4148a5b54dae9d553"
+    },
+    {
+      "file": "coinbase_ticker_AAVE.json",
+      "bytes": 167,
+      "sha256": "349fd224d066e8358c8758a26278dc816b4036e3a2a2f1b4ec97fe04bd0e7f63"
+    },
+    {
+      "file": "coinbase_ticker_AERO.json",
+      "bytes": 174,
+      "sha256": "55452d696c1f825580990548b5c754f9eea6c8f4e6edbe19cc20721e4de74707"
+    },
+    {
+      "file": "coinbase_ticker_HYPE.json",
+      "bytes": 169,
+      "sha256": "12738cd130d00b21a674cf4162848e3b15e26a9c62ccaaaacebb02fba0916e71"
+    },
+    {
+      "file": "coinbase_ticker_LDO.json",
+      "bytes": 174,
+      "sha256": "ba099d5efb2dd318875a38ce3011a603a8381614c51e6ebb7b0ed027c5a63070"
+    },
+    {
+      "file": "coinbase_ticker_ONDO.json",
+      "bytes": 176,
+      "sha256": "2086f2fc1ae8aa91b6abda569b14ac15d9b6b7422485a44af80f0075d1d70a46"
+    },
+    {
+      "file": "coinbase_ticker_PENDLE.json",
+      "bytes": 169,
+      "sha256": "17a673d7c8a6e996cf94ebab4ffd9d2d6086a06afdddc3afadedd38157a12027"
+    },
+    {
+      "file": "coingecko_coin_aave.json",
+      "bytes": 33981,
+      "sha256": "d522cf1d16f02521a4fe500152961110d5b364567385ebf2413e0d4d29d62a2e"
+    },
+    {
+      "file": "coingecko_coin_aerodrome-finance.json",
+      "bytes": 29656,
+      "sha256": "12eca1eb4df05f31801ebb3e5e4dbcd6f0ef4dce82d7ab1792b9c2e4d4b25550"
+    },
+    {
+      "file": "coingecko_coin_hyperliquid.json",
+      "bytes": 29818,
+      "sha256": "686c887e7eda06a5edb95cc0033ace8709fcbe62ba67b1d19968b5d4f6c06f15"
+    },
+    {
+      "file": "coingecko_coin_lido-dao.json",
+      "bytes": 30796,
+      "sha256": "efb2b31be69ff46746e1e00903ce8fa9b44a7afab3deae2bbac22487960fa600"
+    },
+    {
+      "file": "coingecko_coin_ondo-finance.json",
+      "bytes": 187,
+      "sha256": "6529e19eb4c125e9bf94e997ea53c292ea8f4d6d0a8f8c25fb400947c088da2e"
+    },
+    {
+      "file": "coingecko_coin_pendle.json",
+      "bytes": 32840,
+      "sha256": "7f1aa74e5fa072607ce6755148ad53121045f3f51cd510eef2e933caf225b034"
+    },
+    {
+      "file": "coingecko_global.json",
+      "bytes": 3756,
+      "sha256": "641b98dfd46682b850215b699638b51f090f26fa521df31ecf637ded8ac09404"
+    },
+    {
+      "file": "defillama_fees_aave_dailyFees.json",
+      "bytes": 16332,
+      "sha256": "d7395b33480d79a700374b2fd394e76173705e3593ce183eba72c61716845598"
+    },
+    {
+      "file": "defillama_fees_aave_dailyHoldersRevenue.json",
+      "bytes": 11456,
+      "sha256": "0deedce168b6251cf98dece60ef16980bdfbcd73d4cbfda2d13573d61b35bbb6"
+    },
+    {
+      "file": "defillama_fees_aave_dailyRevenue.json",
+      "bytes": 16345,
+      "sha256": "f2476ab128802cfda650cfbd876c9f770f90f18ee3fb1d5c1c06aceaa257a3d0"
+    },
+    {
+      "file": "defillama_fees_aerodrome_dailyFees.json",
+      "bytes": 8238,
+      "sha256": "a7f7c7cb32e04f13fc2affe549ecf769fee941ae0e1c0fbe48d7572119811b69"
+    },
+    {
+      "file": "defillama_fees_aerodrome_dailyHoldersRevenue.json",
+      "bytes": 7863,
+      "sha256": "541d985d2fd36de559b551298f77d6b48b806166ab4f51ca3fa184c66787c99f"
+    },
+    {
+      "file": "defillama_fees_aerodrome_dailyRevenue.json",
+      "bytes": 8028,
+      "sha256": "29888e5c3edfee065f291be2d2fd4a3e0a4a2fdd51a9811af0a7ca64a715eca8"
+    },
+    {
+      "file": "defillama_fees_hyperliquid_dailyFees.json",
+      "bytes": 9715,
+      "sha256": "43e7c2fe0934d940cff0518ee0ea1984932c57281e6877024e2f72a8e52c99bb"
+    },
+    {
+      "file": "defillama_fees_hyperliquid_dailyHoldersRevenue.json",
+      "bytes": 9671,
+      "sha256": "ace7c07cc6d6dc0689659c4624bcd64513866a37643b2130ad73f706d6fe2bab"
+    },
+    {
+      "file": "defillama_fees_hyperliquid_dailyRevenue.json",
+      "bytes": 9671,
+      "sha256": "ace7c07cc6d6dc0689659c4624bcd64513866a37643b2130ad73f706d6fe2bab"
+    },
+    {
+      "file": "defillama_fees_lido_dailyFees.json",
+      "bytes": 4243,
+      "sha256": "ae89de55038429d9635f8b7dc52188dc72cf61133a6faed51427bbba8801dc8d"
+    },
+    {
+      "file": "defillama_fees_lido_dailyHoldersRevenue.json",
+      "bytes": 4095,
+      "sha256": "1d0492d494de9f2cc1b9f0d474283d14a4ed2b77f69d04f5e5d0a6b271a99356"
+    },
+    {
+      "file": "defillama_fees_lido_dailyRevenue.json",
+      "bytes": 4217,
+      "sha256": "232ed8470dbbc88e6aad0e5b1fe13f7fe6e028f9f0b799ccbf7c3ae42cead9b3"
+    },
+    {
+      "file": "defillama_fees_ondo-finance_dailyFees.json",
+      "bytes": 5637,
+      "sha256": "817061b1e0e0723131edaf7a44504eb30d7833975ab499432ca29f909edd1cc0"
+    },
+    {
+      "file": "defillama_fees_ondo-finance_dailyHoldersRevenue.json",
+      "bytes": 3719,
+      "sha256": "3c0dc15c73dd9b104a60d38da8a336e4557ab1d076ef0ad0b600e3310aa1e3af"
+    },
+    {
+      "file": "defillama_fees_ondo-finance_dailyRevenue.json",
+      "bytes": 3719,
+      "sha256": "3c0dc15c73dd9b104a60d38da8a336e4557ab1d076ef0ad0b600e3310aa1e3af"
+    },
+    {
+      "file": "defillama_fees_pendle_dailyFees.json",
+      "bytes": 8938,
+      "sha256": "e8a3c071c91d9d3e9fca6c2aa8cd8e3486a7a80d796f2ee345dd52c5a114851b"
+    },
+    {
+      "file": "defillama_fees_pendle_dailyHoldersRevenue.json",
+      "bytes": 9005,
+      "sha256": "b09455b07c5c7d0ee99d61935d129617623238e793525ba6424fd77df8f85ad6"
+    },
+    {
+      "file": "defillama_fees_pendle_dailyRevenue.json",
+      "bytes": 8930,
+      "sha256": "086ba596e1d779bf5b68e0f2619d8ae35939fba3e3d76aaa09be47dcaa150516"
+    },
+    {
+      "file": "defillama_protocols.json.gz",
+      "bytes": 2274090,
+      "sha256": "f1bc0bc54125880022ab04855ca7b574ca09441ee8621618982d99ccc67138ea",
+      "raw_bytes": 9299165,
+      "raw_sha256": "ed79fbc0f31cef5f4f200b17d52e296d6a86365d16d37b0a47e1b2cd73a44423",
+      "compression": "gzip"
+    },
+    {
+      "file": "defillama_stablecoincharts_all.json.gz",
+      "bytes": 218178,
+      "sha256": "24bb33d359b1aea0581ffb7ecf011ccc1ef1cd82dc7151c1ce8e8f1f6dea33e7",
+      "raw_bytes": 1322103,
+      "raw_sha256": "b77a60b038e9bfcf88f18a933d3809dbf67060eb134f3963804d2f5bf8103b4a",
+      "compression": "gzip"
+    },
+    {
+      "file": "deribit_funding_history_BTC.json",
+      "bytes": 104904,
+      "sha256": "8d1238d333293eb50e342f76d3fbf1dcb696ac7d2ac570664ef999c6caf35e3c"
+    },
+    {
+      "file": "deribit_funding_history_ETH.json",
+      "bytes": 103838,
+      "sha256": "4a802345fac26983fa1ccf2bd31159bff5e3546e8d6e77b3da14e3259306d7ad"
+    },
+    {
+      "file": "deribit_summary_BTC.json",
+      "bytes": 5252,
+      "sha256": "527f4b230f4ce829302affff2d098286e6a30b22ebaf25218c53373eb46cde93"
+    },
+    {
+      "file": "deribit_summary_ETH.json",
+      "bytes": 5146,
+      "sha256": "eb13aca2ec2f677e45ad4f5fca86b7066069978a9316024edfe5fe30bc3bea2c"
+    },
+    {
+      "file": "doc_aave_token.html",
+      "bytes": 84615,
+      "sha256": "34ab36bc9b086d80d33b19989e30dca15fa352ccf9781834ab6101569325286b"
+    },
+    {
+      "file": "doc_aerodrome_spec.md",
+      "bytes": 16238,
+      "sha256": "5bf4d28db92356f8fe156690b172920b72c6b1476d28f4da8dd09c6a626c1833"
+    },
+    {
+      "file": "doc_hyperliquid_fees.html.gz",
+      "bytes": 101354,
+      "sha256": "1a1f55c287e79972da6a55f59c00d00de7740ec65d8c77de7301bc0fe120c095",
+      "raw_bytes": 933652,
+      "raw_sha256": "363a737f2965a3090a9a96813c679384c0710897a4e9830a2538f82b8b33dbcb",
+      "compression": "gzip"
+    },
+    {
+      "file": "doc_hyperliquid_tokenomics.html.gz",
+      "bytes": 42277,
+      "sha256": "b4950643046967ee784d1037465d96b9deb52d6d2ffceba242e7acfcc544b9f0",
+      "raw_bytes": 194274,
+      "raw_sha256": "fd85d231adc6265dbdcaacbfabeefe56dd7a1138aa52b8621174675364ca3ae9",
+      "compression": "gzip"
+    },
+    {
+      "file": "doc_lido_h1_2026.html.gz",
+      "bytes": 101881,
+      "sha256": "8e689280687ce41ae98b68d39519ec26bb3239332db6066d34013bf62960ebc4",
+      "raw_bytes": 503361,
+      "raw_sha256": "f11d2a1dbead0c4b2ad748e0f16ca07a2b220f88c97b5f474c2b6a77fc26e7de",
+      "compression": "gzip"
+    },
+    {
+      "file": "doc_ondo_token.html",
+      "bytes": 26469,
+      "sha256": "b3ebc301e5f6c8c5cab7b03b47d2897096ba976e1a6ee5cf3b16d66537a11592"
+    },
+    {
+      "file": "doc_pendle_fees.html",
+      "bytes": 21177,
+      "sha256": "fccf575f078323a4a3b7d4f273796778e5b9e7a3b9cfc7d3a4f2c17771a6af96"
+    },
+    {
+      "file": "doc_pendle_tokenomics.html",
+      "bytes": 19526,
+      "sha256": "fc2e0393693afd575d144e08cc700e2a4dfc32b9b0a4c03712042e6a76ecb5d3"
+    },
+    {
+      "file": "ethplorer_top_holders_AAVE.json",
+      "bytes": 1394,
+      "sha256": "212865348529376607b224f3e6e9ed0320f0c96384bffc3e16b667725a556d5a"
+    },
+    {
+      "file": "ethplorer_top_holders_LDO.json",
+      "bytes": 1379,
+      "sha256": "ef82954382848eea063ea35724a46020a554a4e0b261dab29be447a8459d6853"
+    },
+    {
+      "file": "ethplorer_top_holders_ONDO.json",
+      "bytes": 1449,
+      "sha256": "8ac5d0f5873e664a8350fb913fc5fdea5571841022f4702fab83a877dbdf685a"
+    },
+    {
+      "file": "ethplorer_top_holders_PENDLE.json",
+      "bytes": 1415,
+      "sha256": "79af849433267b2719ccb17abf37ae8165b1e39997d9f297a1c2f00644a0e915"
+    },
+    {
+      "file": "fed_fomc_calendar.html.gz",
+      "bytes": 16951,
+      "sha256": "74d9e5f6d66b5ae3fe4a60571de1ee4d57b23061f6f2eb2f7f44044c6c85be7a",
+      "raw_bytes": 167856,
+      "raw_sha256": "4533e3f81df875e1af20d22136b087983daf057c159bfa193aa7db6259942bb6",
+      "compression": "gzip"
+    },
+    {
+      "file": "fed_h15.html",
+      "bytes": 108019,
+      "sha256": "ed6e4b2600b2e8da6bc480fc37e4e64cc1dfc9c648376ad38e244f1f55728b00"
+    },
+    {
+      "file": "hyperliquid_spot_meta_ctxs.json.gz",
+      "bytes": 56564,
+      "sha256": "5da2d91a509570257f13c264a893ce23ee398cf39f39991130b75dfd50064b4f",
+      "raw_bytes": 345487,
+      "raw_sha256": "eca1c7b71291c03fb4deeb7a97a5bed03a196c5614536af2f387d97af1103e27",
+      "compression": "gzip"
+    },
+    {
+      "file": "hyperliquid_token_details_HYPE.json.gz",
+      "bytes": 2493658,
+      "sha256": "ede5f7d058294def82b3188933c4fcb5880259bd60543f877e3896662abd70c4",
+      "raw_bytes": 5203717,
+      "raw_sha256": "95f2f7c21012482e45db88a8a0afe8a730da31482c13b95703f162ecd2ec21f5",
+      "compression": "gzip"
+    },
+    {
+      "file": "kraken_ohlc_ETHUSD.json",
+      "bytes": 61931,
+      "sha256": "a434387ddbfe8bba3eafb8a79b1e57fd342da5193e084a6e94cae8f6be6cde45"
+    },
+    {
+      "file": "kraken_ohlc_XBTUSD.json",
+      "bytes": 62305,
+      "sha256": "c83572c052465e73821ff0b9601324aba9f776acacef7a75e92f9656e7405157"
+    },
+    {
+      "file": "observations.json",
+      "bytes": 55619,
+      "sha256": "da2ab81c22c871f407eff27aa4c1fb97668f2d2ddc11a52466f8b71a706f8456"
+    },
+    {
+      "file": "okx_funding_BTC-USDT-SWAP.json",
+      "bytes": 524,
+      "sha256": "9576dbad583acdd6eef7efbb7945f84fa78bc932bcab2082ab471ad855de55eb"
+    },
+    {
+      "file": "okx_funding_ETH-USDT-SWAP.json",
+      "bytes": 522,
+      "sha256": "92c47c48a500b617a9b3d4f5bf855f5757746198beb2c7784ef5d8483fe254a7"
+    },
+    {
+      "file": "okx_funding_history_BTC-USDT-SWAP.json",
+      "bytes": 19480,
+      "sha256": "3f52ad506a293ce01ec8e7202b5a56b6a947feddbed1236c7864bcad575a1d2d"
+    },
+    {
+      "file": "okx_funding_history_ETH-USDT-SWAP.json",
+      "bytes": 19666,
+      "sha256": "6bcbedb6f55f62dcbb8b61431d2ccfddfadb3995efe8be74b07ad1a38e0e3c96"
+    },
+    {
+      "file": "okx_oi_BTC-USDT-SWAP.json",
+      "bytes": 189,
+      "sha256": "58bedad1ac26a2ec19e10700b83b6f7a26fc138263766c4fa48bb03dfba7a186"
+    },
+    {
+      "file": "okx_oi_ETH-USDT-SWAP.json",
+      "bytes": 185,
+      "sha256": "c76f99feca9aff0ea6c2f70c4c12ff050273f01931638c6529c5bceaa60c5e50"
+    },
+    {
+      "file": "okx_oi_history_BTC.json",
+      "bytes": 9726,
+      "sha256": "7c1181142a3e599ee7289091195938c094429e46fc26d7a0a2fdf8c3c21d2657"
+    },
+    {
+      "file": "okx_oi_history_ETH.json",
+      "bytes": 9721,
+      "sha256": "2b94488ebe98f6326116dae3c5dce3def1799b815da48cfc828a02148b859758"
+    },
+    {
+      "file": "retrieval-ledger.json",
+      "bytes": 54372,
+      "sha256": "722b23bb77ced445e3ae4fec7d74b9a70e3f0fe125386576a8e218c4fcf3ab56"
+    },
+    {
+      "file": "rpc_AAVE_decimals.json",
+      "bytes": 103,
+      "sha256": "5703d4b6224aca5e99ca0f83a1c6498a6c24a5c77a675c16d0d47af8ac3feee8"
+    },
+    {
+      "file": "rpc_AAVE_symbol.json",
+      "bytes": 231,
+      "sha256": "c8ff4e159dda5d005318c7acbc16ff7ba25d36d67889d3b117175e142f076269"
+    },
+    {
+      "file": "rpc_AAVE_totalSupply.json",
+      "bytes": 103,
+      "sha256": "ba6c2a3b1dbdae6e26fe332c05ba3f4230c67272bbe607f818fc9beeea140823"
+    },
+    {
+      "file": "rpc_AERO_decimals.json",
+      "bytes": 103,
+      "sha256": "eb1491e7ee73b8c00c20f6c14cc08ba880f85b8ac95a685f3f6acf426f743d8b"
+    },
+    {
+      "file": "rpc_AERO_symbol.json",
+      "bytes": 231,
+      "sha256": "b019e03cad9d47faad0a42fa3046a960d4079ecc70392926f85454ee8bd82d7d"
+    },
+    {
+      "file": "rpc_AERO_totalSupply.json",
+      "bytes": 103,
+      "sha256": "7845634e8490f20201d04b6c376e650e4079ff6669a63f190c7a038d9e06ea7f"
+    },
+    {
+      "file": "rpc_LDO_decimals.json",
+      "bytes": 103,
+      "sha256": "eb1491e7ee73b8c00c20f6c14cc08ba880f85b8ac95a685f3f6acf426f743d8b"
+    },
+    {
+      "file": "rpc_LDO_symbol.json",
+      "bytes": 231,
+      "sha256": "17cab0059c19936ceed1403ebe2dfb1e04bdb24cc36a5d16af9c45a25805b5a3"
+    },
+    {
+      "file": "rpc_LDO_totalSupply.json",
+      "bytes": 103,
+      "sha256": "0c627c930a221e59a3e8557b2651ca5251c87b4819b98b4a1d5f0d21a70d04d7"
+    },
+    {
+      "file": "rpc_ONDO_decimals.json",
+      "bytes": 103,
+      "sha256": "eb1491e7ee73b8c00c20f6c14cc08ba880f85b8ac95a685f3f6acf426f743d8b"
+    },
+    {
+      "file": "rpc_ONDO_symbol.json",
+      "bytes": 231,
+      "sha256": "7052065ebe19db1cf729c46d74f409f8f4139ba2c83afb201561961497317ccd"
+    },
+    {
+      "file": "rpc_ONDO_totalSupply.json",
+      "bytes": 103,
+      "sha256": "7f833e5967a7f584f6b4167ae7a60b84fc4a428d86e194799f040406f350211b"
+    },
+    {
+      "file": "rpc_PENDLE_decimals.json",
+      "bytes": 103,
+      "sha256": "eb1491e7ee73b8c00c20f6c14cc08ba880f85b8ac95a685f3f6acf426f743d8b"
+    },
+    {
+      "file": "rpc_PENDLE_symbol.json",
+      "bytes": 231,
+      "sha256": "3d3671162d89de70a9f01bc1f0ba1bf70ae06df897132cbb30928c630fef9395"
+    },
+    {
+      "file": "rpc_PENDLE_totalSupply.json",
+      "bytes": 103,
+      "sha256": "ca53fd052caf641c37071ff942d691f958d0f48cf85b3fbdf1e8c6c58c3441c6"
+    }
+  ]
+}
