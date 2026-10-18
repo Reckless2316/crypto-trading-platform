@@ -292,6 +292,16 @@ class EvaluationTests(Fixture):
                                                   register=self.register("b.json"))
         self.assertIn("stressed_net_lower_bound_positive", losing["ineligible_reasons"])
 
+    def test_diagnostic_mode_never_looks_at_the_holdout(self):
+        replay = self.replay(self.source("chop", choppy(120)))
+        report = self.runner().diagnose(replay)
+        self.assertFalse(report["promotion_eligible"])
+        self.assertEqual(["holdout_not_evaluated"], report["ineligible_reasons"])
+        self.assertIsNone(report["holdout"])
+        self.assertFalse((self.root / "register.json").exists())
+        first = self.runner().evaluate(replay, register=self.register())  # the holdout is still unseen
+        self.assertTrue(first["criteria_results"]["holdout_unseen"]["pass"])
+
     def test_cli_writes_report_reads_source_read_only_and_refuses_reuse(self):
         directory = self.source("chop", choppy(90))
         copy = self.root / "copy"

@@ -327,12 +327,155 @@ def review_account_activity(connection, account_id: str, cutoff_us: int, archive
     return report
 
 
+def _unresolved_escalations(db_path) -> list[dict]:
+    """Unresolved runtime escalations, read from runtime.sqlite3 opened read-only."""
+    import json
+    import sqlite3
+    from pathlib import Path
+    uri = Path(db_path).resolve().as_uri() + "?mode=ro"
+    with sqlite3.connect(uri, uri=True) as db:
+        db.row_factory = sqlite3.Row
+        rows = db.execute("SELECT e.escalation_id, e.decision_id, e.code, e.payload, e.status, e.created_us "
+                          "FROM escalations e LEFT JOIN escalation_resolutions r USING(escalation_id) "
+                          "WHERE r.escalation_id IS NULL ORDER BY e.created_us, e.escalation_id").fetchall()
+    out = []
+    for row in rows:
+        item = dict(row)
+        try:
+            item["payload"] = json.loads(item["payload"]) if item["payload"] else None
+        except ValueError:
+            item["payload"] = {"unparsed": str(item["payload"])[:2000]}
+        out.append(item)
+    return out
+
+
+def review_escalations(db_path, brain, *, data_dir, batch_size: int = 25, day: str | None = None,
+                       now_us: int | None = None) -> list[dict]:
+    """Ask BRAIN about each batch of unresolved escalations and append a proposal per batch.
+
+    Escalations are never resolved here: resolution is operator-only. A provider outage
+    records a PROVIDER_UNAVAILABLE entry for that batch and continues.
+    """
+    import json
+    import time
+    from datetime import datetime, timezone
+    from . import brain_anthropic as ba
+    if type(batch_size) is not int or not 1 <= batch_size <= 200:
+        raise ValueError("invalid escalation batch size")
+    now_us = time.time_ns() // 1000 if now_us is None else now_us
+    day = day or datetime.fromtimestamp(now_us / 1e6, timezone.utc).strftime("%Y-%m-%d")
+    rows = _unresolved_escalations(db_path)
+    entries = []
+    for start in range(0, len(rows), batch_size):
+        batch = rows[start:start + batch_size]
+        refs = [r["escalation_id"] for r in batch]
+        archive_hash = content_hash(json.dumps(batch, sort_keys=True, default=str))
+        job_id = f"escalations-{day}-{start // batch_size}"
+        metrics = {"unresolved_escalations": len(rows), "batch": len(batch)}
+        extra = {"escalations": batch} if isinstance(brain, ba.AnthropicBrain) else {}
+        try:
+            result = brain.review(job_id=job_id, archive_hash=archive_hash, metrics=metrics, **extra)
+            entry = ba.proposal_entry(result, kind="escalation_batch", inputs_hash=archive_hash, now_us=now_us, refs=refs)
+        except ProviderUnavailable as exc:
+            entry = ba.unavailable_entry("escalation_batch", inputs_hash=archive_hash, now_us=now_us,
+                                         reason=str(exc), refs=refs)
+        ba.write_proposal(data_dir, entry, day=day)
+        entries.append(entry)
+    return entries
+
+
+def run_nightly(data_dir, *, brain_choice: str = "deterministic", environ=None, day: str | None = None,
+                now_us: int | None = None, replay_overrides=None, escalation_batch: int = 25) -> dict:
+    """Runtime nightly metrics, a diagnostic replay (no holdout look) and one BRAIN proposal, hashed together."""
+    import json
+    import time
+    from pathlib import Path
+    from . import brain_anthropic as ba
+    from .brain import DeterministicBrain
+    from .replay import AutonomousReplay, EvaluationRunner
+    from .runtime import nightly_review
+    data_dir = Path(data_dir)
+    db_path = data_dir / "runtime.sqlite3"
+    now_us = time.time_ns() // 1000 if now_us is None else now_us
+    brain, notes = ba.build_brain(brain_choice, environ=environ)
+    # Deterministic metrics are produced first and never depend on the provider.
+    nightly = nightly_review(db_path, data_dir / "nightly", now_us=now_us, brain=DeterministicBrain(), day=day)
+    day = nightly["metrics"]["day"]
+    try:
+        replay_report = EvaluationRunner().diagnose(
+            AutonomousReplay(data_dir, config_overrides=replay_overrides).run())
+        replay_error = None
+    except Exception as exc:  # a replay failure is reported, never hidden, and does not block the metrics
+        replay_report, replay_error = None, type(exc).__name__
+    escalations = _unresolved_escalations(db_path)
+    inputs = {"nightly_archive_hash": nightly["archive_hash"], "replay_seal": (replay_report or {}).get("manifest", {}).get("seal")}
+    inputs_hash = content_hash(json.dumps(inputs, sort_keys=True))
+    job_id = "nightly-" + day
+    try:
+        if isinstance(brain, ba.AnthropicBrain):
+            result = brain.review(job_id=job_id, archive_hash=nightly["archive_hash"], metrics=nightly["metrics"],
+                                  escalations=escalations[:escalation_batch], replay_report=replay_report)
+        else:
+            result = brain.review(job_id=job_id, archive_hash=nightly["archive_hash"], metrics=nightly["metrics"])
+        entry = ba.proposal_entry(result, kind="nightly", inputs_hash=inputs_hash, now_us=now_us,
+                                  refs=[nightly["archive_hash"]])
+    except ProviderUnavailable as exc:
+        entry = ba.unavailable_entry("nightly", inputs_hash=inputs_hash, now_us=now_us, reason=str(exc),
+                                     refs=[nightly["archive_hash"]])
+    ba.write_proposal(data_dir, entry, day=day)
+
+    def digest(value):
+        return content_hash(json.dumps(value, sort_keys=True, default=str))
+
+    artifact = {"version": "nightly-combined-v1", "day": day, "generated_us": now_us, "approved": False,
+                "applied": False,
+                "brain": {"choice": brain_choice, "used": "anthropic" if isinstance(brain, ba.AnthropicBrain) else "deterministic",
+                          "model_id": getattr(brain, "model_id", None), "notes": list(notes)},
+                "nightly": {"archive_hash": nightly["archive_hash"], "metrics": nightly["metrics"]},
+                "replay": {"holdout_evaluated": False, "error": replay_error, "report": replay_report},
+                "escalations": {"unresolved": len(escalations), "sent": min(len(escalations), escalation_batch)
+                                if isinstance(brain, ba.AnthropicBrain) else 0},
+                "proposal": entry,
+                "governance": "PROPOSAL ONLY: operator review required; BRAIN cannot approve, activate, arm or clear."}
+    artifact["hashes"] = {"nightly_report": digest(nightly), "replay_report": digest(replay_report),
+                          "escalations": digest(escalations), "proposal": entry["entry_hash"]}
+    artifact["hashes"]["artifact"] = digest({k: v for k, v in artifact.items() if k != "hashes"} | {
+        "hashes": dict(artifact["hashes"])})
+    out = data_dir / "nightly" / f"combined-{day}.json"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(artifact, indent=2, sort_keys=True, default=str) + "\n")
+    return artifact
+
+
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Inspect nightly review scheduling. Does not load keys or call a venue.")
+    parser = argparse.ArgumentParser(description="Nightly review: deterministic metrics, diagnostic replay and a "
+                                                 "proposal-only BRAIN. Never arms, approves or sends orders.")
     parser.add_argument("--next-review-us", type=int, help="Print the next 00:15 UTC slot after this Unix microsecond clock")
+    parser.add_argument("--data-dir", default=None, help="paper runtime directory holding runtime.sqlite3")
+    parser.add_argument("--brain", choices=("deterministic", "anthropic"), default="deterministic",
+                        help="anthropic needs ANTHROPIC_API_KEY or SURGE_BRAIN_API_KEY; otherwise deterministic is used")
+    parser.add_argument("--day", default=None, help="UTC day YYYY-MM-DD (default: yesterday)")
+    parser.add_argument("--horizon-candles", type=int, default=None)
+    parser.add_argument("--lookback-candles", type=int, default=None)
+    parser.add_argument("--review-escalations", action="store_true",
+                        help="also write one proposal per batch of unresolved escalations")
     args = parser.parse_args(argv)
     if args.next_review_us is not None:
         print(next_review_us(args.next_review_us))
+    if args.data_dir:
+        import json
+        from pathlib import Path
+        overrides = {k: v for k, v in (("horizon_candles", args.horizon_candles),
+                                       ("lookback_candles", args.lookback_candles)) if v is not None}
+        artifact = run_nightly(Path(args.data_dir), brain_choice=args.brain, day=args.day,
+                               replay_overrides=overrides or None)
+        if args.review_escalations:
+            from . import brain_anthropic as ba
+            brain, _ = ba.build_brain(args.brain)
+            review_escalations(Path(args.data_dir) / "runtime.sqlite3", brain, data_dir=Path(args.data_dir),
+                               day=artifact["day"])
+        print(json.dumps({"day": artifact["day"], "brain": artifact["brain"], "proposal_status": artifact["proposal"]["status"],
+                          "hashes": artifact["hashes"]}, sort_keys=True))
     return 0
 
 

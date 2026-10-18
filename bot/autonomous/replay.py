@@ -511,7 +511,7 @@ def code_hash() -> str:
 class EvaluationRunner:
     criteria: Criteria = field(default_factory=Criteria)
 
-    def evaluate(self, replay: ReplayResult, *, register: HoldoutRegister, relook: str | None = None) -> dict:
+    def _prepare(self, replay: ReplayResult):
         c = self.criteria
         plan = seal_splits(replay.snapshot_closes, horizon_us=replay.horizon_us, criteria=c,
                            fingerprint=replay.source_fingerprint)
@@ -520,6 +520,27 @@ class EvaluationRunner:
         for name in SPLITS:
             lo, hi = plan.window(name)
             split_report[name] = {"window_us": [lo, hi], **dropped[name], **block_stats(splits[name], c.block_us)}
+        return plan, splits, split_report
+
+    def diagnose(self, replay: ReplayResult) -> dict:
+        """Nightly diagnostics: splits and train/validation calibration only. The holdout is never computed or
+        registered, so a diagnostic run cannot spend it; it can never be promotion eligible."""
+        plan, splits, split_report = self._prepare(replay)
+        return {"version": REPORT_VERSION, "mode": "diagnostic",
+                "manifest": {"source": replay.source, "source_fingerprint": replay.source_fingerprint,
+                             "as_of_us": replay.as_of_us, "code_hash": code_hash(),
+                             "criteria_hash": self.criteria.criteria_hash, "seal": plan.seal},
+                "replay": {"cycles": replay.cycles, "resolved_samples": len(replay.samples),
+                           "decision_errors": replay.decision_errors, "fidelity": replay.fidelity},
+                "splits": {name: {k: v for k, v in split.items()} for name, split in split_report.items()
+                           if name != "holdout"},
+                "calibration": {name: cohort_calibration(splits[name]) for name in ("train", "validation")},
+                "holdout": None, "criteria_results": {}, "promotion_eligible": False,
+                "ineligible_reasons": ["holdout_not_evaluated"]}
+
+    def evaluate(self, replay: ReplayResult, *, register: HoldoutRegister, relook: str | None = None) -> dict:
+        c = self.criteria
+        plan, splits, split_report = self._prepare(replay)
         manifest = {"source": replay.source, "source_fingerprint": replay.source_fingerprint,
                     "as_of_us": replay.as_of_us, "code_hash": code_hash(), "criteria": asdict(c),
                     "criteria_hash": c.criteria_hash, "seal": plan.seal,
