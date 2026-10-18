@@ -13,8 +13,10 @@ An explicit ``--explore-fraction`` permits tiny labeled exploration entries
 (hard ceiling 0.1% of NAV) so paper outcomes can accumulate.
 
 # HANDOFF(claude-opus-5.5 2026-10-17, review fixes applied): remaining for this runtime ->
-#   1. Wire the real JevClient once an approved release bundle + schema resolver exist
-#      (Task 15); today JEV_API_KEY only records `jev_configured_unwired` and stays offline.
+#   1. DONE (inert): `--reflex jev` uses bot/autonomous/jev_reflex.JevReflex -- one batched call per cycle, strict
+#      validation, 250 ms budget, gated on JEV_API_KEY + operator-approved <data-dir>/jev_schema.approved.json.
+#      Failures HOLD entries (REFLEX_UNAVAILABLE:<reason>); offline fallback only via --reflex-fallback offline.
+#      Not yet: authenticated provider evaluation, tokenizer proof, measured latency/calibration (vendor claims).
 #   2. Route paper orders through OrderAuthority/Ledger (Task 12/16) instead of this
 #      runtime's own append-only fill table, so paper and live share one accounting path.
 #   3. DONE: public Coinbase product details (increments, min funds, status) drive rounding and tradability
@@ -101,6 +103,7 @@ class RuntimeConfig:
     max_book_age_us: int = 10_000_000
     close_tolerance_us: int = 10_000_000
     market_rules_ttl_us: int = 3_600_000_000
+    reflex_fallback: str = "none"  # "offline" only by explicit operator flag; rows are then labeled offline
     brier_window: int = 2_000
     paper_armed: bool = False
 
@@ -108,6 +111,8 @@ class RuntimeConfig:
         if not (0 < self.max_drawdown <= DRAWDOWN_CEILING and 0 < self.max_daily_loss <= DAILY_LOSS_CEILING
                 and 0 < self.max_position_fraction <= POSITION_CEILING and 0 <= self.explore_fraction <= EXPLORE_CEILING):
             raise ValueError("risk configuration exceeds a hard ceiling")
+        if self.reflex_fallback not in ("none", "offline"):
+            raise ValueError("reflex fallback must be none or offline")
         if not self.instruments or any(not i or "/" in i for i in self.instruments):
             raise ValueError("invalid instruments")
         if self.candle_seconds <= 0 or self.horizon_candles <= 0 or self.min_labels <= 0 or self.lookback_candles < MIN_HISTORY:
@@ -156,13 +161,21 @@ class Judgment:
     risk_state: AdvisoryRisk
     reflex_id: str
     calibrated: bool = False
+    critical_confidence: float | None = None  # min over regime/direction/quality/risk confidences when the REFLEX reports them
 
     def __post_init__(self):
         if (type(self.regime) is not Regime or type(self.direction) is not Direction
                 or type(self.risk_state) is not AdvisoryRisk or type(self.toxic_flow) is not bool
                 or type(self.setup_quality) is not int or not 0 <= self.setup_quality <= 3
-                or not math.isfinite(self.direction_confidence) or not 0 <= self.direction_confidence <= 1):
+                or not math.isfinite(self.direction_confidence) or not 0 <= self.direction_confidence <= 1
+                or (self.critical_confidence is not None and not (math.isfinite(self.critical_confidence)
+                                                                   and 0 <= self.critical_confidence <= 1))):
             raise ValueError("invalid typed judgment")
+
+    @property
+    def escalation_confidence(self) -> float:
+        return self.direction_confidence if self.critical_confidence is None else min(self.direction_confidence,
+                                                                                      self.critical_confidence)
 
 
 class ReflexPort(Protocol):
@@ -275,6 +288,8 @@ CREATE TABLE IF NOT EXISTS labels(decision_id TEXT PRIMARY KEY, instrument TEXT,
 CREATE TABLE IF NOT EXISTS escalations(escalation_id TEXT PRIMARY KEY, decision_id TEXT, code TEXT, payload TEXT,
   status TEXT, created_us INTEGER);
 CREATE TABLE IF NOT EXISTS escalation_resolutions(escalation_id TEXT PRIMARY KEY, note TEXT, resolved_us INTEGER);
+CREATE TABLE IF NOT EXISTS reflex_calls(call_id INTEGER PRIMARY KEY AUTOINCREMENT, at_us INTEGER, reflex_id TEXT, outcome TEXT,
+  latency_ms REAL, questions INTEGER, status INTEGER, request_hash TEXT, response_hash TEXT, provider_request_id TEXT);
 CREATE TABLE IF NOT EXISTS latches(event_id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT, action TEXT, reason TEXT, at_us INTEGER);
 """
 _INDEXES = """
@@ -291,7 +306,7 @@ CREATE INDEX IF NOT EXISTS fills_created ON fills(created_us);
 CREATE INDEX IF NOT EXISTS escalations_created ON escalations(created_us);
 """
 _APPEND_ONLY = ("meta", "snapshots", "decisions", "fills", "equity_marks", "labels", "escalations",
-                "escalation_resolutions", "latches")
+                "escalation_resolutions", "latches", "reflex_calls")
 
 
 def open_db(path: Path) -> sqlite3.Connection:
@@ -396,6 +411,9 @@ class PaperRuntime:
         self._rules: dict[str, MarketRules] = {}
         self._dust: dict[str, Decimal] = {}
         self.reflex = reflex or OfflineReflex()
+        self._offline = OfflineReflex()
+        self._batch: dict = {}
+        self._batch_wires: dict[str, str] = {}
         self.jev_note = "jev_configured_unwired" if os.environ.get("JEV_API_KEY") else "jev_not_configured"
         if self.db.execute("SELECT COUNT(*) FROM equity_marks").fetchone()[0] == 0:
             now = self.clock_us()
@@ -670,6 +688,7 @@ class PaperRuntime:
             account = self.mark({i: p for i, p in bids.items() if p > 0}, cutoff)
         account["bid"] = {i: Decimal(str(p)) for i, p in bids.items()}
         results = {i: {"status": "hold", "reasons": [e]} for i, e in errors.items()}
+        self._judge_cycle(observed, cutoff, account)
         for instrument, (book, event_us, received_us) in observed.items():
             try:
                 with self._tx():  # snapshot, decision, escalations and fill commit together or not at all
@@ -682,6 +701,44 @@ class PaperRuntime:
         with self._tx():
             labeled = self.label_matured(cutoff)
         return self.write_status(cutoff, results, labeled)
+
+    def _judge_cycle(self, observed: dict, cutoff: int, account: dict) -> None:
+        """Batch-capable REFLEX: one call per cycle for every instrument that is past warmup or holds a position."""
+        self._batch, self._batch_wires = {}, {}
+        if not hasattr(self.reflex, "judge_batch"):
+            return
+        snaps = {}
+        for instrument, (book, event_us, received_us) in observed.items():
+            try:
+                snap = self.snapshot(instrument, book, event_us, received_us, cutoff, account)
+            except Exception:
+                continue  # the per-instrument decision records the reason
+            if snap.history >= MIN_HISTORY or account["positions"].get(instrument, Decimal(0)) > 0:
+                snaps[instrument] = snap
+        if not snaps:
+            return
+        try:
+            self._batch = dict(self.reflex.judge_batch(snaps))
+        except Exception as exc:  # an adapter bug is still only a REFLEX outage
+            self._batch = {i: "adapter_" + type(exc).__name__ for i in snaps}
+        self._batch_wires = {i: s.wire() for i, s in snaps.items()}
+        call = getattr(self.reflex, "last_call", None) or {}
+        with self._tx():
+            self.db.execute("INSERT INTO reflex_calls(at_us,reflex_id,outcome,latency_ms,questions,status,request_hash,"
+                            "response_hash,provider_request_id) VALUES (?,?,?,?,?,?,?,?,?)",
+                            (cutoff, self.reflex.reflex_id, call.get("outcome"), call.get("latency_ms"), call.get("questions"),
+                             call.get("status"), call.get("request_hash"), call.get("response_hash"), call.get("provider_request_id")))
+
+    def _judgment(self, instrument: str, snap: Snapshot) -> tuple[Judgment | None, list[str]]:
+        if not hasattr(self.reflex, "judge_batch"):
+            return self.reflex.judge(snap), []
+        result = self._batch.get(instrument, "not_in_batch")
+        if isinstance(result, Judgment) and self._batch_wires.get(instrument) == snap.wire():
+            return result, []
+        reason = result if isinstance(result, str) else "batch_snapshot_mismatch"
+        if self.config.reflex_fallback == "offline":
+            return self._offline.judge(snap), ["REFLEX_FALLBACK_OFFLINE:" + reason]
+        return None, ["REFLEX_UNAVAILABLE:" + reason]  # never a silent fallback
 
     def _decide(self, instrument, book, event_us, received_us, cutoff, account) -> dict:
         snap = self.snapshot(instrument, book, event_us, received_us, cutoff, account)
@@ -711,20 +768,24 @@ class PaperRuntime:
             self._dust[instrument] = held * bid
         else:
             self._dust.pop(instrument, None)
-        judgment = self.reflex.judge(snap)
-        if warm and (held <= 0 or dust) and judgment.regime is not Regime.CRISIS:
+        flat = held <= 0 or dust
+        if warm and flat and hasattr(self.reflex, "judge_batch") and instrument not in self._batch:
+            return {"status": "warmup", "reasons": ["WARMUP"], "history": snap.history, "snapshot": json.loads(snap.wire())}
+        judgment, reflex_notes = self._judgment(instrument, snap)
+        if warm and flat and (judgment is None or judgment.regime is not Regime.CRISIS):
             # Warmup gates entries only: with no position and no crisis there is nothing for code to do.
             return {"status": "warmup", "reasons": ["WARMUP"], "history": snap.history, "snapshot": json.loads(snap.wire())}
-        decision_id = content_hash((instrument, snap.candle_close_us, judgment.reflex_id))
-        gate = entry_gate(judgment.setup_quality, judgment.direction_confidence, judgment.risk_state,
-                          judgment.toxic_flow, judgment.direction)
+        reflex_id = judgment.reflex_id if judgment else self.reflex.reflex_id
+        decision_id = content_hash((instrument, snap.candle_close_us, reflex_id))
+        gate = judgment is not None and entry_gate(judgment.setup_quality, judgment.direction_confidence, judgment.risk_state,
+                                                   judgment.toxic_flow, judgment.direction)
         escalate = []
-        if judgment.regime is Regime.CRISIS:
+        if judgment is not None and judgment.regime is Regime.CRISIS:
             escalate.append("BRAIN_CRISIS")
             self._latch("CRISIS_HALT", "reflex regime crisis", cutoff)
-        if judgment.direction_confidence < 0.60 and not warm:  # short-history features are not judged for confidence
+        if judgment is not None and judgment.escalation_confidence < 0.60 and not warm:  # short history is not judged
             escalate.append("LOW_CONFIDENCE")
-        reasons, action = list(escalate) + (["WARMUP"] if warm else []), "hold"
+        reasons, action = reflex_notes + list(escalate) + (["WARMUP"] if warm else []), "hold"
         fill, exploration = None, False
         if (self.config.data_dir / "KILL").exists():
             reasons.append("KILL_SWITCH")  # armed kill file: no order path is entered at all
@@ -746,8 +807,8 @@ class PaperRuntime:
         elif held > 0 and not dust:
             if not escalate:
                 reasons.append("ENTRY_SLOT_OCCUPIED")  # one entry per instrument until its exit
-        elif escalate or warm:
-            pass
+        elif escalate or warm or judgment is None:
+            pass  # escalation, warmup and a REFLEX outage block entries only
         elif entry_block:
             reasons.append(entry_block)
         elif not gate:
@@ -774,10 +835,11 @@ class PaperRuntime:
                     action = "buy" if fill else "hold"
                     if not fill:
                         reasons.append("ENTRY_UNFILLED")
+        phase = "warmup" if warm else "live" if judgment is not None else "reflex_unavailable"
+        typed = (int(judgment.calibrated), judgment.regime.value, judgment.direction.value, judgment.direction_confidence,
+                 int(judgment.toxic_flow), judgment.setup_quality, judgment.risk_state.value) if judgment else (0,) + (None,) * 6
         self.db.execute("INSERT INTO decisions VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (decision_id, instrument, snap.candle_close_us,
-                        judgment.reflex_id, int(judgment.calibrated), judgment.regime.value, judgment.direction.value,
-                        judgment.direction_confidence, int(judgment.toxic_flow), judgment.setup_quality, judgment.risk_state.value,
-                        int(gate and not warm), action, json.dumps(reasons), snap.mid, cutoff, "warmup" if warm else "live"))
+                        reflex_id, *typed, int(gate and not warm), action, json.dumps(reasons), snap.mid, cutoff, phase))
         for code in escalate:
             if code == "LOW_CONFIDENCE" and self.db.execute(self.OPEN_LOW_CONFIDENCE_SQL, (instrument, cutoff - _HOUR_US)).fetchone():
                 continue  # at most one unresolved low-confidence escalation per instrument per hour
@@ -788,7 +850,7 @@ class PaperRuntime:
             self.db.execute("INSERT INTO fills VALUES (?,?,?,?,?,?,?,?,?,?)", (content_hash((decision_id, action)), decision_id, instrument,
                             action, str(qty), str(avg), str(notional), str(fee), int(action == "buy" and exploration), cutoff))
         return {"status": "warmup" if warm and action == "hold" else action, "reasons": reasons, "decision_id": decision_id,
-                "judgment": _judgment_dict(judgment), "history": snap.history,
+                "judgment": _judgment_dict(judgment) if judgment else None, "history": snap.history,
                 "gate_open": gate and not warm, "snapshot": json.loads(snap.wire()), "token_estimate": snap.token_estimate()}
 
     def _entry_notional(self, instrument, judgment: Judgment, account, rules: MarketRules) -> tuple[Decimal, bool, list[str]]:
@@ -811,7 +873,7 @@ class PaperRuntime:
             return Decimal(0), False, ["MAX_POSITION"]
         return notional, False, ["SIZE_CAPPED"] if notional < kelly else []
 
-    def _exit_reason(self, instrument, judgment: Judgment, close_us: int, account) -> str | None:
+    def _exit_reason(self, instrument, judgment: Judgment | None, close_us: int, account) -> str | None:
         last_buy = self.db.execute("SELECT d.candle_close_us FROM fills f JOIN decisions d USING(decision_id) "
                                    "WHERE f.instrument=? AND f.side='buy' ORDER BY f.created_us DESC LIMIT 1", (instrument,)).fetchone()
         horizon = self.config.horizon_candles * self.config.candle_seconds * 1_000_000
@@ -819,6 +881,8 @@ class PaperRuntime:
             return "TIME_STOP"
         if "DRAWDOWN_LATCH" in self.latched() or account["drawdown"] >= self.config.max_drawdown:
             return "DRAWDOWN"
+        if judgment is None:
+            return None  # without a judgment only the code exits above apply
         if judgment.regime is Regime.CRISIS:
             return "CRISIS"
         if judgment.risk_state is AdvisoryRisk.REDUCE:
@@ -832,6 +896,7 @@ class PaperRuntime:
         brier, resolved = self.brier()
         status = {"mode": "paper", "live": False, "armed_paper": self.config.paper_armed,
                   "kill_switch": (self.config.data_dir / "KILL").exists(), "reflex": self.reflex.reflex_id,
+                  "reflex_last_call": getattr(self.reflex, "last_call", None), "reflex_fallback": self.config.reflex_fallback,
                   "reflex_calibrated": False, "jev": self.jev_note, "at_us": now,
                   "equity_usd": mark["equity_usd"], "cash_usd": mark["cash_usd"], "high_water_usd": mark["high_water_usd"],
                   "day_open_usd": mark["day_open_usd"], "positions": {k: str(v) for k, v in self.positions().items()},
@@ -945,7 +1010,7 @@ def nightly_review(db_path: Path, out_dir: Path, *, now_us: int | None = None, b
 def _judgment_dict(j: Judgment) -> dict:
     return {"regime": j.regime.value, "direction": j.direction.value, "direction_confidence": j.direction_confidence,
             "toxic_flow": j.toxic_flow, "setup_quality": j.setup_quality, "risk_state": j.risk_state.value,
-            "reflex_id": j.reflex_id, "calibrated": j.calibrated}
+            "reflex_id": j.reflex_id, "calibrated": j.calibrated, "critical_confidence": j.critical_confidence}
 
 
 def _day(now_us: int) -> str:
@@ -979,14 +1044,32 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--report", action="store_true", help="run nightly review and exit")
     parser.add_argument("--review-day", help="UTC day YYYY-MM-DD for --report (default: previous complete day)")
     parser.add_argument("--clear-latch", help="operator: clear one latch kind")
+    parser.add_argument("--reflex", choices=("offline", "jev"), default="offline")
+    parser.add_argument("--reflex-fallback", choices=("none", "offline"), default="none",
+                        help="explicit opt-in: judge with the labeled offline reflex when Jev is unavailable")
+    parser.add_argument("--jev-model", default=None, help="exact Jev model version (default jev-1.14.0)")
+    parser.add_argument("--jev-budget-ms", type=int, default=250)
+    parser.add_argument("--write-jev-schema", action="store_true", help="write the proposed Jev schema for operator approval")
     args = parser.parse_args(argv)
     config = RuntimeConfig(tuple(i.strip() for i in args.instruments.split(",") if i.strip()), Path(args.data_dir),
                            args.candle_seconds, args.horizon_candles, explore_fraction=args.explore_fraction,
-                           paper_armed=args.arm_paper)
+                           paper_armed=args.arm_paper, reflex_fallback=args.reflex_fallback)
     if args.report:
         print(json.dumps(nightly_review(config.data_dir / "runtime.sqlite3", config.data_dir / "reviews", day=args.review_day)["metrics"], default=str))
         return 0
-    runtime = PaperRuntime(config)
+    reflex = None
+    if args.reflex == "jev" or args.write_jev_schema:
+        from .jev_reflex import DEFAULT_MODEL, JevReflex, write_proposed_schema
+        # The key is read here only; the adapter refuses to send anything without the operator-approved schema file.
+        reflex = JevReflex(data_dir=config.data_dir, api_key=os.environ.get("JEV_API_KEY") or None,
+                           model=args.jev_model or DEFAULT_MODEL, budget_ms=args.jev_budget_ms,
+                           horizon_candles=config.horizon_candles, candle_seconds=config.candle_seconds)
+        if args.write_jev_schema:
+            path = write_proposed_schema(config.data_dir, reflex.schema)
+            print(json.dumps({"proposed": str(path), "schema_hash": reflex.schema_hash,
+                              "approve_by": "operator copies it to jev_schema.approved.json"}))
+            return 0
+    runtime = PaperRuntime(config, reflex=reflex)
     try:
         if args.clear_latch:
             runtime.clear_latch(args.clear_latch)

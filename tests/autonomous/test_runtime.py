@@ -482,6 +482,7 @@ class ReviewFindingTests(RuntimeCase):
         rt.db.execute("INSERT INTO latches(kind,action,reason,at_us) VALUES ('X','set','t',0)")
         rt.db.execute("INSERT INTO escalations VALUES ('e','d','LOW_CONFIDENCE','{}','pending_brain',0)")
         rt.resolve_escalation("e", "reviewed")
+        rt.db.execute("INSERT INTO reflex_calls(at_us,reflex_id,outcome) VALUES (0,'jev:test','ok')")
         for table in _APPEND_ONLY:
             self.assertGreater(rt.db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0], 0, table)
             for sql in (f"UPDATE {table} SET rowid=rowid", f"DELETE FROM {table}"):
