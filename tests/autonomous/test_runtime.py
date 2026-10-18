@@ -411,6 +411,18 @@ class ReviewFindingTests(RuntimeCase):
         self.assertEqual(0, close["candle_close_us"] % 60_000_000)
         self.assertTrue(0 <= close["event_us"] - close["candle_close_us"] <= rt.config.close_tolerance_us)
 
+    def test_local_clock_ahead_of_exchange_still_snapshots_the_close(self):
+        # Observed in WSL: local clock ~4 s ahead of Coinbase. A wake at local close+1 s sees an exchange
+        # event ~3 s before the boundary; it is the pre-close book and belongs to that close, not 57 s late.
+        rt = PaperRuntime(RuntimeConfig(data_dir=self.dir, instruments=("AAVE-USD",)),
+            book_source=FakeBooks(self.clock, {"AAVE-USD": lambda: 100.0}, lag_us=4_000_000), clock_us=self.clock)
+        self.addCleanup(rt.close)
+        result = rt.cycle()["instruments"]["AAVE-USD"]
+        self.assertNotIn("AWAY_FROM_CLOSE", result["reasons"])
+        close = rt.db.execute("SELECT candle_close_us, event_us FROM snapshots").fetchone()
+        self.assertEqual(START_US, close["candle_close_us"])
+        self.assertLessEqual(abs(close["event_us"] - close["candle_close_us"]), rt.config.close_tolerance_us)
+
     def test_brier_split_and_unresolved_escalations(self):
         rt = self.runtime(replace(GOOD, direction_confidence=0.5), horizon_candles=3)
         self.advance(rt, 25)

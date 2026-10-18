@@ -415,15 +415,16 @@ class PaperRuntime:
         return book, parse_event_us(book.get("exchange_time")), received
 
     def snapshot(self, instrument, book, event_us, received_us, cutoff_us, account) -> Snapshot:
-        """``candle_close_us`` is the true close: the candle boundary at or before the event, which must lie within
-        ``close_tolerance_us`` after it. Features use only contiguous earlier closes received by the cutoff."""
+        """``candle_close_us`` is the true close: the candle boundary nearest the event, which must lie within
+        ``close_tolerance_us`` of it. Features use only contiguous earlier closes received by the cutoff."""
         if event_us > cutoff_us or received_us > cutoff_us:
             raise Unavailable("FUTURE_OBSERVATION")
         if cutoff_us - event_us > self.config.max_book_age_us:
             raise Unavailable("STALE_BOOK")
         step = self.config.candle_seconds * 1_000_000
-        close = event_us // step * step
-        if event_us - close > self.config.close_tolerance_us:
+        # Nearest boundary: a pre-close book (local clock ahead of the venue) is that close's state; never later data.
+        close = (event_us + step // 2) // step * step
+        if abs(event_us - close) > self.config.close_tolerance_us:
             raise Unavailable("AWAY_FROM_CLOSE")
         bids, asks = _levels(book.get("bids")), _levels(book.get("asks"))
         try:
