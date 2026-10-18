@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 import re
+import threading
 from abc import ABC, abstractmethod
 from fractions import Fraction
 from dataclasses import dataclass
@@ -219,6 +220,8 @@ class ManagedBoundedTransport:
         if type(account_id) is not str or not account_id:
             raise LiveTradingRejected('Managed account identity required')
         self.client, self.account_id = client, account_id
+        # The injected client is owned exclusively by this transport/LiveVenue.
+        self.client_lock = threading.RLock()
         self.capability_verifier = capability_verifier
         self.clock_us, self.monotonic_ns = clock_us, monotonic_ns
 
@@ -240,7 +243,7 @@ class ManagedBoundedTransport:
             raise reject('Invalid managed dispatch identity/state/side')
         if (market.venue != self.venue or not market.spot_allowed or not market.limit_ioc_verified
                 or market.quote_asset != 'USD' or p.instrument != market.instrument
-                or market.instrument != f'{market.base_asset}/USD'
+                or market.instrument != f'{market.base_asset}-USD'
                 or not re.fullmatch(r'[A-Z0-9]+', market.base_asset)):
             raise reject('Verified Coinbase USD spot market required')
         if (reservation.intent_id != intent.intent_id
@@ -293,5 +296,8 @@ class ManagedBoundedTransport:
         if (self.monotonic_ns() >= p.deadline_mono_ns
                 or self.clock_us() >= min(market.expires_at_us, evidence.expires_at_us)):
             raise reject('Dispatch expired during capability verification')
-        return self.client.create_order(p.instrument, 'limit', p.side.value, quantity, price,
-            {'timeInForce': 'IOC', 'clientOrderId': intent.client_order_id})
+        with self.client_lock:
+            if self.monotonic_ns() >= p.deadline_mono_ns:
+                raise reject('Dispatch expired waiting for client')
+            return self.client.create_order(f'{market.base_asset}/USD', 'limit', p.side.value, quantity, price,
+                {'timeInForce': 'IOC', 'clientOrderId': intent.client_order_id})

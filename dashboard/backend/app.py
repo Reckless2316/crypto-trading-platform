@@ -12,17 +12,20 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Literal
 
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
+
+from dashboard.backend.authority_client import gateway_for, set_session_cookie
 
 from bot.risk_gates import RiskGates
 from bot.onboard_ai import OnboardTradingAgent
-from bot.live_coinbase_adapter import (LiveCoinbaseAccount, LiveConfig, LiveTradingDisabled,
-                                       LiveTradingRejected)
+from data.call_log import DataCallLog
+from data.public_metrics import fetch_coinbase_book, fetch_global, fetch_listed_markets
 from data.collectors.coinbase_collector import CoinbaseCollector
 from data.collectors.collector_base import Candle
 from data.history import CandleHistoryStore, ExchangeHistory
+from research.autonomous.status_cards import candidate_cards
 from data.backtesting import BacktestEngine
 from strategies.strategy_suite import STRATEGY_CATALOG, generate_signal
 
@@ -40,6 +43,38 @@ FRONTEND = ROOT / "dashboard" / "frontend" / "index.html"
 app = FastAPI(title="SURGE Crypto Trading Platform", version="1.1.0")
 logger = logging.getLogger("surge.collector")
 live_armed_until = 0.0
+
+_MANAGED_MUTATIONS = frozenset({"/api/orders", "/api/control/arm", "/api/control/kill",
+    "/api/control/flatten", "/api/live/arm", "/api/live/disarm", "/api/live/orders", "/api/automation"})
+
+
+@app.middleware("http")
+async def authenticate_managed_mutations(request: Request, call_next):
+    execute = request.query_params.get('execute', '').lower() in {'true', '1', 'yes', 'on'}
+    managed = request.method == 'POST' and (request.url.path in _MANAGED_MUTATIONS
+        or request.url.path == '/api/strategy/run' and execute)
+    if managed:
+        try:
+            gateway_for(request, mutation=True)
+        except HTTPException as exc:
+            return JSONResponse(status_code=exc.status_code, content={'detail': exc.detail})
+    return await call_next(request)
+
+
+@app.get('/api/session')
+def browser_session(request: Request):
+    gateway = gateway_for(request)
+    session = gateway.authenticate(request)
+    result = JSONResponse({'actor': session.actor, 'role': session.role,
+        'csrf_token': session.csrf_token})
+    set_session_cookie(result, session)
+    return result
+
+
+@app.get('/api/control/status')
+def authority_status(request: Request):
+    return gateway_for(request).forward(request, 'status')
+
 
 
 def db() -> sqlite3.Connection:
@@ -106,7 +141,6 @@ def init_db() -> None:
         con.commit()
 
 
-init_db()
 
 
 def store_candles(symbol: str, timeframe: str, candles: list, source: str = "coinbase") -> None:
@@ -129,7 +163,6 @@ async def collector_loop() -> None:
             if candles:
                 await asyncio.to_thread(store_candles, "BTC-USD", "1h", candles)
                 app.state.market_data = {"last_success": time.time(), "candles": len(candles), "error": None}
-                await asyncio.to_thread(run_automation_for_new_candle)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -141,6 +174,11 @@ async def collector_loop() -> None:
 
 @app.on_event("startup")
 async def start_collector() -> None:
+    provider_names = {"SURGE_COINBASE_API_KEY", "SURGE_COINBASE_API_SECRET",
+        "SURGE_BINANCE_API_KEY", "SURGE_BINANCE_API_SECRET", "TYPESAFE_API_KEY", "SURGE_BRAIN_API_KEY"}
+    if any(os.environ.get(name) for name in provider_names):
+        raise RuntimeError("Dashboard must start without provider credentials")
+    init_db()
     app.state.market_data = {"last_success": None, "candles": 0, "error": None}
     app.state.collector_task = asyncio.create_task(collector_loop())
 
@@ -191,8 +229,8 @@ class LiveOrderRequest(BaseModel):
     quote_amount: float = Field(gt=0, le=500)
 
 
-def live_config() -> LiveConfig:
-    return LiveConfig.from_env()
+def live_config():
+    raise HTTPException(409, "Venue configuration belongs to the authority")
 
 
 def latest_price(con: sqlite3.Connection, symbol: str) -> float | None:
@@ -214,54 +252,12 @@ def gate_state(con: sqlite3.Connection) -> dict:
             "max_daily_loss_pct": MAX_DAILY_LOSS_PCT, "max_open_positions": MAX_OPEN_POSITIONS, "details": details}
 
 
+def _refuse_dashboard_fill(route: str) -> None:
+    raise HTTPException(status_code=409, detail="Paper fills are accepted only by the autonomous paper authority")
+
+
 def execute_order(con: sqlite3.Connection, symbol: str, side: str, usd_amount: float, strategy: str) -> dict:
-    gate = gate_state(con)
-    if side == "buy" and not gate["allowed"]:
-        raise HTTPException(status_code=409, detail={"message": "Order blocked by risk gates", "gates": gate})
-    price = latest_price(con, symbol)
-    if not price or price <= 0:
-        raise HTTPException(status_code=409, detail="No stored Coinbase hourly price; refresh market data first")
-    position = con.execute("SELECT qty,avg_price FROM positions WHERE account_id=? AND symbol=?", (ACCOUNT_ID, symbol)).fetchone()
-    current_qty = float(position["qty"]) if position else 0.0
-    state = con.execute("SELECT cash,starting_equity FROM account_state WHERE account_id=?", (ACCOUNT_ID,)).fetchone()
-    if side == "buy":
-        max_usd = float(state["starting_equity"]) * MAX_POSITION_PCT / 100
-        room = max(0.0, max_usd - current_qty * price)
-        spend = min(usd_amount, room, float(state["cash"]) / (1 + FEE_RATE))
-        if spend < 1.0:
-            raise HTTPException(status_code=409, detail="Position limit or available cash prevents this buy")
-        open_count = con.execute("SELECT COUNT(*) FROM positions WHERE account_id=? AND qty>0", (ACCOUNT_ID,)).fetchone()[0]
-        control = con.execute("SELECT kill_switch,armed_until FROM runtime_state WHERE id=1").fetchone()
-        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        realized_today = con.execute("SELECT COALESCE(SUM(realized_pnl),0) FROM orders WHERE account_id=? AND side='sell' AND date(created_at,'unixepoch')=?", (ACCOUNT_ID,today)).fetchone()[0]
-        allowed, reason, details = RiskGates({"max_position_pct":MAX_POSITION_PCT,"max_daily_loss_pct":MAX_DAILY_LOSS_PCT,"max_open_positions":MAX_OPEN_POSITIONS}).evaluate({
-            "kill_switch":bool(control["kill_switch"]),"armed_until":control["armed_until"],"now":time.time(),
-            "starting_equity":state["starting_equity"],"daily_realized_pnl":realized_today,"side":"buy",
-            "is_new_position":current_qty<=0,"open_positions":open_count,"current_position_value":current_qty*price,
-            "order_value":spend,"available_cash":state["cash"]})
-        if not allowed:
-            raise HTTPException(status_code=409,detail={"message":reason,"gates":details})
-        qty = spend / price
-        fee = spend * FEE_RATE
-        new_qty = current_qty + qty
-        avg = ((current_qty * float(position["avg_price"])) + spend + spend * FEE_RATE) / new_qty if current_qty > 0 else price * (1 + FEE_RATE)
-        con.execute("UPDATE account_state SET cash=cash-? WHERE account_id=?", (spend + fee, ACCOUNT_ID))
-        realized = 0.0
-    else:
-        if current_qty <= 0:
-            raise HTTPException(status_code=409, detail="No long position to sell")
-        qty = min(current_qty, usd_amount / price)
-        proceeds = qty * price
-        fee = proceeds * FEE_RATE
-        realized = qty * (price - float(position["avg_price"])) - fee
-        new_qty = current_qty - qty
-        avg = float(position["avg_price"])
-        con.execute("UPDATE account_state SET cash=cash+? WHERE account_id=?", (proceeds - fee, ACCOUNT_ID))
-    con.execute("INSERT INTO positions(account_id,symbol,qty,avg_price,updated_at) VALUES(?,?,?,?,?) ON CONFLICT(account_id,symbol) DO UPDATE SET qty=excluded.qty,avg_price=excluded.avg_price,updated_at=excluded.updated_at",
-                (ACCOUNT_ID, symbol, new_qty, avg, time.time()))
-    cur = con.execute("INSERT INTO orders(account_id,symbol,side,qty,price,fee,realized_pnl,strategy,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
-                      (ACCOUNT_ID, symbol, side, qty, price, fee, realized, strategy, time.time()))
-    return {"id": cur.lastrowid, "account": ACCOUNT_ID, "symbol": symbol, "side": side, "qty": qty, "price": price, "fee": fee, "realized_pnl": realized, "status": "filled", "mode": "paper"}
+    _refuse_dashboard_fill("execute_order")
 
 
 def portfolio(con: sqlite3.Connection) -> dict:
@@ -300,7 +296,8 @@ def health():
 @app.get("/api/status")
 def status():
     with closing(db()) as con:
-        return {"mode": "paper", "gates": gate_state(con), "portfolio": portfolio(con),
+        return {"mode": "paper", "accounting_source": "legacy_display_only",
+                "authority_status_url": "/api/control/status", "gates": gate_state(con), "portfolio": portfolio(con),
                 "data_source": "Coinbase, Binance, and Kraken public candle history", "market_collector": getattr(app.state, "market_data", {"last_success":None,"candles":0,"error":None})}
 
 
@@ -369,162 +366,43 @@ def automation_state() -> dict:
         return {"enabled": bool(row["enabled"]), "mode": "paper", "last_candle_ts": row["last_candle_ts"]}
 
 
-def run_automation_for_new_candle() -> dict | None:
-    """Evaluate once per newly stored BTC hourly candle; paper orders remain gated."""
-    with closing(db()) as con:
-        state = con.execute("SELECT enabled,last_candle_ts FROM automation_state WHERE id=1").fetchone()
-        if not state["enabled"]:
-            return None
-        latest = con.execute("SELECT MAX(ts_open) FROM candles WHERE symbol='BTC-USD' AND timeframe='1h' AND ts_open+3600000<=?", (int(time.time() * 1000),)).fetchone()[0]
-        if latest is None or int(latest) <= int(state["last_candle_ts"]):
-            return None
-        con.execute("UPDATE automation_state SET last_candle_ts=? WHERE id=1", (latest,))
-        rows = con.execute("SELECT high,low,close FROM candles WHERE symbol='BTC-USD' AND timeframe='1h' AND ts_open<=? ORDER BY ts_open", (latest,)).fetchall()
-        if len(rows) < 27:
-            con.commit()
-            return None
-        decision = OnboardTradingAgent().analyze("BTC-USD", [float(r["close"]) for r in rows],
-            highs=[float(r["high"]) for r in rows], lows=[float(r["low"]) for r in rows])
-        created = time.time()
-        con.execute("INSERT INTO ai_decisions(symbol,action,score,created_at,details_json) VALUES(?,?,?,?,?)",
-                    ("BTC-USD", decision["action"], decision["score"], created, json.dumps(decision)))
-        order = None
-        price = float(rows[-1]["close"])
-        position = con.execute("SELECT qty FROM positions WHERE account_id=? AND symbol='BTC-USD'", (ACCOUNT_ID,)).fetchone()
-        if decision["action"] == "buy" and (not position or float(position["qty"]) <= 0):
-            gate = gate_state(con)
-            if gate["allowed"]:
-                order = execute_order(con, "BTC-USD", "buy", STARTING_CASH * MAX_POSITION_PCT / 100, "onboard_ai_ensemble")
-            else:
-                order = {"status": "blocked", "reason": gate["reasons"]}
-        elif decision["action"] == "sell_or_reduce" and position and float(position["qty"]) > 0:
-            order = execute_order(con, "BTC-USD", "sell", float(position["qty"]) * price, "onboard_ai_ensemble")
-        con.commit()
-        return {"symbol": "BTC-USD", "candle_ts": int(latest), "decision": decision, "order": order}
+def run_automation_for_new_candle() -> None:
+    """Compatibility hook: only the isolated authority worker schedules decisions."""
+    return None
 
 
 @app.get("/api/automation")
 def get_automation():
-    current = automation_state()
-    with closing(db()) as con:
-        current["gates"] = gate_state(con)
-    return current
+    return {"enabled": False, "mode": "paper", "last_candle_ts": None,
+            "status": "authority_worker_required"}
 
 
 @app.post("/api/automation")
 def set_automation(request: AutomationRequest):
-    with closing(db()) as con:
-        if request.enabled:
-            gates = gate_state(con)
-            if not gates["allowed"]:
-                raise HTTPException(status_code=409, detail={"message": "Arm paper trading before enabling automated execution", "gates": gates})
-            latest = con.execute("SELECT COALESCE(MAX(ts_open),0) FROM candles WHERE symbol='BTC-USD' AND timeframe='1h'").fetchone()[0]
-            con.execute("UPDATE automation_state SET enabled=1,last_candle_ts=? WHERE id=1", (latest,))
-        else:
-            con.execute("UPDATE automation_state SET enabled=0 WHERE id=1")
-        con.commit()
-    return automation_state()
+    raise HTTPException(409, "Authority automation handler unavailable")
 
 
 @app.get("/api/live/status")
 def live_status():
-    try:
-        config = live_config()
-        configured = bool(config.enabled and config.armed and config.api_key and config.api_secret and config.max_order_quote > 0)
-        user_armed = configured and live_armed_until > time.time()
-        missing = []
-        if not config.enabled:
-            missing.append("SURGE_LIVE_TRADING_ENABLED=true")
-        if not config.armed:
-            missing.append("SURGE_LIVE_TRADING_ARMED=I_ACCEPT_LIVE_TRADING_RISK")
-        if not config.api_key:
-            missing.append("exchange API key")
-        if not config.api_secret:
-            missing.append("exchange API secret")
-        if config.max_order_quote <= 0:
-            missing.append("positive SURGE_LIVE_MAX_ORDER_QUOTE")
-        return {"configured": configured, "enabled": config.enabled, "exchange": config.exchange_id,
-                "user_armed": user_armed, "armed_seconds_remaining": max(0, int(live_armed_until-time.time())) if user_armed else 0,
-                "max_order_quote": config.max_order_quote if configured else 0,
-                "mode": "live" if user_armed else "paper", "missing_requirements": missing}
-    except (LiveTradingDisabled, ValueError) as exc:
-        return {"configured": False, "enabled": False, "exchange": None, "user_armed": False,
-                "armed_seconds_remaining": 0, "max_order_quote": 0, "mode": "paper",
-                "missing_requirements": [str(exc)]}
+    """Public availability only; provider credentials are never read by web routes."""
+    return {"configured": False, "enabled": False, "exchange": None,
+            "user_armed": False, "armed_seconds_remaining": 0, "max_order_quote": 0,
+            "mode": "paper", "missing_requirements": ["Authenticated authority status required"]}
 
 
 @app.post("/api/live/arm")
 def arm_live(request: LiveArmRequest):
-    global live_armed_until
-    if request.acknowledgement != "I UNDERSTAND THIS SENDS REAL ORDERS":
-        raise HTTPException(status_code=400, detail="Explicit live-order acknowledgement is required")
-    try:
-        config = live_config()
-        # The server-side enable flag and exact environment latch are separate from this UI arm.
-        LiveCoinbaseAccount(config, user_armed=True, client=object())
-    except (LiveTradingDisabled, ValueError) as exc:
-        raise HTTPException(status_code=409, detail=str(exc))
-    live_armed_until = time.time() + 300
-    return {"status": "live_armed", "expires_at": live_armed_until,
-            "warning": "Real exchange orders can now be submitted for five minutes."}
+    raise HTTPException(409, "Authority live activation handler unavailable")
 
 
 @app.post("/api/live/disarm")
 def disarm_live():
-    global live_armed_until
-    live_armed_until = 0
-    return {"status": "disarmed", "mode": "paper"}
+    raise HTTPException(409, "Authority disarm handler unavailable")
 
 
 @app.post("/api/live/orders")
 def place_live_order(request: LiveOrderRequest):
-    if live_armed_until <= time.time():
-        raise HTTPException(status_code=409, detail="Live trading is not user-armed")
-    try:
-        config = live_config()
-        account = LiveCoinbaseAccount(config, user_armed=True)
-        expected_quote = "USDT" if config.exchange_id == "binance" else "USD"
-        if request.symbol.split("/")[1] != expected_quote:
-            raise LiveTradingRejected(f"{config.exchange_id} live symbols must use {expected_quote} quote currency")
-        account.client.load_markets()
-        reference_price = float(account.client.fetch_ticker(request.symbol).get("last") or 0)
-        if reference_price <= 0:
-            raise LiveTradingRejected("Exchange returned no usable market price")
-        balance = account.get_balances()
-        base, quote = request.symbol.split("/")
-        free = balance.get("free", {})
-        available = float(free.get(quote if request.side == "buy" else base, 0) or 0)
-        day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        with closing(db()) as con:
-            daily_total = float(con.execute("SELECT COALESCE(SUM(quote_amount),0) FROM live_orders WHERE date(created_at,'unixepoch')=?", (day,)).fetchone()[0])
-        daily_cap = config.max_order_quote * 5
-        if daily_total + request.quote_amount > daily_cap:
-            raise LiveTradingRejected("Order exceeds the daily live quote-volume cap")
-        if request.quote_amount > config.max_order_quote:
-            raise LiveTradingRejected("Order exceeds the configured per-order cap")
-        if not (request.quote_amount <= available if request.side == "buy"
-                else request.quote_amount / reference_price <= available):
-            raise LiveTradingRejected("Order exceeds the configured cap or available exchange balance")
-        def risk_check(context):
-            if context["order_value"] > config.max_order_quote or daily_total + context["order_value"] > daily_cap:
-                return False
-            if request.side == "buy":
-                # Leave a small quote balance reserve for exchange fees/rounding.
-                return context["order_value"] <= available * 0.995
-            return context["amount"] <= available
-        order = account.place_market_order(request.symbol, request.side, request.quote_amount,
-            reference_price, risk_check=risk_check)
-        with closing(db()) as con:
-            cur = con.execute("INSERT INTO live_orders(exchange,symbol,side,quote_amount,status,exchange_order_id,created_at,response_json) VALUES(?,?,?,?,?,?,?,?)",
-                (config.exchange_id, request.symbol, request.side, request.quote_amount,
-                 str(order.get("status", "submitted")), str(order.get("id", "")), time.time(), json.dumps(order, default=str)))
-            con.commit()
-        return {"id": cur.lastrowid, "exchange": config.exchange_id, "mode": "live", "order": order}
-    except (LiveTradingDisabled, LiveTradingRejected, ValueError, RuntimeError) as exc:
-        raise HTTPException(status_code=409, detail=str(exc))
-    except Exception as exc:
-        logger.exception("Live order request failed")
-        raise HTTPException(status_code=502, detail=f"Exchange rejected or failed the live order request: {exc}")
+    raise HTTPException(409, "Authority live order handler unavailable")
 
 
 @app.get("/api/live/orders")
@@ -590,10 +468,17 @@ def refresh_market(symbol: str = "BTC-USD", timeframe: str = "1h", limit: int = 
     end = int(time.time())
     seconds = {"1m":60,"5m":300,"15m":900,"1h":3600,"4h":14400,"1d":86400}[timeframe]
     start_ms, end_ms = (end - limit * seconds) * 1000, end * 1000
+    started = time.time()
     try:
         candles = ExchangeHistory().fetch(exchange, symbol, timeframe, start_ms, end_ms,
                                           CandleHistoryStore(DB_FILE))
+        DataCallLog(DB_FILE).record(source=exchange, symbol=symbol, timeframe=timeframe,
+                                    started_at=started, elapsed_ms=int((time.time() - started) * 1000),
+                                    ok=bool(candles), row_count=len(candles), status_code=200 if candles else 204)
     except Exception as exc:
+        DataCallLog(DB_FILE).record(source=exchange, symbol=symbol, timeframe=timeframe,
+                                    started_at=started, elapsed_ms=int((time.time() - started) * 1000),
+                                    ok=False, row_count=0, error=type(exc).__name__)
         raise HTTPException(status_code=502, detail=f"{exchange} request failed: {exc}")
     if not candles:
         raise HTTPException(status_code=502, detail=f"{exchange} returned no candles")
@@ -601,6 +486,504 @@ def refresh_market(symbol: str = "BTC-USD", timeframe: str = "1h", limit: int = 
         store_candles(symbol, timeframe, candles)
     candles.sort(key=lambda c: c.ts_open)
     return {"exchange": exchange, "symbol": symbol, "timeframe": timeframe, "count": len(candles), "source": exchange, "candles": [c.__dict__ for c in candles]}
+
+
+def _stored_close_change(con: sqlite3.Connection, symbol: str) -> dict:
+    rows = con.execute(
+        "SELECT ts_open, open, high, low, close FROM candles WHERE symbol=? AND timeframe='1h' ORDER BY ts_open",
+        (symbol,)).fetchall()
+    body = {"symbol": symbol, "present": bool(rows), "candles": len(rows), "closed_candles": 0,
+            "open_dropped": 0, "consistent": False, "close_change": None, "first_open": None, "last_open": None}
+    if len(rows) < 2:
+        return body
+    times = [row[0] for row in rows]
+    if times != sorted(times) or len(set(times)) != len(times):
+        return body
+    for ts_open, open_, high, low, close in rows:
+        if not (close > 0 and high >= max(open_, close) and low <= min(open_, close)):
+            return body
+    now_ms = int(time.time() * 1000)
+    closed = [row for row in rows if row[0] + 3_600_000 <= now_ms]
+    body["closed_candles"] = len(closed)
+    body["open_dropped"] = len(rows) - len(closed)
+    if len(closed) < 2:
+        return body
+    from decimal import Decimal
+    first = Decimal(str(closed[0][4]))
+    last = Decimal(str(closed[-1][4]))
+    body.update({"consistent": True, "close_change": str((last - first) / first),
+                 "first_open": closed[0][0], "last_open": closed[-1][0]})
+    return body
+
+
+@app.get("/api/market/trends")
+def stored_trends():
+    """Close-to-close change of stored hourly candles. This does not set a regime."""
+    with closing(db()) as con:
+        series = [_stored_close_change(con, symbol) for symbol in ("BTC-USD", "ETH-USD")]
+    body = {"series": series, "regime_valid": False, "eligible": False, "dispatched": False}
+    return body
+
+
+@app.post("/api/market/global")
+def refresh_global():
+    try:
+        return fetch_global(DataCallLog(DB_FILE))
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"coingecko global request failed: {type(exc).__name__}")
+
+
+@app.post("/api/market/dominance-history")
+def refresh_dominance_history():
+    """Seven-day BTC and ETH dominance changes. The shared slot stays invalid."""
+    from data.public_metrics import fetch_dominance_history
+    try:
+        return fetch_dominance_history(DataCallLog(DB_FILE))
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"dominance history request failed: {type(exc).__name__}")
+
+
+@app.post("/api/market/stablecoins")
+def refresh_stablecoins():
+    from data.public_metrics import fetch_stablecoins
+    try:
+        return fetch_stablecoins(DataCallLog(DB_FILE))
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"defillama stablecoin request failed: {type(exc).__name__}")
+
+
+@app.post("/api/market/stablecoin-chart")
+def refresh_stablecoin_chart():
+    """Seven-day stablecoin chart change. It is not written into the state slot."""
+    from data.public_metrics import fetch_stablecoin_chart
+    try:
+        return fetch_stablecoin_chart(DataCallLog(DB_FILE))
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"defillama stablecoin chart request failed: {type(exc).__name__}")
+
+
+@app.post("/api/market/circle")
+def refresh_circle():
+    """Issuer USDC disclosure. It does not set a regime or admit a research name."""
+    from data.public_metrics import fetch_circle_transparency
+    try:
+        return fetch_circle_transparency(DataCallLog(DB_FILE))
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"circle transparency request failed: {type(exc).__name__}")
+
+
+@app.post("/api/market/fed")
+def refresh_fed():
+    """Cited FOMC statement and calendar. A rate decision does not set the crypto regime."""
+    from data.public_metrics import fetch_fed_schedule
+    try:
+        return fetch_fed_schedule(DataCallLog(DB_FILE))
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"federal reserve request failed: {type(exc).__name__}")
+
+
+@app.post("/api/market/deribit")
+def refresh_deribit():
+    """Deribit public perpetual summaries. They do not set a regime or send an order."""
+    from data.public_metrics import fetch_deribit_summaries
+    try:
+        return fetch_deribit_summaries(DataCallLog(DB_FILE))
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"deribit summary request failed: {type(exc).__name__}")
+
+
+@app.post("/api/market/funding")
+def refresh_funding():
+    from data.public_metrics import fetch_perp_quotes
+    try:
+        return fetch_perp_quotes(DataCallLog(DB_FILE))
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"public funding request failed: {type(exc).__name__}")
+
+
+@app.post("/api/market/swap-history")
+def refresh_swap_history():
+    """OKX public funding and open-interest history. The 1-hour funding slot stays invalid."""
+    from data.public_metrics import fetch_swap_history
+    try:
+        return fetch_swap_history(DataCallLog(DB_FILE))
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"public swap history request failed: {type(exc).__name__}")
+
+
+@app.get("/api/data-calls")
+def data_calls(limit: int = 50):
+    """Recent market-data calls from the dashboard log and the autonomous book log."""
+    limit = min(max(int(limit), 1), 200)
+    surge = DataCallLog(DB_FILE).recent(limit)
+    for row in surge:
+        row["log"] = "surge"
+    autonomous_path = ROOT / "data" / "autonomous" / "public_calls.sqlite3"
+    autonomous = DataCallLog(autonomous_path).recent(limit) if autonomous_path.exists() else []
+    for row in autonomous:
+        row["log"] = "autonomous"
+    merged = sorted([*surge, *autonomous], key=lambda row: row.get("started_at") or 0, reverse=True)[:limit]
+    return merged
+
+
+@app.post("/api/market/listings")
+def refresh_listings():
+    """Public market rows for the six researched names. None of them become eligible."""
+    observed = fetch_listed_markets(DataCallLog(DB_FILE), ("AAVE", "HYPE", "PENDLE", "AERO", "LDO", "ONDO"))
+    rows = []
+    for row in observed.get("rows", []):
+        shown = dict(row)
+        shown["eligible"] = False
+        rows.append(shown)
+    body = {"source_url": observed.get("source_url"), "rows": rows,
+            "unresolved": list(observed.get("unresolved", [])), "eligible": False}
+    return body
+
+
+@app.post("/api/market/book-hold")
+def book_hold():
+    """Hold one public BTC-USD top of book. This does not submit or mark it eligible."""
+    from datetime import datetime
+    from bot.autonomous.state import hold_public_top
+    book = fetch_coinbase_book(DataCallLog(DB_FILE), "BTC-USD", level=2)
+    stamp = book.get("exchange_time")
+    if not isinstance(stamp, str) or "." not in stamp or not stamp.endswith("Z"):
+        raise HTTPException(status_code=502, detail="Coinbase book time was not parsed")
+    head, frac = stamp[:-1].split(".")
+    event_us = int(datetime.fromisoformat(head + "." + frac[:6] + "+00:00").timestamp() * 1_000_000)
+    held = hold_public_top(book["bids"], book["asks"], event_us, int(book["sequence"]))
+    body = {"sequence": book.get("sequence"), "exchange_time": stamp, "bids": len(book.get("bids") or []),
+            "asks": len(book.get("asks") or []), "reason": held["reason"], "mid_valid": held["mid_valid"],
+            "eligible": False, "tokens": held["tokens"], "dispatched": False}
+    return body
+
+
+@app.get("/api/market/book-observations")
+def book_observations(limit: int = 8):
+    """Stored public-book holds. The response forces eligibility and dispatch off."""
+    path = ROOT / "data" / "autonomous" / "book_observations.sqlite3"
+    if not path.exists():
+        body = {"rows": [], "eligible": False, "dispatched": False}
+    else:
+        with closing(sqlite3.connect(path)) as connection:
+            found = connection.execute(
+                "SELECT sequence, exchange_time, bids, asks, reason FROM book_observations ORDER BY sequence DESC LIMIT ?",
+                (min(max(limit, 1), 20),)).fetchall()
+        body = {"rows": [{"sequence": row[0], "exchange_time": row[1], "bids": row[2], "asks": row[3],
+                          "reason": row[4], "eligible": False, "dispatched": False} for row in found],
+                "eligible": False, "dispatched": False}
+    return body
+
+
+@app.get("/api/market/book-tops")
+def book_tops():
+    """Replay stored tops. Eligibility and dispatch stay false."""
+    from bot.autonomous.worker import replay_stored_tops
+    body = replay_stored_tops()
+    body["eligible"] = False
+    body["dispatched"] = False
+    from bot.autonomous.worker import load_book_tops
+    mids = []
+    for bids, asks, event_us, _sequence in load_book_tops(70):
+        try:
+            bid = float(bids[0][0])
+            ask = float(asks[0][0])
+        except (TypeError, ValueError, IndexError):
+            continue
+        if bid > 0 and ask > 0 and ask >= bid:
+            mids.append({"event_us": event_us, "mid": (bid + ask) / 2})
+    body["mids"] = mids
+    from bot.autonomous.worker import load_eth_tops
+    eth_mids = []
+    for bids, asks, event_us, _sequence in load_eth_tops(70):
+        try:
+            bid = float(bids[0][0])
+            ask = float(asks[0][0])
+        except (TypeError, ValueError, IndexError):
+            continue
+        if bid > 0 and ask > 0 and ask >= bid:
+            eth_mids.append({"event_us": event_us, "mid": (bid + ask) / 2})
+    body["eth_mids"] = eth_mids
+    ordered = [row["event_us"] for row in mids]
+    gaps = [current - previous for previous, current in zip(ordered, ordered[1:])
+            if current - previous > 70_000_000 or current - previous < 50_000_000]
+    body["cadence_gaps"] = len(gaps)
+    body["opening_gap_only"] = len(gaps) == 1 and len(ordered) > 1 and ordered[1] - ordered[0] == gaps[0]
+    qualified = []
+    unqualified = 0
+    for event_us in ordered:
+        early = 60_000_000 - (event_us % 60_000_000)
+        if early == 60_000_000 or early <= 5_000_000:
+            qualified.append(event_us)
+        else:
+            unqualified += 1
+    close_gaps = [current - previous for previous, current in zip(qualified, qualified[1:])
+                  if current - previous > 70_000_000 or current - previous < 50_000_000]
+    body["close_cadence_gaps"] = len(close_gaps)
+    body["unqualified_tops"] = unqualified
+    from bot.autonomous.worker import load_eth_tops
+    eth_times = [event_us for _bids, _asks, event_us, _sequence in load_eth_tops(70)]
+    eth_qualified = []
+    eth_unqualified = 0
+    for event_us in eth_times:
+        early = 60_000_000 - (event_us % 60_000_000)
+        if early == 60_000_000 or early <= 5_000_000:
+            eth_qualified.append(event_us)
+        else:
+            eth_unqualified += 1
+    eth_gaps = [current - previous for previous, current in zip(eth_qualified, eth_qualified[1:])
+                if current - previous > 70_000_000 or current - previous < 50_000_000]
+    body["eth_qualified_tops"] = len(eth_qualified)
+    body["eth_close_cadence_gaps"] = len(eth_gaps)
+    body["eth_unqualified_tops"] = eth_unqualified
+    from types import SimpleNamespace
+    from bot.autonomous.worker import PaperWorker
+    gate = PaperWorker(SimpleNamespace(venue=SimpleNamespace(venue="paper"))).gate_jev_decision(None)
+    body["gate_status"] = gate["status"]
+    body["gate_reason"] = gate["reason"]
+    body["gate_dispatched"] = gate["dispatched"]
+    return body
+
+
+@app.get("/api/risk/jev-closed")
+def jev_closed():
+    """An empty credential must not construct a Jev client or place a call."""
+    from bot.autonomous.jev_client import JevClient
+    refused = False
+    try:
+        JevClient(transport=None, schema_resolver=None, api_key="")
+    except ValueError:
+        refused = True
+    body = {"called": False, "refused": refused, "dispatched": False}
+    return body
+
+
+@app.get("/api/risk/limits")
+def risk_limits():
+    """Read the immutable autonomous limits. This does not arm or submit."""
+    from bot.autonomous.contracts import RiskLimits
+    limits = RiskLimits()
+    body = {"max_drawdown": format(limits.max_drawdown, "f"), "max_daily_loss": format(limits.max_daily_loss, "f"),
+            "max_position_fraction": format(limits.max_position_fraction, "f"),
+            "kelly_fraction": format(limits.kelly_fraction, "f"), "max_state_tokens": limits.max_state_tokens,
+            "armed": limits.armed, "candidate_eligible": limits.candidate_eligible, "dispatched": False}
+    return body
+
+
+@app.get("/api/risk/kelly-check")
+def kelly_check():
+    """Run the quarter-Kelly cap on fixed inputs. This does not size or submit an order."""
+    from decimal import Decimal
+    from bot.autonomous.sizing import KELLY_FRACTION_CEILING, kelly_loss_budget
+    equity, probability, win, loss = Decimal("10000"), Decimal("0.80"), Decimal("1"), Decimal("1")
+    budget = kelly_loss_budget(equity, probability, win, loss)
+    refused = False
+    try:
+        kelly_loss_budget(equity, probability, win, loss, kelly_fraction=Decimal("0.26"))
+    except ValueError:
+        refused = True
+    body = {"equity": format(equity, "f"), "probability": format(probability, "f"), "payoff": "1:1",
+            "kelly_ceiling": format(KELLY_FRACTION_CEILING, "f"), "loss_budget": format(budget, "f"),
+            "above_ceiling_refused": refused, "dispatched": False}
+    return body
+
+
+@app.get("/api/risk/entry-gate")
+def entry_gate_check():
+    """Run the code gate on fixed judgments. This does not call Jev or submit."""
+    from types import SimpleNamespace
+    from bot.autonomous.contracts import AdvisoryRisk, CandidateDecision, Direction, DirectionDistribution, Regime
+    from bot.autonomous.worker import PaperWorker
+
+    def run(regime, direction, quality, distribution, direction_confidence, noul):
+        worker = PaperWorker(SimpleNamespace(venue=SimpleNamespace(venue="paper")))
+        decision = CandidateDecision("check", regime, direction, quality, AdvisoryRisk.SAFE, distribution,
+                                     direction_confidence, 0.95, 0.95, 0.95, noul)
+        result = worker.gate_jev_decision(decision)
+        return {"status": result["status"], "reason": result.get("reason"), "dispatched": result["dispatched"]}
+
+    body = {
+        "boundary": run(Regime.TRENDING, Direction.LONG, 2, DirectionDistribution(0.80, 0.10, 0.10), 0.80, 0.10),
+        "pass": run(Regime.TRENDING, Direction.LONG, 2, DirectionDistribution(0.81, 0.10, 0.09), 0.81, 0.10),
+        "low_confidence": run(Regime.TRENDING, Direction.LONG, 2, DirectionDistribution(0.59, 0.21, 0.20), 0.59, 0.10),
+        "crisis": run(Regime.CRISIS, Direction.NEUTRAL, 0, DirectionDistribution(0.20, 0.20, 0.60), 0.95, 0.10),
+        "dispatched": False,
+    }
+    body["dispatched"] = any(item["dispatched"] for item in (body["boundary"], body["pass"], body["low_confidence"], body["crisis"]))
+    return body
+
+
+@app.get("/api/review/schema-proposal")
+def schema_proposal_check():
+    """A fixed schema proposal stays unapproved. This does not change a schema or submit."""
+    from bot.autonomous.brain import BrainProposal
+    from bot.autonomous.nightly import SessionView, review_session
+
+    class _Propose:
+        model_id = "fixed-check"
+
+        def review(self, *, job_id, archive_hash, metrics):
+            return BrainProposal(action="propose_schema", finding="fixed check", hypothesis="not applied",
+                                 evidence_refs=(archive_hash,), schema_diff="fixed-check-diff", model_id=self.model_id)
+
+    report = review_session(SessionView("paper-test", 0, "e" * 64, ()), _Propose(), job_id="fixed-schema-check")
+    body = {"status": report.status, "reason_codes": list(report.reason_codes), "brain_action": report.brain_action,
+            "approved": report.approved, "dispatched": False}
+    return body
+
+
+@app.get("/api/review/paper")
+def paper_review():
+    """Score the paper serve ledger. The report cannot approve itself."""
+    from bot.autonomous.nightly import review_account_activity
+    path = Path("/tmp/paper-serve-ledger.sqlite3")
+    if not path.exists():
+        body = {"present": False, "binary_brier": None, "resolved": 0, "pending": 0,
+                "approved": False, "dispatched": False}
+    else:
+        connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        try:
+            report = review_account_activity(connection, "paper-test", time.time_ns() // 1000, "e" * 64)
+            control = connection.execute(
+                """SELECT permit, hard_killed, drawdown_latched, daily_halted, crisis_halted
+                   FROM account_control WHERE account_id=?""", ("paper-test",)).fetchone()
+            price_row = connection.execute(
+                "SELECT payload_json FROM label_events WHERE kind='resolved' ORDER BY recorded_at_us DESC LIMIT 1"
+            ).fetchone()
+        finally:
+            connection.close()
+        entry_price = exit_price = None
+        if price_row and price_row[0]:
+            payload = json.loads(price_row[0])
+            execution = payload.get("verified_execution") if isinstance(payload, dict) else None
+            if isinstance(execution, dict):
+                entry_price = execution.get("entry_price_usd")
+                exit_price = execution.get("exit_price_usd")
+        body = {"present": True, "account": report.account_id, "binary_brier": report.binary_brier,
+                "resolved": report.resolved, "pending": report.pending, "approved": report.approved,
+                "status": report.status, "brain_action": report.brain_action,
+                "fills": dict(report.counts).get("fill", 0), "misses": dict(report.counts).get("miss", 0),
+                "entry_price_usd": entry_price, "exit_price_usd": exit_price,
+                "permit": None if control is None else control[0],
+                "hard_killed": bool(control[1]) if control else None,
+                "drawdown_latched": bool(control[2]) if control else None,
+                "daily_halted": bool(control[3]) if control else None,
+                "crisis_halted": bool(control[4]) if control else None,
+                "dispatched": False}
+    return body
+
+
+@app.get("/api/review/slot")
+def review_slot():
+    """Show the claimed 00:15 UTC slot and the next one. This does not run the review."""
+    from bot.autonomous.nightly import next_review_us
+    from bot.autonomous.worker import due_review_slot
+    now_us = time.time_ns() // 1000
+    path = Path("/tmp/serve-slots-minute.sqlite")
+    claimed = []
+    if path.exists():
+        connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        try:
+            claimed = [row[0] for row in connection.execute("SELECT slot FROM review_slots ORDER BY slot")]
+        finally:
+            connection.close()
+    nxt = next_review_us(now_us)
+    body = {"due_slot": due_review_slot(now_us), "next_slot": nxt, "claimed_slots": claimed,
+            "next_claimed": nxt in claimed, "dispatched": False}
+    return body
+
+
+@app.get("/api/research/schemas")
+def research_schemas():
+    """Read the six typed research schemas. This does not call Jev or admit a name."""
+    expected = {
+        "regime": ["trending", "mean_reverting", "high_vol", "crisis"],
+        "direction": ["long", "short", "neutral"],
+        "setup_quality": [0, 1, 2, 3],
+        "risk_state": ["safe", "near_limit", "reduce"],
+    }
+    rows = []
+    for path in sorted((ROOT / "config" / "autonomous" / "schemas").glob("*.json")):
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        rubric = payload["properties"]["decision_rubric"]["properties"]
+        matches = all(rubric[name].get("enum") == values for name, values in expected.items())
+        matches = matches and rubric["toxic_flow"].get("type") == "boolean"
+        admission = payload["properties"]["admission_status"]
+        allowed = admission.get("enum")
+        if allowed is None and "const" in admission:
+            allowed = [admission["const"]]
+        rows.append({"candidate_id": payload["properties"]["candidate_id"]["const"],
+                     "instrument": payload["properties"]["instrument"]["const"],
+                     "admission_status": allowed, "rubric_matches": matches, "eligible": False})
+    body = {"schemas": rows, "eligible": False, "dispatched": False}
+    return body
+
+
+@app.get("/api/research/candidates")
+def research_candidates():
+    return candidate_cards()
+
+
+@app.get("/api/research/observations")
+def research_observations():
+    """Fetch public protocol rows for the six names. A row does not make a name eligible."""
+    from data.public_metrics import fetch_holder_revenue, fetch_listed_markets, fetch_listed_tvl, fetch_protocol_fees, fetch_protocol_holder_rows, fetch_unlock_status
+    symbols = ("AAVE", "HYPE", "PENDLE", "AERO", "LDO", "ONDO")
+    log = DataCallLog(DB_FILE)
+    markets = fetch_listed_markets(log, symbols)
+    ids = {row["symbol"]: row["id"] for row in markets.get("rows", []) if row.get("symbol") and row.get("id")}
+    tvl = fetch_listed_tvl(log, ids) if ids else {"rows": [], "unresolved": list(symbols), "eligible": False}
+    fees = []
+    fee_gaps = []
+    tvl_by_symbol = {row.get("symbol"): row for row in tvl.get("rows", [])}
+    for symbol, gecko_id in ids.items():
+        candidates = []
+        row = tvl_by_symbol.get(symbol)
+        if row and row.get("slug"):
+            candidates.append(row["slug"])
+        for slug in tvl.get("parent_slugs", {}).get(symbol, []):
+            if slug not in candidates:
+                candidates.append(slug)
+        matched = []
+        for slug in candidates:
+            try:
+                matched.append(fetch_protocol_fees(log, slug, gecko_id))
+            except Exception:
+                continue
+        if not matched:
+            fee_gaps.append(symbol)
+            continue
+        ambiguous = len(matched) > 1
+        for item in matched:
+            item["symbol"] = symbol
+            item["ambiguous"] = ambiguous
+        fees.extend(matched)
+    fee_slugs = tuple(dict.fromkeys(
+        [row["slug"] for row in tvl.get("rows", []) if row.get("slug")]
+        + [row["slug"] for row in fees if row.get("slug")]))
+    holders = fetch_holder_revenue(log, fee_slugs) if fee_slugs else {"rows": [], "unresolved": [], "eligible": False}
+    unlocks = fetch_unlock_status(log)
+    identities = []
+    for symbol, gecko_id in ids.items():
+        parents = tvl.get("parent_slugs", {}).get(symbol) or []
+        joined = tvl_by_symbol.get(symbol) or {}
+        slug = parents[0] if parents else joined.get("slug")
+        identities.append((symbol, slug if isinstance(slug, str) else "", gecko_id))
+    raw_holders = fetch_protocol_holder_rows(log, tuple(identities))
+    for row in markets.get("rows", []):
+        row["eligible"] = False
+    body = {"markets": markets.get("rows", []), "unresolved_markets": markets.get("unresolved", []),
+            "tvl": tvl.get("rows", []), "unresolved_tvl": tvl.get("unresolved", []),
+            "fees": fees, "fee_gaps": fee_gaps, "holder_revenue": holders.get("rows", []),
+            "unresolved_holder_revenue": holders.get("unresolved", []),
+            "unjoined_same_symbol": tvl.get("unjoined_same_symbol", []),
+            "unlocks_status": unlocks["status_code"], "unlocks_present": False,
+            "raw_holder_rows": raw_holders.get("rows", []),
+            "unresolved_raw_holders": raw_holders.get("unresolved", []),
+            "entity_adjusted": False,
+            "eligible": False, "dispatched": False,
+            "note": "Protocol TVL and fees are not token-holder accrual. None of these names are eligible."}
+    return body
 
 
 @app.get("/api/candles")
@@ -628,6 +1011,8 @@ def signals(limit: int = 20):
 @app.post("/api/strategy/run")
 def run_strategy(symbol: str = "BTC-USD", strategy: str = "ema_12_26_crossover", execute: bool = False,
                  exchange: str = "coinbase"):
+    if execute:
+        raise HTTPException(409, "Authority strategy execution handler unavailable")
     if exchange not in {"coinbase", "binance", "kraken"}:
         raise HTTPException(status_code=422, detail="Unsupported exchange")
     candle_rows = CandleHistoryStore(DB_FILE).load(exchange, symbol, "1h")
@@ -652,66 +1037,197 @@ def run_strategy(symbol: str = "BTC-USD", strategy: str = "ema_12_26_crossover",
         cur = con.execute("INSERT INTO signals(symbol,strategy,direction,strength,reference_price,created_at,details_json) VALUES(?,?,?,?,?,?,?)",
                           (symbol, strategy, decision["direction"], decision["strength"], price, now, json.dumps(decision)))
         result = {"signal_id": cur.lastrowid, "symbol": symbol, "strategy": strategy, "price": price, **decision, "order": None}
-        if execute and exchange == "coinbase" and decision["direction"] == "long":
-            gate = gate_state(con)
-            if gate["allowed"]:
-                result["order"] = execute_order(con, symbol, "buy", STARTING_CASH * MAX_POSITION_PCT / 100, "ema_12_26_crossover")
-            else:
-                result["order"] = {"status": "blocked", "reason": gate["reasons"]}
-        elif execute and exchange == "coinbase" and decision["direction"] == "exit":
-            position = con.execute("SELECT qty FROM positions WHERE account_id=? AND symbol=?", (ACCOUNT_ID, symbol)).fetchone()
-            if position and position["qty"] > 0:
-                result["order"] = execute_order(con, symbol, "sell", float(position["qty"]) * price, "ema_12_26_crossover")
+        if execute and exchange == "coinbase":
+            result["order"] = {"status": "blocked", "reason": ["paper authority required"]}
         con.commit()
         return result
 
 
 @app.post("/api/orders")
 def place_order(request: OrderRequest):
-    with closing(db()) as con:
-        result = execute_order(con, request.symbol, request.side, request.usd_amount, "manual_paper")
-        con.commit()
-        return result
+    raise HTTPException(409, "Authority manual order handler unavailable")
 
 
 @app.post("/api/control/arm")
 def arm(request: ArmRequest):
+    raise HTTPException(409, "Authority arm handler unavailable")
+
+
+def _paper_control_flags() -> dict:
+    return {"ledger_present": False, "hard_killed": None, "source": "authority_status_required"}
+
+
+@app.get("/api/risk/kill-split")
+def kill_split():
+    """Show the dashboard flag and the ledger flag orders actually read."""
     with closing(db()) as con:
-        con.execute("UPDATE runtime_state SET kill_switch=0,armed_until=? WHERE id=1", (time.time() + request.duration_minutes * 60,))
-        con.commit()
-        return {"status": "armed", "mode": "paper", "expires_at": time.time() + request.duration_minutes * 60}
+        state = con.execute("SELECT kill_switch FROM runtime_state WHERE id=1").fetchone()
+    ledger = _paper_control_flags()
+    dashboard_killed = bool(state[0]) if state else None
+    body = {"dashboard_killed": dashboard_killed, "ledger_hard_killed": ledger["hard_killed"],
+            "same": dashboard_killed is ledger["hard_killed"], "dispatched": False}
+    return body
+
+
+@app.get("/api/risk/inventory")
+def paper_inventory():
+    """Read the paper balances. They have no event time, so they stay out of the causal snapshot."""
+    path = Path("/tmp/paper-serve-ledger.sqlite3")
+    rows = []
+    if path.exists():
+        connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        try:
+            rows = [{"asset": row[0], "native_qty": row[1]} for row in connection.execute(
+                "SELECT asset, native_qty FROM balance_positions WHERE account_id=? ORDER BY asset",
+                ("paper-test",))]
+        finally:
+            connection.close()
+    body = {"rows": rows, "as_of_available": False, "in_snapshot": False, "eligible": False, "dispatched": False}
+    return body
+
+
+@app.get("/api/risk/equity")
+def paper_equity():
+    """Apply the code loss check to the stored paper mark. This does not reprice it."""
+    path = Path("/tmp/paper-serve-ledger.sqlite3")
+    body = {"present": False, "repriced": False, "dispatched": False}
+    if path.exists():
+        connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        try:
+            row = connection.execute(
+                """SELECT nav, high_water_nav, day_open_nav, drawdown, daily_loss, marked_at_us
+                   FROM equity_marks WHERE account_id=?
+                   ORDER BY marked_at_us DESC, mark_id DESC LIMIT 1""",
+                ("paper-test",)).fetchone()
+        finally:
+            connection.close()
+        if row is not None:
+            from decimal import Decimal
+            from fractions import Fraction
+            from bot.autonomous.risk import loss_triggers
+            hit_drawdown, hit_daily = loss_triggers(Fraction(Decimal(row[0])), Fraction(Decimal(row[1])), Fraction(Decimal(row[2])))
+            body = {"present": True, "nav": row[0], "high_water_nav": row[1], "day_open_nav": row[2],
+                    "stored_drawdown": row[3], "stored_daily_loss": row[4], "marked_at_us": row[5],
+                    "drawdown_hit": hit_drawdown, "daily_hit": hit_daily, "repriced": False, "dispatched": False}
+    return body
+
+
+@app.get("/api/risk/unpriced-inventory")
+def unpriced_inventory():
+    """Place the journal balances next to the public AAVE book. The stored mark is not repriced."""
+    from decimal import Decimal
+    from data.public_metrics import fetch_coinbase_book
+    path = Path("/tmp/paper-serve-ledger.sqlite3")
+    balances = []
+    mark = None
+    if path.exists():
+        connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        try:
+            balances = [{"asset": row[0], "native_qty": row[1]} for row in connection.execute(
+                "SELECT asset, native_qty FROM balance_positions WHERE account_id=? ORDER BY asset",
+                ("paper-test",))]
+            row = connection.execute(
+                """SELECT nav, high_water_nav, day_open_nav, marked_at_us FROM equity_marks
+                   WHERE account_id=? ORDER BY marked_at_us DESC, mark_id DESC LIMIT 1""",
+                ("paper-test",)).fetchone()
+        finally:
+            connection.close()
+        if row is not None:
+            mark = {"nav": row[0], "high_water_nav": row[1], "day_open_nav": row[2], "marked_at_us": row[3]}
+    book = fetch_coinbase_book(DataCallLog(DB_FILE), "AAVE-USD", level=1)
+    bids, asks = book.get("bids") or [], book.get("asks") or []
+    bid = max(bids)[0] if bids else None
+    ask = min(asks)[0] if asks else None
+    mid = (bid + ask) / 2 if bid is not None and ask is not None and bid > 0 and ask >= bid else None
+    quantity = next((Decimal(item["native_qty"]) for item in balances if item["asset"] == "AAVE"), None)
+    notional = None
+    if quantity is not None and mid is not None:
+        notional = str((quantity * Decimal(str(mid))).quantize(Decimal("0.01")))
+    assets = {item["asset"]: Decimal(item["native_qty"]) for item in balances}
+    extra = sorted(set(assets) - {"USD", "AAVE"})
+    usd = assets.get("USD")
+    cash_fraction = None
+    marked_journal_usd = None
+    if not extra and usd is not None and notional is not None and usd >= 0:
+        marked = usd + Decimal(notional)
+        if marked > 0 and usd <= marked:
+            cash_fraction = format(usd / marked, "f")
+            marked_journal_usd = format(marked, "f")
+    from bot.autonomous.contracts import RiskLimits
+    limits = RiskLimits()
+    cap = limits.max_position_fraction
+    gross_cap = limits.max_gross_fraction
+    position_fraction_marked = None
+    position_fraction_stored = None
+    if notional is not None and marked_journal_usd is not None:
+        position_fraction_marked = format(Decimal(notional) / Decimal(marked_journal_usd), "f")
+    stored_nav = Decimal(mark["nav"]) if mark is not None else None
+    if notional is not None and stored_nav is not None and stored_nav > 0:
+        position_fraction_stored = format(Decimal(notional) / stored_nav, "f")
+    gross_fraction_marked = None if extra else position_fraction_marked
+    gross_fraction_stored = None if extra else position_fraction_stored
+    body = {"balances": balances, "mark": mark, "aave_bid": bid, "aave_ask": ask, "aave_mid": mid,
+            "aave_notional_usd": notional, "included_in_nav": False, "book_time": book.get("exchange_time"),
+            "position_headroom_valid": False, "repriced": False, "eligible": False, "dispatched": False,
+            "cash_fraction_of_marked_journal": cash_fraction, "cash_fraction_valid": cash_fraction is not None,
+            "marked_journal_usd": marked_journal_usd, "copied_to_state": False,
+            "state_slot_cash_headroom": "left_invalid",
+            "max_position_fraction": format(cap, "f"),
+            "position_fraction_of_marked_journal": position_fraction_marked,
+            "inside_max_position_of_marked_journal": position_fraction_marked is not None and Decimal(position_fraction_marked) <= cap,
+            "position_fraction_of_stored_nav": position_fraction_stored,
+            "inside_max_position_of_stored_nav": position_fraction_stored is not None and Decimal(position_fraction_stored) <= cap,
+            "state_slot_position_headroom": "left_invalid",
+            "max_gross_fraction": format(gross_cap, "f"),
+            "gross_fraction_of_marked_journal": gross_fraction_marked,
+            "inside_max_gross_of_marked_journal": gross_fraction_marked is not None and Decimal(gross_fraction_marked) <= gross_cap,
+            "gross_fraction_of_stored_nav": gross_fraction_stored,
+            "inside_max_gross_of_stored_nav": gross_fraction_stored is not None and Decimal(gross_fraction_stored) <= gross_cap,
+            "state_slot_gross_fraction": "left_invalid",
+            "reason": "Stored mark is not a reprice of the journal balances, so headroom is not computed."}
+    return body
+
+
+@app.get("/api/risk/snapshot-drawdown")
+def snapshot_drawdown():
+    """Put the stored mark's drawdown on the public snapshot context. This does not tokenize or submit."""
+    from bot.autonomous.state import hold_public_top
+    from bot.autonomous.worker import load_book_tops
+    tops = load_book_tops(70)
+    from bot.autonomous.worker import load_mark_context
+    shared = load_mark_context()
+    if not tops:
+        body = {"tops": 0, "drawdown_valid": False, "eligible_valid": False, "tokens": None,
+                "repriced": False, "dispatched": False}
+    else:
+        current = tops[-1]
+        event_us = current[2]
+        close_us = (event_us // 60_000_000 + 1) * 60_000_000
+        if close_us - event_us > 5_000_000:
+            close_us = event_us
+        from bot.autonomous.worker import load_causal_inventory
+        inventory = load_causal_inventory(close_us)
+        held = hold_public_top(current[0], current[1], event_us, current[3], prior=tuple(tops[:-1]),
+                               candle_close_us=close_us, shared=shared, causal_inventory=inventory)
+        body = {"tops": len(tops), "minute_books": held.get("minute_books"), "required": 61,
+                "rv_valid": held["rv_valid"], "reason": held["reason"], "eligible_valid": held["eligible_valid"],
+                "drawdown_valid": held["drawdown_valid"], "drawdown": held["drawdown"],
+                "daily_loss_valid": held["daily_loss_valid"], "daily_loss": held["daily_loss"],
+                "base_inventory": held["base_inventory"], "base_inventory_valid": held["base_inventory_valid"],
+                "other_inventory": held["other_inventory"], "inventory_source": held["inventory_source"],
+                "tokens": held["tokens"], "token_counter_called": held["token_counter_called"],
+                "feature_bytes": held["feature_bytes"], "repriced": False, "dispatched": False}
+    return body
 
 
 @app.post("/api/control/kill")
-def kill():
-    with closing(db()) as con:
-        con.execute("UPDATE runtime_state SET kill_switch=1,armed_until=0 WHERE id=1")
-        con.commit()
-        return {"status": "killed", "mode": "paper"}
+def kill(request: Request):
+    return gateway_for(request, mutation=True).forward(request, 'kill')
 
 
 @app.post("/api/control/flatten")
 def flatten():
-    with closing(db()) as con:
-        # Flatten remains available while the new-order kill switch is engaged.
-        rows = con.execute("SELECT symbol,qty FROM positions WHERE account_id=? AND qty>0", (ACCOUNT_ID,)).fetchall()
-        results = []
-        for row in rows:
-            price = latest_price(con, row["symbol"])
-            if not price:
-                continue
-            state = con.execute("SELECT cash FROM account_state WHERE account_id=?", (ACCOUNT_ID,)).fetchone()
-            qty = float(row["qty"])
-            avg = con.execute("SELECT avg_price FROM positions WHERE account_id=? AND symbol=?", (ACCOUNT_ID, row["symbol"])).fetchone()[0]
-            proceeds = qty * price
-            fee = proceeds * FEE_RATE
-            pnl = qty * (price - avg) - fee
-            con.execute("UPDATE account_state SET cash=cash+? WHERE account_id=?", (proceeds-fee, ACCOUNT_ID))
-            con.execute("UPDATE positions SET qty=0,updated_at=? WHERE account_id=? AND symbol=?", (time.time(), ACCOUNT_ID, row["symbol"]))
-            cur = con.execute("INSERT INTO orders(account_id,symbol,side,qty,price,fee,realized_pnl,strategy,created_at) VALUES(?,?,?,?,?,?,?,?,?)", (ACCOUNT_ID,row["symbol"],"sell",qty,price,fee,pnl,"flatten",time.time()))
-            results.append({"id":cur.lastrowid,"symbol":row["symbol"],"qty":qty,"price":price,"realized_pnl":pnl,"status":"filled"})
-        con.commit()
-        return {"flattened": results}
+    raise HTTPException(409, "Authority bounded reduction handler unavailable")
 
 
 @app.get("/api/orders")

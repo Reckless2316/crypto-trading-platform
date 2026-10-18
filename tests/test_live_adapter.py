@@ -106,14 +106,14 @@ class ManagedTransportTests(unittest.TestCase):
         from bot import live_coinbase_adapter as adapter
         self.assertTrue(hasattr(adapter, "ManagedBoundedTransport"), "managed bounded transport is missing")
         self.adapter, self.replace, self.D = adapter, dataclasses.replace, D
-        self.market = MarketRules('coinbaseadvanced', 'BTC/USD', 'BTC', 'USD', D('.01'),
+        self.market = MarketRules('coinbaseadvanced', 'BTC-USD', 'BTC', 'USD', D('.01'),
             D('.00001'), D('.00001'), D('1'), D('.001'), 2, 'a' * 64, 100,
             spot_allowed=True, limit_ioc_verified=True)
-        proposal = OrderProposal('action-1', 'managed-1', 'candidate-1', 'BTC/USD',
+        proposal = OrderProposal('action-1', 'managed-1', 'candidate-1', 'BTC-USD',
             Side.SELL, D('.01001'), D('100.01'), 1002, 'b' * 64, None,
             1, 'reduction-1', True, 0, 100)
         reservation = Reservation('intent-1', 0, proposal.base_quantity, 0, 0,
-            proposal.base_quantity, IntentState.RESERVED, instrument='BTC/USD', side='sell')
+            proposal.base_quantity, IntentState.RESERVED, instrument='BTC-USD', side='sell')
         self.intent = PreparedIntent('intent-1', proposal, reservation, 'stable-action-1',
             0, AccountRevision(), IntentState.DISPATCHING)
         self.exchange = MockExchange()
@@ -178,7 +178,7 @@ class ManagedTransportTests(unittest.TestCase):
 
     def test_invalid_market_rules_reject_before_venue(self):
         D = self.D
-        cases = [dict(venue='binance'), dict(instrument='ETH/USD'), dict(base_asset='ETH'),
+        cases = [dict(venue='binance'), dict(instrument='ETH-USD'), dict(base_asset='ETH'),
             dict(spot_allowed=False), dict(limit_ioc_verified=False), dict(expires_at_us=10),
             dict(tick_size=D('.1')), dict(lot_size=D('.001')),
             dict(minimum_quantity=D('1')), dict(minimum_notional=D('2')),
@@ -213,7 +213,7 @@ class ManagedTransportTests(unittest.TestCase):
         account = LiveCoinbaseAccount(enabled_config(), user_armed=True,
             client=self.exchange, managed=True)
         with self.assertRaises(LiveTradingRejected):
-            account.place_market_order('BTC/USD', 'buy', 10, 100,
+            account.place_market_order('BTC-USD', 'buy', 10, 100,
                 risk_check=lambda _: self.fail('managed legacy called risk callback'))
         self.assertEqual([], self.exchange.created)
 

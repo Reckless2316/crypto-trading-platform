@@ -2,7 +2,14 @@
 set -euo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
-COMPOSE=(docker compose -f "$ROOT/deploy/docker-compose.yml" --project-directory "$ROOT")
+if docker compose version >/dev/null 2>&1; then
+  COMPOSE=(docker compose -f "$ROOT/deploy/docker-compose.yml" --project-directory "$ROOT")
+elif command -v docker-compose >/dev/null 2>&1; then
+  COMPOSE=(docker-compose -f "$ROOT/deploy/docker-compose.yml" --project-directory "$ROOT")
+else
+  echo "Docker Compose is unavailable (install the Docker Compose plugin or docker-compose)." >&2
+  exit 1
+fi
 COMMAND="${1:-help}"
 
 case "$COMMAND" in

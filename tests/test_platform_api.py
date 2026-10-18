@@ -30,6 +30,7 @@ class PlatformApiTests(unittest.TestCase):
         self.client = TestClient(platform_app.app)
 
     def tearDown(self):
+        self.client.close()
         platform_app.DB_FILE = self.original_db_path
         self.temp_dir.cleanup()
 
@@ -71,18 +72,18 @@ class PlatformApiTests(unittest.TestCase):
         self.assertEqual(self.order_count(), before)
         self.assertEqual(len(self.client.get("/api/ai/decisions").json()), 1)
 
-    def test_automation_requires_paper_arm_and_defaults_off(self):
+    def test_automation_requires_authenticated_authority_and_defaults_off(self):
         self.assertFalse(self.client.get("/api/automation").json()["enabled"])
         blocked = self.client.post("/api/automation", json={"enabled": True})
-        self.assertEqual(blocked.status_code, 409)
+        self.assertEqual(blocked.status_code, 401)
         self.assertFalse(self.client.get("/api/automation").json()["enabled"])
 
         with closing(platform_app.db()) as con:
             con.execute("UPDATE runtime_state SET kill_switch=0,armed_until=? WHERE id=1", (platform_app.time.time() + 600,))
             con.commit()
         enabled = self.client.post("/api/automation", json={"enabled": True})
-        self.assertEqual(enabled.status_code, 200, enabled.text)
-        self.assertTrue(enabled.json()["enabled"])
+        self.assertEqual(enabled.status_code, 401, enabled.text)
+        self.assertFalse(self.client.get("/api/automation").json()["enabled"])
         self.assertEqual(self.order_count(), 0)
 
     def test_backtest_reads_stored_candles_without_fetching(self):
@@ -102,6 +103,22 @@ class PlatformApiTests(unittest.TestCase):
         self.assertIn("Historical simulation only", body["caveat"])
         self.assertEqual(self.order_count(), 0)
 
+    def test_dashboard_cannot_fill_paper_orders(self):
+        self.seed_candles()
+        with closing(platform_app.db()) as con:
+            con.execute("UPDATE runtime_state SET kill_switch=0,armed_until=? WHERE id=1", (platform_app.time.time() + 600,))
+            con.commit()
+        order = self.client.post("/api/orders", json={"symbol": "BTC-USD", "side": "buy", "usd_amount": 100})
+        flatten = self.client.post("/api/control/flatten")
+        strategy = self.client.post("/api/strategy/run", params={"execute": True, "strategy": "ema_12_26_crossover"})
+        self.assertEqual(order.status_code, 401)
+        self.assertEqual(flatten.status_code, 401)
+        self.assertEqual(strategy.status_code, 401, strategy.text)
+        self.assertEqual(self.order_count(), 0)
+        with closing(platform_app.db()) as con:
+            cash = con.execute("SELECT cash FROM account_state").fetchone()[0]
+        self.assertEqual(cash, 10000)
+
     def test_live_status_and_order_fail_closed_by_default(self):
         with patch.dict(os.environ, {}, clear=True):
             status = self.client.get("/api/live/status")
@@ -111,10 +128,25 @@ class PlatformApiTests(unittest.TestCase):
             self.assertEqual(status.json()["mode"], "paper")
 
             order = self.client.post("/api/live/orders", json={"symbol": "BTC/USD", "side": "buy", "quote_amount": 25})
-            self.assertEqual(order.status_code, 409)
-            self.assertIn("not user-armed", order.json()["detail"])
+            self.assertEqual(order.status_code, 401)
+            self.assertIn("session", order.json()["detail"])
+            armed = self.client.post("/api/live/arm", json={"acknowledgement": "I UNDERSTAND THIS SENDS REAL ORDERS"})
+            self.assertEqual(armed.status_code, 401)
         with closing(platform_app.db()) as con:
             self.assertEqual(con.execute("SELECT COUNT(*) FROM live_orders").fetchone()[0], 0)
+
+
+    def test_listings_stay_ineligible(self):
+        payload = {"source_url": "https://api.coingecko.com/api/v3/coins/markets",
+                   "rows": [{"symbol": "AAVE", "id": "aave", "current_price": 1}], "unresolved": ["HYPE"]}
+        with patch("dashboard.backend.app.fetch_listed_markets", return_value=payload):
+            response = self.client.post("/api/market/listings")
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertFalse(body["eligible"])
+        self.assertEqual(body["unresolved"], ["HYPE"])
+        self.assertEqual(body["rows"][0]["symbol"], "AAVE")
+        self.assertFalse(body["rows"][0]["eligible"])
 
 
 if __name__ == "__main__":
