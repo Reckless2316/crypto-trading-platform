@@ -1,0 +1,668 @@
+"""End-to-end PAPER runtime: public book -> causal snapshot -> REFLEX -> code gate -> sizing -> hard risk -> paper fill.
+
+This process never holds venue credentials and never sends a real order. "Armed"
+here is a local paper flag (``--arm-paper``); it cannot arm a live account. Every
+threshold, size and side effect is computed in this module; the REFLEX only
+returns a typed judgment. The offline reflex is deterministic rules over the
+numeric snapshot and is UNCALIBRATED: it is labeled ``offline-reflex-v1`` in every
+row and never presented as Jev.
+
+Until a cohort has ``min_labels`` resolved outcomes the calibrated probability is
+the prior 0.5, Kelly is zero, and no entry is sized (``CALIBRATION_INSUFFICIENT``).
+An explicit ``--explore-fraction`` permits tiny labeled exploration entries
+(hard ceiling 0.1% of NAV) so paper outcomes can accumulate.
+
+# HANDOFF(claude-opus-5.5 2026-10-17): remaining for this runtime ->
+#   1. Wire the real JevClient once an approved release bundle + schema resolver exist
+#      (Task 15); today JEV_API_KEY only records `jev_configured_unwired` and stays offline.
+#   2. Route paper orders through OrderAuthority/Ledger (Task 12/16) instead of this
+#      runtime's own append-only fill table, so paper and live share one accounting path.
+#   3. Exchange tick/lot rules are approximated (lot 1e-8, fee bound estimate 0.6%);
+#      replace with verified MarketRules per instrument.
+#   4. Labels use mids only; add spread/slippage-aware exit labels and per-regime cohorts.
+#   5. Dashboard read of status.json (Task 17) and operator clear-latch via authenticated control.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import os
+import sqlite3
+import statistics
+import time
+from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
+from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
+from pathlib import Path
+from typing import Callable, Protocol
+
+from .brain import DeterministicBrain
+from .calibration import binary_brier, wilson_lower
+from .contracts import AdvisoryRisk, Direction, Regime, content_hash
+from .policy import entry_gate
+from .risk import loss_fractions
+from .sizing import kelly_loss_budget
+from .state import book_metrics, require_token_budget
+
+REFLEX_ID = "offline-reflex-v1"
+SNAPSHOT_VERSION = "paper-snapshot-v1"
+LOT = Decimal("0.00000001")
+MICRO_USD = Decimal("0.000001")
+# Hard ceilings: configuration may tighten, never loosen.
+DRAWDOWN_CEILING = 0.15
+DAILY_LOSS_CEILING = 0.02
+POSITION_CEILING = 0.05
+EXPLORE_CEILING = 0.001
+MIN_HISTORY = 20
+
+
+class Unavailable(ValueError):
+    """An observation cannot be used for this cycle."""
+
+
+@dataclass(frozen=True)
+class RuntimeConfig:
+    instruments: tuple[str, ...] = ("BTC-USD", "ETH-USD")
+    data_dir: Path = Path("data/autonomous/runtime")
+    candle_seconds: int = 60
+    horizon_candles: int = 60
+    lookback_candles: int = 60
+    starting_cash_usd: Decimal = Decimal("10000")
+    fee_rate: Decimal = Decimal("0.006")  # ESTIMATE: Coinbase Advanced lowest-tier taker bound; not verified per account.
+    max_slippage_bps: Decimal = Decimal("10")
+    max_drawdown: float = DRAWDOWN_CEILING
+    max_daily_loss: float = DAILY_LOSS_CEILING
+    max_position_fraction: float = POSITION_CEILING
+    explore_fraction: float = 0.0
+    min_labels: int = 100
+    max_book_age_us: int = 10_000_000
+    paper_armed: bool = False
+
+    def __post_init__(self):
+        if not (0 < self.max_drawdown <= DRAWDOWN_CEILING and 0 < self.max_daily_loss <= DAILY_LOSS_CEILING
+                and 0 < self.max_position_fraction <= POSITION_CEILING and 0 <= self.explore_fraction <= EXPLORE_CEILING):
+            raise ValueError("risk configuration exceeds a hard ceiling")
+        if not self.instruments or any(not i or "/" in i for i in self.instruments):
+            raise ValueError("invalid instruments")
+        if self.candle_seconds <= 0 or self.horizon_candles <= 0 or self.min_labels <= 0 or self.lookback_candles < MIN_HISTORY:
+            raise ValueError("invalid cadence")
+
+
+@dataclass(frozen=True)
+class Snapshot:
+    """The only state the REFLEX sees. Every field is computed in code from causal rows."""
+    instrument: str
+    candle_close_us: int
+    event_us: int
+    received_us: int
+    cutoff_us: int
+    mid: float
+    spread_bps: float
+    imbalance: float
+    realized_vol_bps: float
+    momentum_bps: float
+    trend_t: float
+    history: int
+    inventory_fraction: float
+    drawdown: float
+    daily_loss: float
+
+    def wire(self) -> str:
+        values = {"v": SNAPSHOT_VERSION, "i": self.instrument, "c": self.candle_close_us,
+                  "mid": round(self.mid, 8), "spr": round(self.spread_bps, 3), "imb": round(self.imbalance, 4),
+                  "rv": round(self.realized_vol_bps, 3), "mom": round(self.momentum_bps, 3), "t": round(self.trend_t, 3),
+                  "n": self.history, "inv": round(self.inventory_fraction, 5), "dd": round(self.drawdown, 5),
+                  "dl": round(self.daily_loss, 5)}
+        return json.dumps(values, separators=(",", ":"), sort_keys=True)
+
+    def token_estimate(self) -> int:
+        """ESTIMATE (not a provider tokenizer count): ceil(bytes/3), conservative for numeric JSON."""
+        return math.ceil(len(self.wire().encode()) / 3)
+
+
+@dataclass(frozen=True)
+class Judgment:
+    regime: Regime
+    direction: Direction
+    direction_confidence: float
+    toxic_flow: bool
+    setup_quality: int
+    risk_state: AdvisoryRisk
+    reflex_id: str
+    calibrated: bool = False
+
+    def __post_init__(self):
+        if (type(self.regime) is not Regime or type(self.direction) is not Direction
+                or type(self.risk_state) is not AdvisoryRisk or type(self.toxic_flow) is not bool
+                or type(self.setup_quality) is not int or not 0 <= self.setup_quality <= 3
+                or not math.isfinite(self.direction_confidence) or not 0 <= self.direction_confidence <= 1):
+            raise ValueError("invalid typed judgment")
+
+
+class ReflexPort(Protocol):
+    reflex_id: str
+    def judge(self, snapshot: Snapshot) -> Judgment: ...
+
+
+class OfflineReflex:
+    """Deterministic, UNCALIBRATED stand-in for Jev. Rules, not a model."""
+    reflex_id = REFLEX_ID
+
+    def judge(self, s: Snapshot) -> Judgment:
+        t = abs(s.trend_t)
+        if s.drawdown >= 0.10 or s.realized_vol_bps >= 100 or s.spread_bps >= 50:
+            regime = Regime.CRISIS
+        elif s.realized_vol_bps >= 25:
+            regime = Regime.HIGH_VOL
+        elif t >= 1.5:
+            regime = Regime.TRENDING
+        else:
+            regime = Regime.MEAN_REVERTING
+        if regime in (Regime.TRENDING, Regime.HIGH_VOL) and t >= 1.5:
+            direction = Direction.LONG if s.trend_t > 0 else Direction.SHORT
+            confidence = 0.5 + 0.45 * math.tanh(t / 2)
+        else:
+            direction, confidence = Direction.NEUTRAL, 0.95 - 0.45 * math.tanh(t / 1.5)
+        toxic = s.spread_bps > 20 or abs(s.imbalance) > 0.9
+        quality = (regime is Regime.TRENDING) + (s.spread_bps <= 10) + (t >= 2.5 and regime is not Regime.HIGH_VOL)
+        if s.drawdown >= 0.10 or s.daily_loss >= 0.015:
+            risk = AdvisoryRisk.REDUCE
+        elif s.drawdown >= 0.05 or s.inventory_fraction >= 0.8 * POSITION_CEILING:
+            risk = AdvisoryRisk.NEAR_LIMIT
+        else:
+            risk = AdvisoryRisk.SAFE
+        return Judgment(regime, direction, round(confidence, 6), toxic, int(quality), risk, self.reflex_id)
+
+
+_SCHEMA = """
+CREATE TABLE IF NOT EXISTS snapshots(instrument TEXT, candle_close_us INTEGER, event_us INTEGER, received_us INTEGER,
+  cutoff_us INTEGER, mid REAL, best_bid REAL, best_ask REAL, wire TEXT, token_estimate INTEGER, snapshot_hash TEXT,
+  PRIMARY KEY(instrument, candle_close_us));
+CREATE TABLE IF NOT EXISTS decisions(decision_id TEXT PRIMARY KEY, instrument TEXT, candle_close_us INTEGER, reflex_id TEXT,
+  calibrated INTEGER, regime TEXT, direction TEXT, confidence REAL, toxic INTEGER, quality INTEGER, risk_state TEXT,
+  gate_open INTEGER, action TEXT, reasons TEXT, mid REAL, created_us INTEGER);
+CREATE TABLE IF NOT EXISTS fills(fill_id TEXT PRIMARY KEY, decision_id TEXT, instrument TEXT, side TEXT, qty TEXT,
+  avg_price TEXT, notional_usd TEXT, fee_usd TEXT, exploration INTEGER, created_us INTEGER);
+CREATE TABLE IF NOT EXISTS equity_marks(mark_id INTEGER PRIMARY KEY AUTOINCREMENT, at_us INTEGER, equity_usd TEXT,
+  cash_usd TEXT, high_water_usd TEXT, day_open_usd TEXT, day TEXT);
+CREATE TABLE IF NOT EXISTS labels(decision_id TEXT PRIMARY KEY, instrument TEXT, direction TEXT, confidence REAL,
+  entry_mid REAL, exit_mid REAL, net_return REAL, hit INTEGER, labeled_us INTEGER);
+CREATE TABLE IF NOT EXISTS escalations(escalation_id TEXT PRIMARY KEY, decision_id TEXT, code TEXT, payload TEXT,
+  status TEXT, created_us INTEGER);
+CREATE TABLE IF NOT EXISTS latches(event_id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT, action TEXT, reason TEXT, at_us INTEGER);
+"""
+_APPEND_ONLY = ("snapshots", "decisions", "fills", "equity_marks", "labels", "escalations", "latches")
+
+
+def open_db(path: Path) -> sqlite3.Connection:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    db = sqlite3.connect(path, isolation_level=None)
+    db.row_factory = sqlite3.Row
+    db.execute("PRAGMA journal_mode=WAL")
+    db.execute("PRAGMA synchronous=FULL")
+    db.executescript(_SCHEMA)
+    for table in _APPEND_ONLY:
+        for op in ("UPDATE", "DELETE"):
+            db.execute(f"CREATE TRIGGER IF NOT EXISTS {table}_no_{op.lower()} BEFORE {op} ON {table} "
+                       f"BEGIN SELECT RAISE(ABORT, '{table} is append-only'); END")
+    return db
+
+
+def parse_event_us(stamp) -> int:
+    if not isinstance(stamp, str) or not stamp.endswith("Z"):
+        raise Unavailable("BOOK_TIME_UNPARSED")
+    head, _, frac = stamp[:-1].partition(".")
+    try:
+        whole = datetime.fromisoformat(head).replace(tzinfo=timezone.utc)
+    except ValueError as exc:
+        raise Unavailable("BOOK_TIME_UNPARSED") from exc
+    return int(whole.timestamp()) * 1_000_000 + int((frac + "000000")[:6] or 0)
+
+
+def _levels(rows) -> list[tuple[float, float]]:
+    out = []
+    for row in rows or ():
+        price, qty = float(row[0]), float(row[1])
+        if math.isfinite(price) and math.isfinite(qty) and price > 0 and qty > 0:
+            out.append((price, qty))
+    return out
+
+
+def paper_fill(levels, side: str, budget_usd: Decimal | None, qty: Decimal | None, limit: Decimal, fee_rate: Decimal):
+    """Adverse IOC paper fill. Walk levels to the limit; round qty down to the lot and fee up to µUSD.
+
+    Buys spend at most ``budget_usd`` including fee. Sells sell at most ``qty``.
+    Returns (qty, avg_price, notional, fee) or None when nothing fills.
+    """
+    filled = notional = Decimal(0)
+    ordered = sorted(levels, key=lambda l: l[0], reverse=(side == "sell"))
+    for price_f, size_f in ordered:
+        price, size = Decimal(str(price_f)), Decimal(str(size_f))
+        if (side == "buy" and price > limit) or (side == "sell" and price < limit):
+            break
+        if side == "buy":
+            room = (budget_usd - MICRO_USD - notional * (1 + fee_rate)) / (price * (1 + fee_rate))  # µUSD margin for fee ceil
+        else:
+            room = qty - filled
+        take = min(size, room).quantize(LOT, rounding=ROUND_FLOOR)
+        if take <= 0:
+            break
+        filled += take
+        notional += take * price
+    if filled <= 0:
+        return None
+    fee = (notional * fee_rate).quantize(MICRO_USD, rounding=ROUND_CEILING)
+    if side == "buy" and notional + fee > budget_usd:
+        return None
+    return filled, (notional / filled), notional, fee
+
+
+class PaperRuntime:
+    def __init__(self, config: RuntimeConfig, *, book_source: Callable[[str], dict] | None = None,
+                 clock_us: Callable[[], int] | None = None, reflex: ReflexPort | None = None):
+        self.config = config
+        self.clock_us = clock_us or (lambda: time.time_ns() // 1000)
+        self.book_source = book_source or _public_book_source(config.data_dir)
+        self.reflex = reflex or OfflineReflex()
+        self.jev_note = "jev_configured_unwired" if os.environ.get("JEV_API_KEY") else "jev_not_configured"
+        config.data_dir.mkdir(parents=True, exist_ok=True)
+        self.db = open_db(config.data_dir / "runtime.sqlite3")
+        if self.db.execute("SELECT COUNT(*) FROM equity_marks").fetchone()[0] == 0:
+            now = self.clock_us()
+            cash = str(config.starting_cash_usd)
+            self.db.execute("INSERT INTO equity_marks(at_us,equity_usd,cash_usd,high_water_usd,day_open_usd,day) VALUES (?,?,?,?,?,?)",
+                            (now, cash, cash, cash, cash, _day(now)))
+
+    # ---------- accounting (derived from append-only rows) ----------
+    def positions(self) -> dict[str, Decimal]:
+        held: dict[str, Decimal] = {}
+        for r in self.db.execute("SELECT instrument, side, qty FROM fills"):
+            q = Decimal(r["qty"])
+            held[r["instrument"]] = held.get(r["instrument"], Decimal(0)) + (q if r["side"] == "buy" else -q)
+        return {k: v for k, v in held.items() if v > 0}
+
+    def cash(self) -> Decimal:
+        cash = self.config.starting_cash_usd
+        for r in self.db.execute("SELECT side, notional_usd, fee_usd FROM fills"):
+            n, f = Decimal(r["notional_usd"]), Decimal(r["fee_usd"])
+            cash += (-n - f) if r["side"] == "buy" else (n - f)
+        return cash
+
+    def _last_mark(self):
+        return self.db.execute("SELECT * FROM equity_marks ORDER BY mark_id DESC LIMIT 1").fetchone()
+
+    def latched(self) -> set[str]:
+        active: set[str] = set()
+        for r in self.db.execute("SELECT kind, action FROM latches ORDER BY event_id"):
+            (active.add if r["action"] == "set" else active.discard)(r["kind"])
+        return active
+
+    def _latch(self, kind: str, reason: str, now: int) -> None:
+        if kind not in self.latched():
+            self.db.execute("INSERT INTO latches(kind,action,reason,at_us) VALUES (?,?,?,?)", (kind, "set", reason, now))
+
+    def clear_latch(self, kind: str, reason: str = "operator") -> None:
+        """Operator-only local action; the REFLEX has no path to this method."""
+        self.db.execute("INSERT INTO latches(kind,action,reason,at_us) VALUES (?,?,?,?)", (kind, "clear", reason, self.clock_us()))
+
+    def mark(self, bids_by: dict[str, float], now: int) -> dict:
+        cash, held = self.cash(), self.positions()
+        prices = {}
+        for instrument in held:
+            if instrument in bids_by:
+                prices[instrument] = Decimal(str(bids_by[instrument]))
+            else:  # last causal liquidation mark; a held asset is never valued at zero by omission
+                row = self.db.execute("SELECT best_bid FROM snapshots WHERE instrument=? AND received_us<=? "
+                                      "ORDER BY candle_close_us DESC LIMIT 1", (instrument, now)).fetchone()
+                prices[instrument] = Decimal(str(row["best_bid"])) if row else Decimal(0)
+        equity = cash + sum(q * prices[i] for i, q in held.items())
+        last = self._last_mark()
+        high = max(Decimal(last["high_water_usd"]), equity)
+        day = _day(now)
+        day_open = Decimal(last["day_open_usd"]) if last["day"] == day else Decimal(last["equity_usd"])
+        self.db.execute("INSERT INTO equity_marks(at_us,equity_usd,cash_usd,high_water_usd,day_open_usd,day) VALUES (?,?,?,?,?,?)",
+                        (now, str(equity), str(cash), str(high), str(day_open), day))
+        drawdown, daily = (float(x) for x in loss_fractions(max(equity, MICRO_USD), high, day_open))
+        if drawdown >= self.config.max_drawdown:
+            self._latch("DRAWDOWN_LATCH", f"drawdown {drawdown:.4f}", now)
+        if daily >= self.config.max_daily_loss:
+            self._latch("DAILY_HALT:" + day, f"daily loss {daily:.4f}", now)
+        return {"equity": equity, "cash": cash, "high_water": high, "day_open": day_open,
+                "drawdown": drawdown, "daily_loss": daily, "positions": held}
+
+    # ---------- state engine ----------
+    def observe(self, instrument: str) -> tuple[dict, int, int]:
+        book = self.book_source(instrument)
+        received = self.clock_us()
+        return book, parse_event_us(book.get("exchange_time")), received
+
+    def snapshot(self, instrument, book, event_us, received_us, cutoff_us, account) -> Snapshot:
+        if event_us > cutoff_us or received_us > cutoff_us:
+            raise Unavailable("FUTURE_OBSERVATION")
+        if cutoff_us - event_us > self.config.max_book_age_us:
+            raise Unavailable("STALE_BOOK")
+        bids, asks = _levels(book.get("bids")), _levels(book.get("asks"))
+        try:
+            mid, spread, imbalance = book_metrics(bids, asks)
+        except ValueError as exc:
+            raise Unavailable("INVALID_BOOK") from exc
+        step = self.config.candle_seconds * 1_000_000
+        close = event_us // step * step
+        prior = [r["mid"] for r in self.db.execute(
+            "SELECT mid FROM snapshots WHERE instrument=? AND candle_close_us<? AND received_us<=? "
+            "ORDER BY candle_close_us DESC LIMIT ?", (instrument, close, cutoff_us, self.config.lookback_candles))][::-1]
+        mids = prior + [mid]
+        returns = [1e4 * math.log(b / a) for a, b in zip(mids, mids[1:])]
+        vol = statistics.pstdev(returns) if len(returns) >= 2 else 0.0
+        momentum = 1e4 * math.log(mids[-1] / mids[0]) if len(mids) > 1 else 0.0
+        t = momentum / (vol * math.sqrt(len(returns))) if vol > 0 and returns else 0.0
+        held = account["positions"].get(instrument, Decimal(0))
+        inventory = float(held * Decimal(str(max(p for p, _ in bids))) / account["equity"]) if account["equity"] > 0 else 0.0
+        snap = Snapshot(instrument, close, event_us, received_us, cutoff_us, mid, spread, imbalance, vol, momentum, t,
+                        len(prior), inventory, account["drawdown"], account["daily_loss"])
+        require_token_budget(snap.token_estimate())
+        return snap
+
+    # ---------- calibration ----------
+    def calibrated_edge(self, instrument: str, reflex_id: str) -> tuple[Decimal, Decimal, Decimal, int]:
+        """Wilson-lower hit rate and mean net payoffs for resolved long labels; prior 0.5 when unsupported."""
+        rows = self.db.execute("SELECT l.hit, l.net_return FROM labels l JOIN decisions d USING(decision_id) "
+                               "WHERE l.instrument=? AND l.direction='long' AND d.reflex_id=?", (instrument, reflex_id)).fetchall()
+        n = len(rows)
+        wins = [r["net_return"] for r in rows if r["hit"]]
+        losses = [-r["net_return"] for r in rows if not r["hit"] and r["net_return"] < 0]
+        if n < self.config.min_labels or not wins or not losses:
+            return Decimal("0.5"), Decimal(1), Decimal(1), n
+        p = Decimal(str(wilson_lower(len(wins), n)))
+        return p, Decimal(str(statistics.fmean(wins))), Decimal(str(statistics.fmean(losses))), n
+
+    def label_matured(self, now: int) -> int:
+        step = self.config.candle_seconds * 1_000_000
+        horizon = self.config.horizon_candles * step
+        cost = 2 * float(self.config.fee_rate)
+        count = 0
+        for d in self.db.execute("SELECT * FROM decisions WHERE decision_id NOT IN (SELECT decision_id FROM labels) "
+                                 "AND candle_close_us+?<=?", (horizon, now)).fetchall():
+            later = self.db.execute("SELECT mid FROM snapshots WHERE instrument=? AND candle_close_us>=? AND received_us<=? "
+                                    "ORDER BY candle_close_us LIMIT 1", (d["instrument"], d["candle_close_us"] + horizon, now)).fetchone()
+            if later is None:
+                continue
+            gross = later["mid"] / d["mid"] - 1
+            if d["direction"] == "long":
+                net, hit = gross - cost, gross - cost > 0
+            elif d["direction"] == "short":
+                net, hit = -gross - cost, -gross - cost > 0
+            else:
+                net, hit = -abs(gross), abs(gross) < cost
+            self.db.execute("INSERT INTO labels VALUES (?,?,?,?,?,?,?,?,?)", (d["decision_id"], d["instrument"], d["direction"],
+                            d["confidence"], d["mid"], later["mid"], net, int(hit), now))
+            count += 1
+        return count
+
+    def brier(self) -> tuple[float | None, int]:
+        rows = self.db.execute("SELECT confidence, hit FROM labels").fetchall()
+        if not rows:
+            return None, 0
+        return binary_brier(tuple(float(r["confidence"]) for r in rows), tuple(int(r["hit"]) for r in rows)), len(rows)
+
+    # ---------- hard risk (code only; the model never reaches this) ----------
+    def risk_check(self, side: str, instrument: str, notional: Decimal, account: dict) -> tuple[str, ...]:
+        reasons = []
+        if (self.config.data_dir / "KILL").exists():
+            reasons.append("KILL_SWITCH")
+        if not self.config.paper_armed:
+            reasons.append("PAPER_NOT_ARMED")
+        if side == "buy":
+            latched = self.latched()
+            if "DRAWDOWN_LATCH" in latched or account["drawdown"] >= self.config.max_drawdown:
+                reasons.append("DRAWDOWN_LATCH")
+            if any(k.startswith("DAILY_HALT:" + _day(self.clock_us())) for k in latched) or account["daily_loss"] >= self.config.max_daily_loss:
+                reasons.append("DAILY_HALT")
+            if "CRISIS_HALT" in latched:
+                reasons.append("CRISIS_HALT")
+            held_value = account["positions"].get(instrument, Decimal(0)) * account.get("bid", {}).get(instrument, Decimal(0))
+            if held_value + notional > Decimal(str(self.config.max_position_fraction)) * account["equity"]:
+                reasons.append("MAX_POSITION")
+            if notional * (1 + self.config.fee_rate) > account["cash"]:
+                reasons.append("INSUFFICIENT_CASH")
+        return tuple(reasons)
+
+    # ---------- one cycle ----------
+    def cycle(self) -> dict:
+        observed, errors = {}, {}
+        for instrument in self.config.instruments:
+            try:
+                observed[instrument] = self.observe(instrument)
+            except Exception as exc:  # public read failures hold, never trade
+                errors[instrument] = type(exc).__name__ if not isinstance(exc, Unavailable) else str(exc)
+        cutoff = self.clock_us()
+        bids = {i: max(_levels(b.get("bids")) or [(0.0, 0.0)])[0] for i, (b, _, _) in observed.items()}
+        account = self.mark({i: p for i, p in bids.items() if p > 0}, cutoff)
+        account["bid"] = {i: Decimal(str(p)) for i, p in bids.items()}
+        results = {i: {"status": "hold", "reasons": [e]} for i, e in errors.items()}
+        for instrument, (book, event_us, received_us) in observed.items():
+            try:
+                results[instrument] = self._decide(instrument, book, event_us, received_us, cutoff, account)
+            except Unavailable as exc:
+                results[instrument] = {"status": "hold", "reasons": [str(exc)]}
+        labeled = self.label_matured(cutoff)
+        status = self.write_status(cutoff, results, labeled)
+        return status
+
+    def _decide(self, instrument, book, event_us, received_us, cutoff, account) -> dict:
+        snap = self.snapshot(instrument, book, event_us, received_us, cutoff, account)
+        bids, asks = _levels(book.get("bids")), _levels(book.get("asks"))
+        best_bid, best_ask = max(p for p, _ in bids), min(p for p, _ in asks)
+        try:
+            self.db.execute("INSERT INTO snapshots VALUES (?,?,?,?,?,?,?,?,?,?,?)", (instrument, snap.candle_close_us, event_us,
+                            received_us, cutoff, snap.mid, best_bid, best_ask, snap.wire(), snap.token_estimate(),
+                            content_hash(snap.wire())))
+        except sqlite3.IntegrityError:
+            raise Unavailable("DUPLICATE_CANDLE")
+        if snap.history < MIN_HISTORY:
+            return {"status": "warmup", "reasons": ["WARMUP"], "history": snap.history, "snapshot": json.loads(snap.wire())}
+        judgment = self.reflex.judge(snap)
+        decision_id = content_hash((instrument, snap.candle_close_us, judgment.reflex_id))
+        reasons, action = [], "hold"
+        gate = entry_gate(judgment.setup_quality, judgment.direction_confidence, judgment.risk_state,
+                          judgment.toxic_flow, judgment.direction)
+        escalate = []
+        if judgment.regime is Regime.CRISIS:
+            escalate.append("BRAIN_CRISIS")
+            self._latch("CRISIS_HALT", "reflex regime crisis", cutoff)
+        if judgment.direction_confidence < 0.60:
+            escalate.append("LOW_CONFIDENCE")
+        held = account["positions"].get(instrument, Decimal(0))
+        fill, exploration = None, False
+        if escalate:
+            reasons += escalate
+        elif (self.config.data_dir / "KILL").exists():
+            reasons.append("KILL_SWITCH")  # armed kill file: no order path is entered at all
+        elif held > 0 and self._should_exit(instrument, judgment, snap.candle_close_us):
+            blocked = self.risk_check("sell", instrument, Decimal(0), account)
+            if blocked:
+                reasons += blocked
+            else:
+                limit = Decimal(str(best_bid)) * (1 - self.config.max_slippage_bps / Decimal(10_000))
+                fill = paper_fill(bids, "sell", None, held, limit, self.config.fee_rate)
+                action, reasons = ("sell", ["EXIT"]) if fill else ("hold", ["EXIT_UNFILLED"])
+        elif not gate:
+            reasons.append("ENTRY_GATE_REFUSED")
+        elif held > 0:
+            reasons.append("ENTRY_SLOT_OCCUPIED")  # one entry per instrument until its exit
+        else:
+            p, win, loss, n = self.calibrated_edge(instrument, judgment.reflex_id)
+            budget = kelly_loss_budget(account["equity"], p, win, loss)
+            notional = (budget / loss).quantize(MICRO_USD, rounding=ROUND_FLOOR) if budget > 0 else Decimal(0)
+            if notional <= 0:
+                reasons.append("CALIBRATION_INSUFFICIENT")
+                if self.config.explore_fraction > 0:
+                    notional = (account["equity"] * Decimal(str(self.config.explore_fraction))).quantize(MICRO_USD, rounding=ROUND_FLOOR)
+                    exploration = True
+                    reasons.append("EXPLORATION")
+            if notional > 0:
+                blocked = self.risk_check("buy", instrument, notional, account)
+                if blocked:
+                    reasons += blocked
+                else:
+                    limit = Decimal(str(best_ask)) * (1 + self.config.max_slippage_bps / Decimal(10_000))
+                    fill = paper_fill(asks, "buy", notional * (1 + self.config.fee_rate), None, limit, self.config.fee_rate)
+                    action = "buy" if fill else "hold"
+                    if not fill:
+                        reasons.append("ENTRY_UNFILLED")
+        self.db.execute("INSERT INTO decisions VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (decision_id, instrument, snap.candle_close_us,
+                        judgment.reflex_id, int(judgment.calibrated), judgment.regime.value, judgment.direction.value,
+                        judgment.direction_confidence, int(judgment.toxic_flow), judgment.setup_quality, judgment.risk_state.value,
+                        int(gate), action, json.dumps(reasons), snap.mid, cutoff))
+        for code in escalate:
+            self.db.execute("INSERT INTO escalations VALUES (?,?,?,?,?,?)", (content_hash((decision_id, code)), decision_id, code,
+                            json.dumps({"snapshot": json.loads(snap.wire()), "judgment": _judgment_dict(judgment)}), "pending_brain", cutoff))
+        if fill:
+            qty, avg, notional, fee = fill
+            self.db.execute("INSERT INTO fills VALUES (?,?,?,?,?,?,?,?,?,?)", (content_hash((decision_id, action)), decision_id, instrument,
+                            action, str(qty), str(avg), str(notional), str(fee), int(action == "buy" and exploration), cutoff))
+        return {"status": action, "reasons": reasons, "decision_id": decision_id, "judgment": _judgment_dict(judgment),
+                "gate_open": gate, "snapshot": json.loads(snap.wire()), "token_estimate": snap.token_estimate()}
+
+    def _should_exit(self, instrument, judgment: Judgment, close_us: int) -> bool:
+        last_buy = self.db.execute("SELECT f.created_us, d.candle_close_us FROM fills f JOIN decisions d USING(decision_id) "
+                                   "WHERE f.instrument=? AND f.side='buy' ORDER BY f.created_us DESC LIMIT 1", (instrument,)).fetchone()
+        horizon = self.config.horizon_candles * self.config.candle_seconds * 1_000_000
+        time_stop = last_buy is not None and close_us - last_buy["candle_close_us"] >= horizon
+        return (time_stop or judgment.risk_state is AdvisoryRisk.REDUCE
+                or (judgment.direction is Direction.SHORT and judgment.direction_confidence > 0.80))
+
+    def write_status(self, now: int, results: dict, labeled: int) -> dict:
+        mark = self._last_mark()
+        brier, resolved = self.brier()
+        status = {"mode": "paper", "live": False, "armed_paper": self.config.paper_armed,
+                  "kill_switch": (self.config.data_dir / "KILL").exists(), "reflex": self.reflex.reflex_id,
+                  "reflex_calibrated": False, "jev": self.jev_note, "at_us": now,
+                  "equity_usd": mark["equity_usd"], "cash_usd": mark["cash_usd"], "high_water_usd": mark["high_water_usd"],
+                  "day_open_usd": mark["day_open_usd"], "positions": {k: str(v) for k, v in self.positions().items()},
+                  "latches": sorted(self.latched()), "brier": brier, "resolved_labels": resolved, "labeled_this_cycle": labeled,
+                  "pending_escalations": self.db.execute("SELECT COUNT(*) FROM escalations").fetchone()[0],
+                  "fills": self.db.execute("SELECT COUNT(*) FROM fills").fetchone()[0], "instruments": results}
+        path = self.config.data_dir / "status.json"
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(status, indent=2, default=str))
+        os.replace(tmp, path)
+        return status
+
+    def serve(self, stop: Callable[[], bool], sleep: Callable[[float], None] = time.sleep, offset_s: float = 1.0) -> int:
+        """Run one cycle shortly after each candle close until ``stop()``."""
+        cycles = 0
+        step = self.config.candle_seconds
+        while not stop():
+            now_s = self.clock_us() / 1e6
+            sleep(max(0.0, step - now_s % step + offset_s) if cycles else 0.0)
+            if stop():
+                break
+            self.cycle()
+            cycles += 1
+        return cycles
+
+    def close(self):
+        self.db.close()
+
+
+def nightly_review(db_path: Path, out_dir: Path, *, now_us: int | None = None, brain=None) -> dict:
+    """Read every fill and miss, measure Brier and buckets, and emit a PROPOSAL (never auto-applied)."""
+    now_us = now_us if now_us is not None else time.time_ns() // 1000
+    db = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    db.row_factory = sqlite3.Row
+    try:
+        fills = [dict(r) for r in db.execute("SELECT * FROM fills ORDER BY created_us")]
+        decisions = [dict(r) for r in db.execute("SELECT * FROM decisions ORDER BY created_us")]
+        labels = [dict(r) for r in db.execute("SELECT * FROM labels")]
+        escalations = db.execute("SELECT code, COUNT(*) n FROM escalations GROUP BY code").fetchall()
+    finally:
+        db.close()
+    misses = [d for d in decisions if d["gate_open"] and d["action"] == "hold"]
+    reasons: dict[str, int] = {}
+    for d in decisions:
+        for code in json.loads(d["reasons"]):
+            reasons[code] = reasons.get(code, 0) + 1
+    buckets = []
+    for lo in (0.5, 0.6, 0.7, 0.8, 0.9):
+        rows = [l for l in labels if lo <= l["confidence"] < lo + 0.1 or (lo == 0.9 and l["confidence"] == 1.0)]
+        if rows:
+            buckets.append({"bucket": f"{lo:.1f}-{lo + 0.1:.1f}", "n": len(rows),
+                            "mean_confidence": statistics.fmean(l["confidence"] for l in rows),
+                            "hit_rate": statistics.fmean(l["hit"] for l in rows)})
+    brier = binary_brier(tuple(float(l["confidence"]) for l in labels), tuple(int(l["hit"]) for l in labels)) if labels else None
+    metrics = {"decisions": len(decisions), "fills": len(fills), "misses": len(misses), "reason_counts": reasons,
+               "resolved_labels": len(labels), "brier": brier, "buckets": buckets,
+               "escalations": {r["code"]: r["n"] for r in escalations}}
+    archive_hash = content_hash(json.dumps(metrics, sort_keys=True, default=str))
+    proposal = (brain or DeterministicBrain()).review(job_id="nightly-" + _day(now_us), archive_hash=archive_hash, metrics=metrics)
+    report = {"generated_us": now_us, "archive_hash": archive_hash, "metrics": metrics,
+              "fills": fills, "misses": [{k: m[k] for k in ("decision_id", "instrument", "reasons", "confidence")} for m in misses],
+              "proposal": asdict(proposal), "applied": False,
+              "governance": "PROPOSAL ONLY: a schema change ships only through the AgenKit review gate with operator approval."}
+    out_dir.mkdir(parents=True, exist_ok=True)
+    day = _day(now_us)
+    (out_dir / f"nightly-{day}.json").write_text(json.dumps(report, indent=2, default=str))
+    overconfident = [b for b in buckets if b["n"] >= 20 and b["mean_confidence"] - b["hit_rate"] > 0.1]
+    lines = [f"# Schema proposal {day} (PROPOSAL ONLY, not applied)", "", f"BRAIN: {proposal.model_id} -> {proposal.action}",
+             f"Finding: {proposal.finding}", f"Brier: {brier} over {len(labels)} resolved labels", ""]
+    lines += [f"- Bucket {b['bucket']} overconfident: mean {b['mean_confidence']:.3f} vs hit {b['hit_rate']:.3f}; "
+              "consider tightening the direction rubric or the 0.80 entry gate." for b in overconfident] or ["- No bucket shows supported overconfidence."]
+    (out_dir / f"schema-proposal-{day}.md").write_text("\n".join(lines) + "\n")
+    return report
+
+
+def _judgment_dict(j: Judgment) -> dict:
+    return {"regime": j.regime.value, "direction": j.direction.value, "direction_confidence": j.direction_confidence,
+            "toxic_flow": j.toxic_flow, "setup_quality": j.setup_quality, "risk_state": j.risk_state.value,
+            "reflex_id": j.reflex_id, "calibrated": j.calibrated}
+
+
+def _day(now_us: int) -> str:
+    return datetime.fromtimestamp(now_us / 1e6, tz=timezone.utc).strftime("%Y-%m-%d")
+
+
+def _public_book_source(data_dir: Path) -> Callable[[str], dict]:
+    from data.call_log import DataCallLog
+    from data.public_metrics import fetch_coinbase_book
+    log = DataCallLog(data_dir / "public_calls.sqlite3")
+    return lambda product: fetch_coinbase_book(log, product, level=2)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Autonomous PAPER runtime. Never sends a real order.")
+    parser.add_argument("--paper", action="store_true", required=True, help="required: paper mode is the only mode")
+    parser.add_argument("--once", action="store_true")
+    parser.add_argument("--instruments", default="BTC-USD,ETH-USD")
+    parser.add_argument("--data-dir", default="data/autonomous/runtime")
+    parser.add_argument("--candle-seconds", type=int, default=60)
+    parser.add_argument("--horizon-candles", type=int, default=60)
+    parser.add_argument("--explore-fraction", type=float, default=0.0)
+    parser.add_argument("--arm-paper", action="store_true", help="local paper flag; cannot arm a live account")
+    parser.add_argument("--report", action="store_true", help="run nightly review and exit")
+    parser.add_argument("--clear-latch", help="operator: clear one latch kind")
+    args = parser.parse_args(argv)
+    config = RuntimeConfig(tuple(i.strip() for i in args.instruments.split(",") if i.strip()), Path(args.data_dir),
+                           args.candle_seconds, args.horizon_candles, explore_fraction=args.explore_fraction,
+                           paper_armed=args.arm_paper)
+    if args.report:
+        print(json.dumps(nightly_review(config.data_dir / "runtime.sqlite3", config.data_dir / "reviews")["metrics"], default=str))
+        return 0
+    runtime = PaperRuntime(config)
+    try:
+        if args.clear_latch:
+            runtime.clear_latch(args.clear_latch)
+            print(json.dumps({"cleared": args.clear_latch}))
+        elif args.once:
+            print(json.dumps(runtime.cycle(), default=str))
+        else:
+            stop_file = config.data_dir / "STOP"
+            runtime.serve(lambda: stop_file.exists())
+    finally:
+        runtime.close()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
