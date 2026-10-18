@@ -304,6 +304,23 @@ def status():
                 "data_source": "Coinbase, Binance, and Kraken public candle history", "market_collector": getattr(app.state, "market_data", {"last_success":None,"candles":0,"error":None})}
 
 
+@app.get("/api/autonomous/runtime")
+def autonomous_runtime():
+    """Read-only projection of the paper runtime's status.json. Never arms, kills or submits."""
+    # HANDOFF(claude-opus-5.5 2026-10-17): operator latch clear/kill must go through bot.autonomous.control, not here.
+    path = Path(os.environ.get("AUTONOMOUS_RUNTIME_DIR", ROOT / "data" / "autonomous" / "runtime")) / "status.json"
+    if not path.exists():
+        return {"available": False, "detail": "Paper runtime has not written status yet. Start: python -m bot.autonomous.runtime --paper"}
+    try:
+        payload = json.loads(path.read_text())
+    except (OSError, ValueError) as exc:
+        raise HTTPException(status_code=503, detail=f"Runtime status unreadable: {type(exc).__name__}")
+    age_s = None
+    if isinstance(payload.get("at_us"), int):
+        age_s = round(time.time() - payload["at_us"] / 1_000_000, 1)
+    return {"available": True, "age_seconds": age_s, "stale": age_s is None or age_s > 180, "status": payload}
+
+
 @app.get("/api/strategies")
 def strategy_catalog():
     return STRATEGY_CATALOG

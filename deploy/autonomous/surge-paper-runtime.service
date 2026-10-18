@@ -1,0 +1,20 @@
+# Paper-only autonomous runtime. Holds no venue credentials; never sends a real order.
+# Install (user unit): cp deploy/autonomous/surge-paper-runtime.* deploy/autonomous/surge-nightly.* ~/.config/systemd/user/
+#   systemctl --user daemon-reload && systemctl --user enable --now surge-paper-runtime surge-nightly.timer
+# Graceful stop: touch data/autonomous/runtime/STOP   Kill new orders: touch data/autonomous/runtime/KILL
+[Unit]
+Description=SURGE autonomous PAPER runtime (public books only)
+After=network-online.target
+
+[Service]
+WorkingDirectory=%h/crypto-trading-platform
+ExecStartPre=/bin/rm -f data/autonomous/runtime/STOP
+ExecStart=%h/crypto-trading-platform/.venv/bin/python -m bot.autonomous.runtime --paper --data-dir data/autonomous/runtime
+Restart=on-failure
+RestartSec=30
+# The runtime needs no secrets; strip anything inherited.
+UnsetEnvironment=COINBASE_API_KEY COINBASE_API_SECRET JEV_API_KEY ANTHROPIC_API_KEY
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,7 @@
+[Unit]
+Description=SURGE nightly review (fills, misses, Brier, schema proposal; never auto-applied)
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/crypto-trading-platform
+ExecStart=%h/crypto-trading-platform/.venv/bin/python -m bot.autonomous.runtime --paper --report --data-dir data/autonomous/runtime
