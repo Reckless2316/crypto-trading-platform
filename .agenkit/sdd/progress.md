@@ -1,5 +1,15 @@
 # Autonomous agent implementation
 
+## Claude Opus 5.5 continuation — 2026-10-17 22:40 MDT  `HANDOFF(claude-opus-5.5 2026-10-17)`
+
+- `32a72bc`: committed inherited Codex reconciliation WIP (582 tests OK).
+- `81910dd`: `bot/autonomous/runtime.py` end-to-end PAPER loop + 18 tests (600 OK). Offline reflex is labeled uncalibrated; zero Kelly below 100 resolved labels; hard drawdown/daily/position/KILL checks precede every paper fill.
+- `bc13161`: read-only `GET /api/autonomous/runtime`, `deploy/autonomous/` systemd units (runtime + 06:10 UTC nightly), `HANDOFF.md`. The frontend panel is in the uncommitted operator `index.html` edits.
+- Paper runtime started locally (nohup) writing `data/autonomous/runtime/`; stop with `touch data/autonomous/runtime/STOP`.
+- Independent contrarian review of the runtime is in flight; fix its findings test-first before claiming acceptance.
+- No live calls, orders, arming or deployment.
+
+
 ## Resumed — current local software checkpoint
 
 The operator resumed the active goal and reconfirmed approval for implementation,
