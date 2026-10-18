@@ -1,0 +1,261 @@
+{
+  "calibration": {
+    "train": [
+      {
+        "brier": 0.0550490920589697,
+        "calibrated_within_wilson": false,
+        "hit_rate": 1.0,
+        "instrument": "BTC-USD",
+        "mean_confidence": 0.7749923636363636,
+        "n": 33,
+        "reflex_id": "offline-reflex-v1",
+        "regime": "mean_reverting",
+        "wilson_95": [
+          0.895730002457548,
+          1.0
+        ]
+      },
+      {
+        "brier": 0.08554427216919354,
+        "calibrated_within_wilson": false,
+        "hit_rate": 1.0,
+        "instrument": "ETH-USD",
+        "mean_confidence": 0.7265753870967742,
+        "n": 31,
+        "reflex_id": "offline-reflex-v1",
+        "regime": "mean_reverting",
+        "wilson_95": [
+          0.889744604539564,
+          1.0
+        ]
+      },
+      {
+        "brier": 0.645290008549,
+        "calibrated_within_wilson": false,
+        "hit_rate": 0.0,
+        "instrument": "ETH-USD",
+        "mean_confidence": 0.803282,
+        "n": 2,
+        "reflex_id": "offline-reflex-v1",
+        "regime": "trending",
+        "wilson_95": [
+          0.0,
+          0.6576197724933469
+        ]
+      }
+    ],
+    "validation": []
+  },
+  "criteria_results": {
+    "brier_beats_base_rate": {
+      "pass": false,
+      "threshold": "<0 (95% upper, Holm)",
+      "value": null
+    },
+    "day_concentration": {
+      "pass": false,
+      "threshold": 0.3,
+      "value": null
+    },
+    "holdout_effective_blocks": {
+      "pass": false,
+      "threshold": 800,
+      "value": 0
+    },
+    "holdout_unseen": {
+      "pass": true,
+      "threshold": true,
+      "value": true
+    },
+    "no_decision_errors": {
+      "pass": true,
+      "threshold": 0,
+      "value": 0
+    },
+    "replay_fidelity_exact": {
+      "pass": true,
+      "threshold": 0,
+      "value": 0
+    },
+    "stressed_net_lower_bound_positive": {
+      "pass": false,
+      "threshold": ">0 (95% lower, Holm)",
+      "value": null
+    },
+    "train_effective_blocks": {
+      "pass": false,
+      "threshold": 1000,
+      "value": 1
+    },
+    "validation_effective_blocks": {
+      "pass": false,
+      "threshold": 400,
+      "value": 0
+    }
+  },
+  "holdout": {
+    "base_rate_brier": null,
+    "base_rate_from_train": 0.9696969696969697,
+    "brier": null,
+    "brier_difference_upper_95": null,
+    "cohorts": [],
+    "evaluation_hash": "bf98c0ff72c98db661898ccd2d48406525b656ec08357fe0bde9067d831e2ade",
+    "holdout_identity": "f62cbd536f4a06de9327cc51fea3abb73f7ede03207636457b38007f5b2d68e9",
+    "p_brier": null,
+    "prior_looks": [],
+    "relook": null,
+    "samples": 0,
+    "stress": {
+      "baseline": {
+        "day_concentration": null,
+        "lower_95": null,
+        "mean_net_return": null,
+        "p_not_positive": null,
+        "trades": 0,
+        "unresolved_nonfills": 0,
+        "upper_95": null
+      },
+      "combined": {
+        "day_concentration": null,
+        "lower_95": null,
+        "mean_net_return": null,
+        "p_not_positive": null,
+        "trades": 0,
+        "unresolved_nonfills": 0,
+        "upper_95": null
+      },
+      "fee_x1.5": {
+        "day_concentration": null,
+        "lower_95": null,
+        "mean_net_return": null,
+        "p_not_positive": null,
+        "trades": 0,
+        "unresolved_nonfills": 0,
+        "upper_95": null
+      },
+      "latency_1_candle": {
+        "day_concentration": null,
+        "lower_95": null,
+        "mean_net_return": null,
+        "p_not_positive": null,
+        "trades": 0,
+        "unresolved_nonfills": 0,
+        "upper_95": null
+      },
+      "spread_x2": {
+        "day_concentration": null,
+        "lower_95": null,
+        "mean_net_return": null,
+        "p_not_positive": null,
+        "trades": 0,
+        "unresolved_nonfills": 0,
+        "upper_95": null
+      }
+    }
+  },
+  "ineligible_reasons": [
+    "brier_beats_base_rate",
+    "day_concentration",
+    "holdout_effective_blocks",
+    "stressed_net_lower_bound_positive",
+    "train_effective_blocks",
+    "validation_effective_blocks"
+  ],
+  "manifest": {
+    "as_of_us": 1792310221667085,
+    "assumptions": [
+      "replayed book = recorded best bid/ask with recorded imbalance (two levels)",
+      "product rules = fixed conservative public increments",
+      "OfflineReflex regenerated; stress applied to recorded top-of-book quotes",
+      "trades = gate-open long decisions (the only entries the runtime can make)"
+    ],
+    "bootstrap": {
+      "block_us": 14400000000,
+      "method": "nonoverlapping time-block bootstrap, blocks resampled with replacement",
+      "replications": 10000,
+      "seed": 20261018
+    },
+    "code_hash": "e7f7cf0ead92f1562b036524cf53c6be1b93ed345421ae241078ad5ed1ef8033",
+    "criteria": {
+      "alpha": 0.05,
+      "block_floor": 200,
+      "block_us": 14400000000,
+      "bootstrap": 10000,
+      "embargo_us": 14400000000,
+      "fee_multiplier": 1.5,
+      "fractions": [
+        0.6,
+        0.2,
+        0.2
+      ],
+      "latency_candles": 1,
+      "max_day_concentration": 0.3,
+      "min_holdout_blocks": 800,
+      "min_train_blocks": 1000,
+      "min_validation_blocks": 400,
+      "seed": 20261018,
+      "spread_multiplier": 2.0
+    },
+    "criteria_hash": "e318995f7b84866e781e1becc53f9d119889b9c8af2e2281fa46e7d9037d84a1",
+    "seal": "373af6f9b7e58416756c581abe033200c8e6ee614b488bb09e3a9507585f0817",
+    "source": "data/autonomous/runtime/runtime.sqlite3",
+    "source_fingerprint": "3de4d7a6ae9c8e57c64aa9315769a78c6cf2668edbc36420244ccf7994d671b6"
+  },
+  "promotion_eligible": false,
+  "replay": {
+    "cycles": 188,
+    "decision_errors": 0,
+    "fidelity": {
+      "compared": 336,
+      "exact": true,
+      "labels_compared": 216,
+      "labels_mismatched": 0,
+      "mismatch_examples": [],
+      "mismatched": 0,
+      "only_recorded": 0,
+      "only_replayed": 0,
+      "recorded_decisions": 336,
+      "replayed_decisions": 336
+    },
+    "resolved_samples": 216
+  },
+  "splits": {
+    "holdout": {
+      "blocks": 0,
+      "effective_blocks": 0,
+      "embargoed": 0,
+      "lag1_autocorrelation": null,
+      "purged": 0,
+      "rows": 0,
+      "window_us": [
+        1792307976000000,
+        1792310220000001
+      ]
+    },
+    "train": {
+      "blocks": 1,
+      "effective_blocks": 1,
+      "embargoed": 0,
+      "lag1_autocorrelation": null,
+      "purged": 120,
+      "rows": 66,
+      "window_us": [
+        1792299000000000,
+        1792305732000000
+      ]
+    },
+    "validation": {
+      "blocks": 0,
+      "effective_blocks": 0,
+      "embargoed": 30,
+      "lag1_autocorrelation": null,
+      "purged": 0,
+      "rows": 0,
+      "window_us": [
+        1792305732000000,
+        1792307976000000
+      ]
+    }
+  },
+  "version": "replay-report-v1"
+}

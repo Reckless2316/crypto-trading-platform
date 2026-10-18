@@ -392,7 +392,7 @@ def load_eth_tops(limit: int = 70) -> list:
     path = Path("data/autonomous/book_observations.sqlite3")
     if not path.exists():
         return []
-    connection = sqlite3.connect(path)
+    connection = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)  # reader only; never writes
     try:
         rows = connection.execute(
             """SELECT bid_price, bid_size, ask_price, ask_size, event_us, sequence
@@ -432,7 +432,7 @@ def load_book_tops(limit: int = 70) -> list:
     path = Path("data/autonomous/book_observations.sqlite3")
     if not path.exists():
         return []
-    connection = sqlite3.connect(path)
+    connection = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)  # reader only; never writes
     rows = connection.execute(
         """SELECT bid_price, bid_size, ask_price, ask_size, event_us, sequence
            FROM book_tops ORDER BY event_us DESC LIMIT ?""", (limit,)).fetchall()

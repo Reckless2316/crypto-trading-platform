@@ -1,0 +1,21 @@
+{
+  "looks": [
+    {
+      "as_of_us": 1792310221667085,
+      "evaluation_hash": "bf98c0ff72c98db661898ccd2d48406525b656ec08357fe0bde9067d831e2ade",
+      "holdout_identity": "f62cbd536f4a06de9327cc51fea3abb73f7ede03207636457b38007f5b2d68e9",
+      "instruments": [
+        "BTC-USD",
+        "ETH-USD"
+      ],
+      "prior_looks": [],
+      "relook": null,
+      "seal": "373af6f9b7e58416756c581abe033200c8e6ee614b488bb09e3a9507585f0817",
+      "window_us": [
+        1792307976000000,
+        1792310220000001
+      ]
+    }
+  ],
+  "version": 1
+}

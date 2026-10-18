@@ -324,3 +324,37 @@ class WorkerTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class WorkerBookReadersAreReadOnlyTests(unittest.TestCase):
+    """Dashboard-called book readers never open the observation database writable."""
+
+    def test_book_and_eth_readers_open_mode_ro(self):
+        import os
+        import sqlite3
+        import tempfile
+        from unittest.mock import patch
+        from bot.autonomous import worker
+        with tempfile.TemporaryDirectory() as directory:
+            previous = os.getcwd()
+            os.chdir(directory)
+            self.addCleanup(os.chdir, previous)
+            path = os.path.join("data", "autonomous", "book_observations.sqlite3")
+            os.makedirs(os.path.dirname(path))
+            with sqlite3.connect(path) as db:
+                for table in ("book_tops", "eth_book_tops"):
+                    db.execute(f"CREATE TABLE {table}(event_us INTEGER PRIMARY KEY, sequence INTEGER, exchange_time TEXT, "
+                               "bid_price TEXT, bid_size TEXT, ask_price TEXT, ask_size TEXT, eligible INTEGER, dispatched INTEGER)")
+                    db.execute(f"INSERT INTO {table} VALUES (1, 7, 't', '1', '2', '3', '4', 0, 0)")
+            seen = []
+            real = sqlite3.connect
+            def spy(target, *args, **kwargs):
+                seen.append((str(target), kwargs.get("uri", False)))
+                return real(target, *args, **kwargs)
+            with patch("sqlite3.connect", spy):
+                self.assertEqual(1, len(worker.load_book_tops(5)))
+                self.assertEqual(1, len(worker.load_eth_tops(5)))
+            self.assertEqual(2, len(seen))
+            for target, uri in seen:
+                self.assertTrue(uri, target)
+                self.assertIn("mode=ro", target)
