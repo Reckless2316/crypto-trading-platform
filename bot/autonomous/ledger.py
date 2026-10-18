@@ -1707,6 +1707,42 @@ class Ledger:
             self._release_killed_reservations(account_id)
             return True
 
+    # ---------- runtime decision bridge (formal provenance, never asserted validity) ----------
+    RUNTIME_SNAPSHOT_INVALID = 'TOKENIZER_PROOF_UNAVAILABLE;CAUSAL_SOURCE_LINEAGE_UNAVAILABLE'
+
+    def record_runtime_decision(self, *, account_id: str, release_hash: str, snapshot_id: str, candle_close_us: int,
+            knowledge_cutoff_us: int, field_hash: str, state_json: str, lineage_hash: str, batch, candidate_wire: int,
+            veto_codes: tuple[str, ...]) -> str:
+        """Persist a runtime judgment as a formal completed DecisionBatch over its real numeric state.
+
+        The snapshot is recorded INVALID: the runtime has no provider tokenizer proof and no causal source lineage
+        (StateEngine), which the formal state persistence requires. It is therefore audit provenance only: it can
+        never verify as a decision snapshot, carry a forecast, or authorize an entry. Idempotent by request id."""
+        from .contracts import DecisionBatch
+        if type(batch) is not DecisionBatch or batch.bundle_hash != release_hash or len(batch.decisions) != 1:
+            raise ContractViolation('typed single-candidate runtime DecisionBatch required')
+        if content_hash(strict_json(state_json)) != batch.state_hash:
+            raise ContractViolation('runtime decision state hash mismatch')
+        decision_id = 'runtime-decision-' + content_hash((account_id, batch.request_id))
+        response_json = batch.to_json()
+        with self.transaction() as c:
+            existing = c.execute('SELECT response_json FROM decisions WHERE decision_id=?', (decision_id,)).fetchone()
+            if existing is not None:
+                if existing[0] != response_json:
+                    raise ContractViolation('runtime decision identity/content conflict')
+                return decision_id
+            now = self._clock_us()
+            revision = canonical_bytes(self._revision(account_id)).decode()
+            c.execute('INSERT INTO snapshots VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+                      (snapshot_id, account_id, release_hash, candle_close_us, knowledge_cutoff_us, field_hash, state_json,
+                       None, None, lineage_hash, revision, 0, self.RUNTIME_SNAPSHOT_INVALID, now))
+            c.execute('INSERT INTO decisions VALUES (?,?,?,?,?,?,?,?,?,?,?)',
+                      (decision_id, snapshot_id, batch.request_id, batch.received_at_us, batch.model_id, response_json,
+                       content_hash(strict_json(response_json)), 'completed', 'runtime-bridge', batch.received_at_us, now))
+            c.execute('INSERT INTO candidate_results VALUES (?,?,?,?,?,?)',
+                      (decision_id, candidate_wire, 'hold', None, canonical_bytes(list(veto_codes)).decode(), now))
+        return decision_id
+
     # ---------- Task 14: operator paper arm and the deadman lease ----------
     MAX_LEASE_NS = 600_000_000_000
     REDUCE_LEASE_NS = 60_000_000_000

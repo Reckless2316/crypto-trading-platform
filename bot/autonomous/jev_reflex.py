@@ -284,10 +284,30 @@ class JevReflex:
                         or set(probabilities) != set(_CHOICE_LABELS[kind])):
                     raise ValueError("Choice labels differ from approved schema")
                 validate_choice(probabilities, answer["choice"], answer["confidence"])
-                values[kind] = (answer["choice"], float(answer["confidence"]))
+                values[kind] = (answer["choice"], float(answer["confidence"]),
+                                {label: float(probabilities[label]) for label in _CHOICE_LABELS[kind]})
             critical = min(values[k][1] for k in ("regime", "direction", "setup_quality", "risk_state"))
             out[instrument] = judgment_type(Regime(values["regime"][0]), Direction(values["direction"][0]),
                                             values["direction"][1], values["toxic_flow"] >= 0.5,  # approved .50 boundary
                                             int(values["setup_quality"][0]), AdvisoryRisk(values["risk_state"][0]),
-                                            self.reflex_id, False, critical)
+                                            self.reflex_id, False, critical, formal=self._formal(instrument, values))
         return out
+
+    @staticmethod
+    def _formal(instrument: str, values: dict):
+        """The complete provider answer as a formal CandidateDecision, for research candidates only.
+
+        Every probability and confidence is the provider's own validated value; nothing is derived or filled in."""
+        from .contracts import CANDIDATE_WIRE_IDS, CandidateDecision, ChoiceDistribution, DirectionDistribution
+        candidate = next((cid for cid, _ in CANDIDATE_WIRE_IDS if cid.upper() + "-USD" == instrument), None)
+        if candidate is None:
+            return None
+        def distribution(kind):
+            return ChoiceDistribution(_CHOICE_LABELS[kind], tuple(values[kind][2][label] for label in _CHOICE_LABELS[kind]))
+        direction = values["direction"][2]
+        return CandidateDecision(candidate, Regime(values["regime"][0]), Direction(values["direction"][0]),
+                                 int(values["setup_quality"][0]), AdvisoryRisk(values["risk_state"][0]),
+                                 DirectionDistribution(direction["long"], direction["short"], direction["neutral"]),
+                                 values["direction"][1], values["regime"][1], values["setup_quality"][1],
+                                 values["risk_state"][1], values["toxic_flow"], distribution("regime"),
+                                 distribution("setup_quality"), distribution("risk_state"))

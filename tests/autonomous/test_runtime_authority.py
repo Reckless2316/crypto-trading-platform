@@ -171,7 +171,7 @@ class LedgerRuntimeTests(LedgerCase):
         rt = self.runtime(self.adapter(entry_verifier=None), explore_fraction=0.001)
         self.clock.us += 1_000_000
         result = self.advance(rt, 21)["instruments"]["AAVE-USD"]
-        self.assertIn("AUTHORITY_REFUSED:DECISION_PROVENANCE_UNAVAILABLE", result["reasons"])
+        self.assertIn("AUTHORITY_REFUSED:FORMAL_JUDGMENT_UNAVAILABLE", result["reasons"])  # offline rules have no distribution
         self.assertEqual(0, self.ledger.connection.execute("SELECT COUNT(*) FROM order_intents").fetchone()[0])
         self.assertEqual(0, rt.db.execute("SELECT COUNT(*) FROM fills").fetchone()[0])
 

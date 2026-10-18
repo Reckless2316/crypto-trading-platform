@@ -35,6 +35,12 @@ An explicit ``--explore-fraction`` permits tiny labeled exploration entries
 #      methods and still need the authenticated control path.
 #   6. Warmup (fewer than 20 contiguous candles) gates entries only; exits and the crisis latch still act.
 #      Warmup decisions are stored with phase='warmup' and never labeled or used for calibration.
+#  10. Task 16 (2026-10-18): in ledger mode serve() renews the deadman lease every 10 s through an in-process
+#      `authority` role session, only while the cycle, books and ledger readiness are < 2 candles old and there are
+#      no unknown intents; otherwise it lapses to exit-only. Jev judgments on research candidates are persisted as
+#      formal DecisionBatches (real state + reflex_id) with INVALID snapshots (no tokenizer proof / causal lineage),
+#      so entries are refused with CALIBRATION_NOT_ATTESTED + SNAPSHOT_TOKEN_PROOF_UNAVAILABLE. Open: provider
+#      tokenizer proof, StateEngine causal ingestion, a production OutcomeEvidenceVerifier for labels, attestation.
 #   9. Control (2026-10-18): in ledger mode every latch lives in the ledger (single owner). DRAWDOWN never clears
 #      by command, DAILY clears only at UTC rollover, CRISIS/KILL clear only by an operator clear_latch request on
 #      <data-dir>/control/control.sock (unarmed, ready, reason recorded); every clear leaves the account unarmed.
@@ -76,6 +82,7 @@ from .state import book_metrics, require_token_budget
 
 REFLEX_ID = "offline-reflex-v1"
 LEDGER_ACCOUNT_ID = "runtime-paper"
+RENEW_EVERY_S = 10  # authority-worker lease renewal cadence against the 30 s deadman lease
 MIDNIGHT_LEAD_S = 1.2  # pre-midnight book read lead; the ledger accepts depth observed <= 2 s before the boundary
 SNAPSHOT_VERSION = "paper-snapshot-v1"
 SCHEMA_VERSION = "runtime-v3"
@@ -179,6 +186,7 @@ class Judgment:
     reflex_id: str
     calibrated: bool = False
     critical_confidence: float | None = None  # min over regime/direction/quality/risk confidences when the REFLEX reports them
+    formal: object = field(default=None, compare=False)  # the provider's complete CandidateDecision, when one exists
 
     def __post_init__(self):
         if (type(self.regime) is not Regime or type(self.direction) is not Direction
@@ -441,6 +449,9 @@ class PaperRuntime:
         self._offline = OfflineReflex()
         self._batch: dict = {}
         self._crisis_pending: list[str] = []
+        self._last_cycle_ok_us = self._last_books_ok_us = self._ledger_ready_us = 0
+        self._last_renew_mono = -(10**30)
+        self._lease = {"at_us": None, "renewed": False, "blocker": "NOT_STARTED"}
         self._batch_wires: dict[str, str] = {}
         self.jev_note = "jev_configured_unwired" if os.environ.get("JEV_API_KEY") else "jev_not_configured"
         if self.db.execute("SELECT COUNT(*) FROM equity_marks").fetchone()[0] == 0:
@@ -806,6 +817,12 @@ class PaperRuntime:
             # the authority's account lock; nothing here activates on its own.
             with self.authority.authority._lock(account_id):
                 ledger.apply_due_activation(account_id)
+            # Health evidence for the lease renewer: this cycle completed, its books were fresh, the ledger was ready.
+            self._last_cycle_ok_us = cutoff
+            if not errors and observed:
+                self._last_books_ok_us = cutoff
+            if self.authority.view()["ready"]:
+                self._ledger_ready_us = cutoff
         with self._tx():
             labeled = self.label_matured(cutoff)
         return self.write_status(cutoff, results, labeled)
@@ -905,6 +922,13 @@ class PaperRuntime:
         if judgment is not None and judgment.escalation_confidence < 0.60 and not warm:  # short history is not judged
             escalate.append("LOW_CONFIDENCE")
         reasons, action = reflex_notes + list(escalate) + (["WARMUP"] if warm else []), "hold"
+        formal_record = (None, ("FORMAL_JUDGMENT_UNAVAILABLE",))
+        if self.authority is not None and judgment is not None and not warm:
+            try:  # formal provenance for every live judgment (audit only; it never authorizes by itself)
+                formal_record = self.authority.record_decision(instrument, snap, judgment, gate_open=gate,
+                                                               reflex_call=getattr(self.reflex, "last_call", None))
+            except Exception as exc:
+                formal_record = (None, ("FORMAL_RECORD_FAILED:" + type(exc).__name__,))
         # The REFLEX call takes wall-clock time: re-check the book age with the real clock before any fill.
         book_fresh = self.clock_us() - event_us <= self.config.max_book_age_us
         fill, exploration = None, False
@@ -971,14 +995,10 @@ class PaperRuntime:
                 if blocked := self.risk_check("buy", instrument, notional, account):
                     reasons += blocked
                 elif self.authority is not None:
-                    # HANDOFF(claude-opus-5.5 2026-10-17): runtime judgments are not formal decisions; entries on the
-                    # ledger path stay refused until a persisted decision + recorded calibration attestation exist.
-                    outcome = self.authority.entry(instrument, notional, snap.candle_close_us, decision=None)
-                    if outcome.ok:
-                        fill, action = (outcome.qty, outcome.avg_price, outcome.notional, outcome.fee), "buy"
-                        reasons.append("LEDGER")
-                    else:
-                        reasons += ["AUTHORITY_REFUSED:" + r for r in outcome.reasons]
+                    # The formal path needs a valid decision snapshot and an attested calibration; until both exist
+                    # the precise missing prerequisites are reported and nothing is submitted.
+                    decision_ref, bridge_reasons = formal_record
+                    reasons += ["AUTHORITY_REFUSED:" + r for r in self.authority.entry_refusals(decision_ref, bridge_reasons)]
                 else:
                     limit = rules.round_limit(Decimal(str(best_ask)) * (1 + self.config.max_slippage_bps / Decimal(10_000)), "buy")
                     fill = paper_fill(asks, "buy", notional * (1 + self.config.fee_rate), None, limit, self.config.fee_rate, rules)
@@ -1064,6 +1084,7 @@ class PaperRuntime:
         status = {"mode": "paper", "live": False, "armed_paper": self.config.paper_armed,
                   "kill_switch": (self.config.data_dir / "KILL").exists(), "reflex": self.reflex.reflex_id,
                   "reflex_last_call": getattr(self.reflex, "last_call", None), "reflex_fallback": self.config.reflex_fallback,
+                  "lease": self.lease_status() if self.authority is not None else None,
                   "reflex_calibrated": False, "jev": self.jev_note, "at_us": now,
                   "equity_usd": mark["equity_usd"], "cash_usd": mark["cash_usd"], "high_water_usd": mark["high_water_usd"],
                   "day_open_usd": mark["day_open_usd"], "positions": {k: str(v) for k, v in self.positions().items()},
@@ -1196,14 +1217,92 @@ class PaperRuntime:
             return False
 
     def _wait(self, seconds: float, sleep: Callable[[float], None]) -> None:
-        """Sleep, serving control requests meanwhile when the endpoint is open."""
-        if getattr(self, "_control_server", None) is None:
+        """Sleep on the runtime clock, serving control requests and renewing the lease meanwhile (ledger mode)."""
+        if self.authority is None:
             sleep(seconds)
             return
-        deadline = time.monotonic() + max(0.0, seconds)
-        while (remaining := deadline - time.monotonic()) > 0:
-            if not self.poll_control(min(remaining, 1.0)):
-                sleep(min(remaining, 0.25))
+        end = self.clock_us() + int(max(0.0, seconds) * 1_000_000)
+        while (remaining := (end - self.clock_us()) / 1_000_000) > 0:
+            chunk = min(remaining, RENEW_EVERY_S)
+            if getattr(self, "_control_server", None) is not None:
+                if not self.poll_control(min(chunk, 1.0)):
+                    sleep(min(chunk, 0.25))
+            else:
+                sleep(chunk)
+            self.renew_tick()
+
+    # ---------- authority worker: deadman lease renewal (Task 16) ----------
+    def renewal_blocker(self) -> str | None:
+        """Why the lease must not be renewed now, or None. Any doubt lets the lease lapse to exit-only."""
+        ledger, account_id = self.authority.ledger, self.authority.account_id
+        row = ledger.connection.execute("SELECT permit, hard_killed FROM account_control WHERE account_id=?",
+                                        (account_id,)).fetchone()
+        if row["permit"] == "none" or row["hard_killed"]:
+            return "NOT_ARMED"
+        now, window = self.clock_us(), 2 * self.config.candle_seconds * 1_000_000
+        if now - self._last_cycle_ok_us > window:
+            return "CYCLE_STALE"
+        if now - self._last_books_ok_us > window:
+            return "BOOKS_STALE"
+        if now - self._ledger_ready_us > window:
+            return "UNRECONCILED"
+        if ledger.account_view(account_id).unknown_intent_ids:
+            return "UNKNOWN_INTENTS"
+        return None
+
+    def renew_tick(self) -> None:
+        """Renew through the authenticated `authority` role every RENEW_EVERY_S while healthy; otherwise stop."""
+        if self.authority is None:
+            return
+        mono = self.authority.monotonic_ns()
+        if mono - self._last_renew_mono < RENEW_EVERY_S * 1_000_000_000:
+            return
+        try:
+            blocker = self.renewal_blocker()
+            renewed = False
+            if blocker is None:
+                receipt = self._renew_via_control()
+                renewed = receipt.get("status") == "completed"
+                if not renewed:
+                    blocker = "RENEW_REFUSED:" + ",".join(receipt.get("reason_codes") or ["unknown"])
+        except Exception as exc:
+            blocker, renewed = "RENEWER_ERROR:" + type(exc).__name__, False
+        self._last_renew_mono = mono
+        self._lease = {"at_us": self.clock_us(), "renewed": renewed, "blocker": blocker}
+
+    def lease_status(self) -> dict:
+        row = self.authority.ledger.connection.execute(
+            "SELECT permit, lease_deadline_mono_ns FROM account_control WHERE account_id=?", (self.authority.account_id,)).fetchone()
+        remaining = None if row["lease_deadline_mono_ns"] is None else (row["lease_deadline_mono_ns"] - self.authority.monotonic_ns()) / 1e9
+        return dict(self._lease, permit=row["permit"], remaining_s=remaining)
+
+    def _renew_via_control(self) -> dict:
+        """One authenticated `renew` request from this process's own authority-role session (no model role)."""
+        import secrets
+        from .control import ControlService, ControlSession, FileControlJournal, PeerCredentials, _private_directory
+        mono = self.authority.monotonic_ns()
+        session = getattr(self, "_renewer_session", None)
+        if session is None or not self._renewer_nonces or session.expires_mono_ns <= mono:
+            expires = mono + 3_600_000_000_000
+            nonces = [secrets.token_hex(8) for _ in range(512)]
+            session = ControlSession("renewer-" + secrets.token_hex(8), "authority:worker", "authority",
+                                     self.authority.account_id, "paper", self.authority.boot_id, secrets.token_urlsafe(32),
+                                     PeerCredentials(os.getpid(), os.getuid(), os.getgid()), expires,
+                                     {nonce: expires for nonce in nonces})
+            self._renewer_session, self._renewer_nonces = session, nonces
+            _private_directory(self.control_dir)
+            self._renewer_service = ControlService(backend=self.control_backend(), sessions=[session],
+                                                   journal=FileControlJournal(self.control_dir / "renewer-journal"),
+                                                   boot_id=self.authority.boot_id, monotonic_ns=self.authority.monotonic_ns)
+        nonce = self._renewer_nonces.pop()
+        epoch = self.authority.ledger.connection.execute("SELECT permit_epoch FROM account_control WHERE account_id=?",
+                                                         (self.authority.account_id,)).fetchone()[0]
+        raw = json.dumps({"version": 1, "request_id": "renew-" + secrets.token_hex(8), "account_id": session.account_id,
+                          "mode": "paper", "kind": "renew", "actor": session.actor, "expected_epoch": epoch,
+                          "boot_id": session.boot_id, "deadline_mono_ns": session.expires_mono_ns,
+                          "session_id": session.session_id, "token": session.token, "nonce": nonce,
+                          "payload": {"reason": "authority worker heartbeat"}}).encode()
+        return self._renewer_service.handle(raw, PeerCredentials(os.getpid(), os.getuid(), os.getgid()))
 
     def close(self):
         server = getattr(self, "_control_server", None)

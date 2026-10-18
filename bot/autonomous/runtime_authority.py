@@ -27,6 +27,8 @@ the evidence class the ledger accepts for paper accounts. They are not venue att
 """
 from __future__ import annotations
 
+import json
+import math
 import time
 from dataclasses import dataclass
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
@@ -34,7 +36,7 @@ from typing import Callable
 
 from . import risk
 from .contracts import (
-    CANDIDATE_WIRE_IDS, BookPayload, ContractViolation, DecisionReference, ExecutableBook, MarketRules, OrderProposal,
+    CANDIDATE_WIRE_IDS, BookPayload, canonical_bytes, ContractViolation, DecisionReference, ExecutableBook, MarketRules, OrderProposal,
     ReceiptStatus, ReconcileReason, RiskLimits, Side, content_hash, decimal_text,
 )
 from .execution import OrderAuthority, PaperVenue
@@ -224,6 +226,82 @@ class RuntimeAuthority:
 
     def reconcile(self):
         return self.authority.reconcile(self.account_id, ReconcileReason.PERIODIC)
+
+    # ---------- formal decision bridge ----------
+    def record_decision(self, instrument: str, snap, judgment, *, gate_open: bool, reflex_call: dict | None = None):
+        """Persist a REFLEX judgment as formal provenance. Returns (decision_id | None, refusal reasons).
+
+        Only research candidates with an active release and a provider-complete CandidateDecision qualify; the
+        offline reflex has no probability distribution and is never converted into one."""
+        from .contracts import DecisionBatch, Feature, candidate_wire_id, default_field_dictionary
+        from .state import _wire_values
+        candidate = CANDIDATE_INSTRUMENTS.get(instrument)
+        if candidate is None:
+            return None, ("NOT_A_CANDIDATE",)
+        formal = getattr(judgment, "formal", None)
+        if formal is None or formal.candidate_id != candidate:
+            return None, ("FORMAL_JUDGMENT_UNAVAILABLE",)
+        release = self.ledger.connection.execute("SELECT active_release_hash FROM account_control WHERE account_id=?",
+                                                 (self.account_id,)).fetchone()[0]
+        if release is None:
+            return None, ("NO_ACTIVE_RELEASE",)
+        dictionary = default_field_dictionary()
+        view = self.view()
+        held = view["positions"].get(instrument, Decimal(0))
+        equity = Decimal(view["equity_usd_u"]) / _MICRO if view["equity_usd_u"] else Decimal(0)
+        bid = self._books[instrument].book.bids[0][0] if instrument in self._books else None
+        value = held * bid if bid is not None else None
+        measured = {  # every value is the runtime's own measurement; anything not measured stays invalid
+            "mid": snap.mid, "spread_bps": snap.spread_bps, "imbalance": snap.imbalance,
+            "rv_60m": snap.realized_vol_bps / 10_000 if snap.history >= 60 else None, "rv_samples": float(snap.history),
+            "return_1h": (math.exp(snap.momentum_bps / 10_000) - 1) if snap.history >= 60 else None,
+            "base_inventory": float(held), "inventory_usd": float(value) if value is not None else None,
+            "estimated_roundtrip_cost_bps": float(2 * self.fee_rate * 10_000) + snap.spread_bps}
+        candidate_features = tuple(Feature(f.name, float(measured.get(f.name) or 0.0), measured.get(f.name) is not None)
+                                   for f in dictionary.candidate_fields)
+        shared_measured = {"candle_close_ms": float(snap.candle_close_us // 1000), "drawdown": snap.drawdown,
+                           "daily_loss": snap.daily_loss,
+                           "cash_headroom": float(view["cash"] / equity) if equity > 0 else None}
+        shared_features = tuple(Feature(f.name, float(shared_measured.get(f.name) or 0.0), shared_measured.get(f.name) is not None)
+                                for f in dictionary.shared_fields)
+        state = [_wire_values(shared_features, dictionary.shared_fields), [_wire_values(candidate_features, dictionary.candidate_fields, candidate)]]
+        state_json = canonical_bytes(state).decode()
+        runtime_hash = content_hash(snap.wire())  # the runtime's own persisted snapshot identity
+        mono = self.monotonic_ns()
+        call = reflex_call or {}
+        batch = DecisionBatch(f"runtime-{judgment.reflex_id}-{instrument}-{snap.candle_close_us}", content_hash(state),
+                              release, judgment.reflex_id, mono, mono, self.clock_us(), (formal,),
+                              call.get("response_hash"), schema_hash=getattr(judgment, "schema_hash", None))
+        vetoes = ("SNAPSHOT_TOKEN_PROOF_UNAVAILABLE",) + (() if gate_open else ("ENTRY_GATE_REFUSED",))
+        decision_id = self.ledger.record_runtime_decision(
+            account_id=self.account_id, release_hash=release, snapshot_id="runtime-snapshot-" + runtime_hash,
+            candle_close_us=snap.candle_close_us, knowledge_cutoff_us=snap.cutoff_us, field_hash=dictionary.dictionary_hash,
+            state_json=state_json, lineage_hash=runtime_hash, batch=batch, candidate_wire=candidate_wire_id(candidate),
+            veto_codes=vetoes)
+        return decision_id, ()
+
+    def entry_refusals(self, decision_id: str | None, reasons: tuple[str, ...]) -> tuple[str, ...]:
+        """Precise reasons an entry cannot use the formal path yet (all that apply, in order)."""
+        if decision_id is None:
+            return reasons
+        out = []
+        valid = self.ledger.connection.execute("SELECT s.valid FROM decisions d JOIN snapshots s USING(snapshot_id) "
+                                               "WHERE d.decision_id=?", (decision_id,)).fetchone()
+        if not valid or not valid[0]:
+            out.append("SNAPSHOT_TOKEN_PROOF_UNAVAILABLE")
+        release = self.ledger.connection.execute(
+            "SELECT b.manifest_json FROM account_control c JOIN release_bundles b ON b.release_hash=c.active_release_hash "
+            "WHERE c.account_id=?", (self.account_id,)).fetchone()
+        manifest = json.loads(release[0]) if release else {}
+        calibrator = manifest.get("calibrator_hash") if isinstance(manifest, dict) else None
+        active = self.ledger.connection.execute("SELECT active_release_hash FROM account_control WHERE account_id=?",
+                                                (self.account_id,)).fetchone()[0]
+        if calibrator is None or self.ledger.attested_calibration(calibrator, active) is None:
+            out.insert(0, "CALIBRATION_NOT_ATTESTED")
+        # HANDOFF(claude-opus-5.5 2026-10-18): with a valid snapshot AND an attested calibration, wire
+        # estimate_edge -> size_entry -> sizing_entry_verifier and submit through `entry`. Unreachable today: no
+        # provider tokenizer proof (snapshots stay invalid) and no production OutcomeEvidenceVerifier (no labels).
+        return tuple(out) or ("ATTESTED_ENTRY_PATH_PENDING",)
 
     # ---------- admission ----------
     def diagnose(self, instrument: str, *, reducing: bool) -> tuple[str, ...]:
