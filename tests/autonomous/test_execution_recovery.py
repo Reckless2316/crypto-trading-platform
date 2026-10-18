@@ -26,6 +26,7 @@ class ActionKeyTests(unittest.TestCase):
 
 class RecordingVenue:
     """Wraps a venue and counts submissions so tests can prove nothing reached it."""
+    venue = "paper"
     def __init__(self, inner=None, error=None):
         self.inner, self.error, self.calls = inner, error, 0
 
@@ -190,6 +191,32 @@ class AuthorityTests(unittest.TestCase):
         self.assertTrue(blocked["halted"])
         self.assertEqual(0, self.venue.calls)
         self.assertEqual(0, self.ledger.connection.execute("SELECT count(*) FROM fills").fetchone()[0])
+
+    def test_paper_account_cannot_dispatch_to_a_live_venue(self):
+        self.prepare()
+        self.venue.venue = "coinbaseadvanced"
+        receipt = self.submit()
+        self.assertEqual(ReceiptStatus.REJECTED, receipt.status)
+        self.assertIn("VENUE_MODE_MISMATCH", receipt.reason_codes)
+        self.assertEqual(0, self.venue.calls)
+        self.assertEqual(0, self.ledger.connection.execute("SELECT count(*) FROM fills").fetchone()[0])
+
+    def test_acknowledgment_with_unknown_outcome_is_pending(self):
+        from bot.autonomous.contracts import OrderReference, VenueOrderResult
+        self.prepare()
+        owner = self
+        class AcknowledgmentOnly:
+            def submit(self, intent, book, market):
+                reference = OrderReference(intent.proposal.account_id, intent.intent_id,
+                    intent.client_order_id, "acknowledged-order")
+                result = VenueOrderResult(reference, IntentState.UNKNOWN, D(0),
+                    intent.proposal.base_quantity, owner.now, "ack-only")
+                return execution().VenueExecution((result,), ())
+        self.venue.inner = AcknowledgmentOnly()
+        receipt = self.submit()
+        self.assertEqual(ReceiptStatus.PENDING, receipt.status)
+        self.assertEqual(IntentState.UNKNOWN, receipt.state)
+        self.assertGreater(self.ledger.account_view("paper-test").reservations[0].cash_usd_u, 0)
 
     def test_serve_loop_reviews_once_and_never_submits(self):
         from bot.autonomous.worker import PaperWorker

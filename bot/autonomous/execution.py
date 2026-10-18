@@ -16,8 +16,8 @@ from typing import Any, Callable, Protocol
 
 from .contracts import (
     AccountView, ContractViolation, DecisionReference, ExecutableBook, IntentReceipt, IntentState,
-    MarketRules, OrderEvent, OrderProposal, OrderReference, PersistenceUnavailable, PreparedIntent,
-    ReceiptStatus, Side, SizedProposal, StateUnavailable, VenueOrderResult, content_hash, decimal_text,
+    MarketRules, Mode, OrderEvent, OrderProposal, OrderReference, PersistenceUnavailable, PreparedIntent,
+    ReceiptStatus, ReconcileReason, ReconcileReport, Side, SizedProposal, StateUnavailable, VenueOrderResult, content_hash, decimal_text,
 )
 
 _REFUSALS = (ContractViolation, StateUnavailable, PersistenceUnavailable, ValueError)
@@ -182,9 +182,10 @@ class OrderAuthority:
     def __init__(self, ledger, venue: VenuePort, *, book_source: Callable[[str], ExecutableBook | None],
                  market_source: Callable[[str], MarketRules],
                  entry_verifier: Callable[[OrderProposal, AccountView, ExecutableBook, MarketRules, int], bool],
-                 clock_us: Callable[[], int]):
+                 clock_us: Callable[[], int], reconciliation_source: Callable[[str], str] | None = None):
         self.ledger, self.venue, self.book_source, self.market_source = ledger, venue, book_source, market_source
         self.entry_verifier, self.clock_us = entry_verifier, clock_us
+        self.reconciliation_source = reconciliation_source
         self._locks: dict[str, threading.Lock] = {}
         self._locks_guard = threading.Lock()
 
@@ -194,6 +195,46 @@ class OrderAuthority:
 
     def _receipt(self, request_id, status, intent_id=None, state=None, *reasons):
         return IntentReceipt(request_id, status, intent_id, state, tuple(reasons))
+
+    def reconcile(self, account_id: str, reason: ReconcileReason = ReconcileReason.PERIODIC) -> ReconcileReport:
+        """Reconcile from authority-owned observations, never caller-supplied balances.
+
+        Acquisition holds the account mutex but no SQL transaction. Mark admission
+        and all terminal settlements then commit together, or retain all capacity.
+        The paper evidence boundary is implemented; live requires its authenticated
+        accounting importer before it can use this path.
+        """
+        if type(reason) is not ReconcileReason or type(account_id) is not str or not account_id:
+            raise ContractViolation('typed reconciliation account/reason required')
+        with self._lock(account_id):
+            started = self.clock_us()
+            self.ledger.invalidate_account(account_id)
+            differences = ()
+            if self.reconciliation_source is None:
+                differences = ('RECONCILIATION_SOURCE_UNAVAILABLE',)
+            else:
+                try:
+                    evidence_id = self.reconciliation_source(account_id)
+                    with self.ledger.transaction():
+                        evidence, _ = self.ledger._evidence(evidence_id, 'mark')
+                        if evidence['account_id'] != account_id or evidence['event_at_us'] < started:
+                            raise ContractViolation('reconciliation observation is stale or misbound')
+                        self.ledger.record_mark(evidence_id)
+                        account = self.ledger.account_view(account_id)
+                        if not account.ready or account.unknown_intent_ids:
+                            raise ContractViolation('account remains unreconciled')
+                        for reservation in account.reservations:
+                            if reservation.state in (IntentState.FILLED, IntentState.CANCELED, IntentState.REJECTED):
+                                self.ledger.settle_reconciled_intent(evidence_id, reservation.intent_id)
+                except _REFUSALS:
+                    differences = ('RECONCILIATION_INCOMPLETE',)
+                    self.ledger.invalidate_account(account_id)
+            account = self.ledger.account_view(account_id)
+            finished = self.clock_us()
+            key = account.reconcile_id if not differences else 'reconcile-failed-' + content_hash(
+                (account_id, started, finished, reason.value, differences))
+            return ReconcileReport(key, account_id, reason, started, finished,
+                not differences and account.ready, differences, account.revision)
 
     def _event(self, intent: PreparedIntent, result: VenueOrderResult) -> OrderEvent:
         now = self.ledger._clock_us()
@@ -239,6 +280,13 @@ class OrderAuthority:
             return self._receipt(request_id, ReceiptStatus.REJECTED, None, None, "ACCOUNT_OR_MARKET_UNAVAILABLE")
         if type(market) is not MarketRules or market.instrument != proposal.instrument:
             return self._receipt(request_id, ReceiptStatus.REJECTED, None, None, "ACCOUNT_OR_MARKET_UNAVAILABLE")
+        venue = getattr(self.venue, 'venue', None)
+        expected_venue = self.ledger.connection.execute('SELECT venue FROM accounts WHERE account_id=?',
+            (proposal.account_id,)).fetchone()[0]
+        if ((account.mode is Mode.PAPER and venue != 'paper')
+                or (account.mode is Mode.LIVE and (venue != expected_venue or venue == 'paper'))
+                or account.mode is Mode.SHADOW):
+            return self._receipt(request_id, ReceiptStatus.REJECTED, None, None, "VENUE_MODE_MISMATCH")
         if not proposal.reducing_only and not self.entry_verifier(proposal, account, book, market, self.clock_us()):
             return self._receipt(request_id, ReceiptStatus.REJECTED, None, None, "ENTRY_SIZING_NOT_REPRODUCED")
         try:
@@ -316,4 +364,5 @@ class OrderAuthority:
         if fee_u > intent.proposal.max_fee_usd_u:
             self.ledger.invalidate_account(intent.proposal.account_id)
             return self._receipt(request_id, ReceiptStatus.COMPLETED, intent.intent_id, results[-1].state, "FEE_BOUND_EXCEEDED")
-        return self._receipt(request_id, ReceiptStatus.COMPLETED, intent.intent_id, results[-1].state)
+        status = ReceiptStatus.PENDING if results[-1].state is IntentState.UNKNOWN else ReceiptStatus.COMPLETED
+        return self._receipt(request_id, status, intent.intent_id, results[-1].state)

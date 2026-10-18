@@ -1018,6 +1018,53 @@ class Ledger:
             c.execute("UPDATE reservations SET state='rejected',cash_usd_u=0,gross_usd_u=0,loss_budget_usd_u=0,remaining_qty='0',version=version+1,updated_at_us=? WHERE intent_id=?", (now, intent_id))
             return True
 
+    def settle_reconciled_intent(self, evidence_id: str, intent_id: str) -> bool:
+        """Release paper capacity only against current complete settlement proof.
+
+        A terminal event proves order status; the economic replay proves accounted
+        quantity/final fees, and an independent current mark proves account balances
+        and open orders. Live evidence still requires the authenticated importer.
+        """
+        with self.transaction() as c:
+            evidence, payload = self._evidence(evidence_id, 'mark')
+            intent = self._prepared(intent_id)
+            account_id = intent.proposal.account_id
+            if evidence['account_id'] != account_id or intent.state not in _TERMINAL:
+                raise ContractViolation('settlement requires account-bound terminal intent')
+            account = self._account_view(account_id)
+            state = self._state(account_id)
+            mark = c.execute('SELECT * FROM exact_marks WHERE mark_id=?', (state['last_mark_id'],)).fetchone()
+            if (not account.ready or account.unknown_intent_ids or mark is None or mark['evidence_id'] != evidence_id
+                    or not mark['ready'] or mark['reconcile_id'] != account.reconcile_id):
+                raise ContractViolation('settlement requires current complete reconciliation')
+            balances = {r['asset']: r['native_qty'] for r in c.execute(
+                'SELECT asset,native_qty FROM balance_positions WHERE account_id=?', (account_id,))}
+            if payload['balances'] != balances or tuple(payload['open_intent_ids']) != account.open_intent_ids:
+                raise ContractViolation('settlement observation differs from current account')
+            row = c.execute('SELECT payload_json,recorded_at_us FROM order_events WHERE intent_id=? ORDER BY append_sequence DESC LIMIT 1',
+                (intent_id,)).fetchone()
+            if row is None or row['recorded_at_us'] > evidence['known_at_us']:
+                raise ContractViolation('settlement lacks causal terminal event')
+            event = OrderEvent.from_json(row['payload_json'])
+            if (event.kind is not intent.state or event.result.received_at_us > evidence['event_at_us']):
+                raise ContractViolation('settlement terminal evidence disagrees')
+            replay = self._replay_economics(account_id)
+            if replay[5] or Fraction(event.result.filled_quantity) != replay[4].get(intent_id, Fraction(0)):
+                raise ContractViolation('settlement fills or final fees incomplete')
+            reservation = intent.reservation
+            if not any((reservation.cash_usd_u, reservation.gross_usd_u,
+                    reservation.loss_budget_usd_u, reservation.base_quantity, reservation.remaining_quantity)):
+                return False
+            now = self._clock_us()
+            c.execute("UPDATE reservations SET cash_usd_u=0,gross_usd_u=0,loss_budget_usd_u=0,base_qty='0',remaining_qty='0',version=version+1,updated_at_us=? WHERE intent_id=?",
+                (now, intent_id))
+            key = 'settlement-' + content_hash((account_id, intent_id, evidence_id))
+            epoch = c.execute('SELECT permit_epoch FROM account_control WHERE account_id=?', (account_id,)).fetchone()[0]
+            c.execute("INSERT INTO control_events VALUES (?,?,?,?,'recovery','reconciler',?,?)",
+                (key, account_id, key, epoch, canonical_bytes({'intent_id': intent_id,
+                    'mark_evidence_id': evidence_id, 'terminal_event_id': event.event_id}).decode(), now))
+            return True
+
     def _append_order_evidence(self, event_id: str, intent_id: str, kind: str,
             payload_json: str, received_at_us: int, recorded_at_us: int,
             event_at_us: int | None = None, venue_event_key: str | None = None) -> None:
