@@ -19,6 +19,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import threading
 import time
 from pathlib import Path
 from typing import Callable
@@ -60,10 +61,20 @@ _RUBRICS = {
 }
 
 
+_QUESTION_TEMPLATE = ("Schema SHA-256: {schema_hash}. Instrument: {instrument}. Read only this instrument's row "
+                      "state.rows[{instrument_json}]; do not infer or substitute values. Fields: {fields}. "
+                      "Horizon: {horizon}. Rubric ({kind}): {instructions}")
+
+
 def compile_schema(model: str = DEFAULT_MODEL, *, horizon_candles: int = 60, candle_seconds: int = 60) -> dict:
-    """The full question schema. Its canonical hash is what an operator approves."""
-    return {"version": "paper-jev-schema-v1", "model": model, "fields": _FIELDS,
+    """The full request template minus ``state``: model, question text template, type mapping, rubrics and fields.
+
+    Everything sent besides the numeric state and the instrument name is rendered from this object, so its
+    canonical hash is exactly what an operator approves."""
+    return {"version": "paper-jev-schema-v2", "model": model, "fields": _FIELDS,
             "horizon": f"the next {horizon_candles} completed candles of {candle_seconds} seconds",
+            "question_template": _QUESTION_TEMPLATE,
+            "types": {kind: "noul" if kind == "toxic_flow" else "choice" for kind in _QUESTION_KINDS},
             "rubrics": {kind: {"instructions": text, "criteria": criteria} for kind, (text, criteria) in _RUBRICS.items()}}
 
 
@@ -79,12 +90,65 @@ def write_proposed_schema(data_dir: Path, schema: dict) -> Path:
     return path
 
 
-def http_transport(url: str, headers: dict, body: bytes, timeout_s: float) -> tuple[int, str | None, bytes]:
-    """Single POST, no retries, no environment proxies. Used only after every gate has passed."""
-    import httpx
-    with httpx.Client(timeout=httpx.Timeout(timeout_s), trust_env=False) as client:
-        response = client.post(url, content=body, headers=headers)
-        return response.status_code, response.headers.get("x-typesafe-request-id"), response.content[:_MAX_RESPONSE_BYTES + 1]
+class ResponseTooLarge(ValueError):
+    """The provider response exceeded the local size bound; reading stopped."""
+
+
+def _is_timeout(exc: BaseException) -> bool:
+    if isinstance(exc, TimeoutError):
+        return True
+    try:
+        import httpx
+    except ImportError:  # pragma: no cover - httpx is a pinned dependency
+        return False
+    return isinstance(exc, httpx.TimeoutException)
+
+
+def make_http_transport(httpx_transport=None, *, monotonic_ns: Callable[[], int] = time.monotonic_ns):
+    """Single streamed POST under a hard wall-clock deadline. No retries, no environment proxies.
+
+    httpx timeouts are per phase (and read restarts per chunk; DNS is uncovered), so the whole call runs in a
+    daemon worker joined with the remaining budget; a miss is a timeout and the late result is discarded.
+    The body is streamed: an over-limit Content-Length is refused before reading, and reading stops at the
+    size bound. The deadline is re-checked after every chunk."""
+    def transport(url: str, headers: dict, body: bytes, timeout_s: float) -> tuple[int, str | None, bytes]:
+        import httpx
+        deadline = monotonic_ns() + int(timeout_s * 1e9)
+        outcome: dict = {}
+
+        def call():
+            try:
+                with httpx.Client(transport=httpx_transport, timeout=httpx.Timeout(timeout_s), trust_env=False) as client:
+                    with client.stream("POST", url, content=body, headers=headers) as response:
+                        length = response.headers.get("content-length")
+                        if length is not None and (not length.isdigit() or int(length) > _MAX_RESPONSE_BYTES):
+                            raise ResponseTooLarge("declared response size exceeds bound")
+                        if response.headers.get("content-encoding", "identity").lower() != "identity":
+                            raise ValueError("compressed provider response is not accepted")
+                        chunks = bytearray()
+                        for chunk in response.iter_bytes():  # identity only, so these are the wire bytes
+                            if len(chunks) + len(chunk) > _MAX_RESPONSE_BYTES:
+                                raise ResponseTooLarge("streamed response exceeds bound")
+                            chunks.extend(chunk)
+                            if monotonic_ns() > deadline:
+                                raise TimeoutError("deadline passed while streaming")
+                        outcome["result"] = (response.status_code, response.headers.get("x-typesafe-request-id"), bytes(chunks))
+            except BaseException as exc:  # handed to the caller; never raised in the worker
+                outcome["error"] = exc
+
+        worker = threading.Thread(target=call, name="jev-call", daemon=True)
+        worker.start()
+        worker.join(max(0.0, (deadline - monotonic_ns()) / 1e9))
+        if worker.is_alive() or monotonic_ns() > deadline:
+            raise TimeoutError("hard Jev deadline")
+        if "error" in outcome:
+            error = outcome["error"]
+            raise TimeoutError("httpx timeout") if _is_timeout(error) else error
+        return outcome["result"]
+    return transport
+
+
+http_transport = make_http_transport()
 
 
 class JevReflex:
@@ -99,7 +163,7 @@ class JevReflex:
         self.schema = compile_schema(model, horizon_candles=horizon_candles, candle_seconds=candle_seconds)
         self.schema_hash = schema_hash(self.schema)
         self.model, self.api_key, self.data_dir = model, api_key, Path(data_dir)
-        self.transport = transport or http_transport
+        self.transport = transport or http_transport  # module attribute, resolved at construction
         self.budget_ns = budget_ms * 1_000_000
         self.monotonic_ns, self.endpoint = monotonic_ns, endpoint
         self.reflex_id = f"jev:{model}:{self.schema_hash[:16]}"
@@ -127,11 +191,12 @@ class JevReflex:
         for instrument in instruments:
             for kind in _QUESTION_KINDS:
                 rubric = self.schema["rubrics"][kind]
-                prompt = (f"Schema SHA-256: {self.schema_hash}. Instrument: {instrument}. Read only this instrument's row "
-                          f"state.rows[{json.dumps(instrument)}]; do not infer or substitute values. Fields: {self.schema['fields']}. "
-                          f"Horizon: {self.schema['horizon']}. Rubric ({kind}): {rubric['instructions']}")
-                out[f"{instrument}:{kind}"] = {"type": "noul" if kind == "toxic_flow" else "choice",
-                                               "instructions": prompt, "criteria": dict(rubric["criteria"])}
+                prompt = self.schema["question_template"].format(
+                    schema_hash=self.schema_hash, instrument=instrument, instrument_json=json.dumps(instrument),
+                    fields=self.schema["fields"], horizon=self.schema["horizon"], kind=kind,
+                    instructions=rubric["instructions"])
+                out[f"{instrument}:{kind}"] = {"type": self.schema["types"][kind], "instructions": prompt,
+                                               "criteria": dict(rubric["criteria"])}
         return out
 
     def judge_batch(self, snapshots: dict) -> dict:
@@ -167,10 +232,10 @@ class JevReflex:
             status, provider_id, raw = self.transport(self.endpoint, {"Authorization": f"Bearer {self.api_key}",
                                                       "Content-Type": "application/json", "Accept-Encoding": "identity"},
                                                       body, remaining_s)
-        except TimeoutError:
-            return fail("timeout")
+        except ResponseTooLarge:
+            return fail("response_size")
         except Exception as exc:  # exception text may carry headers; keep only the category
-            return fail("transport_" + type(exc).__name__)
+            return fail("timeout" if _is_timeout(exc) else "transport_" + type(exc).__name__)
         record["status"] = status
         record["provider_request_id"] = provider_id if isinstance(provider_id, str) and len(provider_id) <= 256 else None
         if self.monotonic_ns() - started > self.budget_ns:

@@ -16,6 +16,9 @@ An explicit ``--explore-fraction`` permits tiny labeled exploration entries
 #   1. DONE (inert): `--reflex jev` uses bot/autonomous/jev_reflex.JevReflex -- one batched call per cycle, strict
 #      validation, 250 ms budget, gated on JEV_API_KEY + operator-approved <data-dir>/jev_schema.approved.json.
 #      Failures HOLD entries (REFLEX_UNAVAILABLE:<reason>); offline fallback only via --reflex-fallback offline.
+#      Transport: streamed POST in a daemon worker joined with the budget (hard wall-clock deadline), size bound
+#      enforced on Content-Length and while streaming. After the REFLEX the book age is re-checked: exits re-fetch
+#      once (EXIT_BOOK_REFETCHED / EXIT_STALE_BOOK), entries hold STALE_AFTER_REFLEX. Brier is per reflex_id.
 #      Not yet: authenticated provider evaluation, tokenizer proof, measured latency/calibration (vendor claims).
 #   2. Route paper orders through OrderAuthority/Ledger (Task 12/16) instead of this
 #      runtime's own append-only fill table, so paper and live share one accounting path.
@@ -643,14 +646,23 @@ class PaperRuntime:
         self._label_floor_us = min(pending) if pending else max(self._label_floor_us, now - horizon - step)
         return count
 
-    def brier(self, kind: str = "all") -> tuple[float | None, int]:
-        """Binary Brier of the predicted choice over the last ``brier_window`` resolved labels."""
-        where = {"all": "", "directional": "AND direction IN ('long','short')", "neutral": "AND direction='neutral'"}[kind]
-        rows = self.db.execute(f"SELECT confidence, hit FROM labels WHERE label_version='{LABEL_VERSION}' AND status='resolved' {where} "
-                               "ORDER BY labeled_us DESC LIMIT ?", (self.config.brier_window,)).fetchall()
+    def brier(self, kind: str = "all", reflex_id: str | None = None) -> tuple[float | None, int]:
+        """Binary Brier of the predicted choice over the last ``brier_window`` resolved labels of one REFLEX
+        (default: the active one), so offline and Jev judgments are never pooled."""
+        where = {"all": "", "directional": "AND l.direction IN ('long','short')", "neutral": "AND l.direction='neutral'"}[kind]
+        rows = self.db.execute(f"SELECT l.confidence, l.hit FROM labels l JOIN decisions d USING(decision_id) "
+                               f"WHERE l.label_version='{LABEL_VERSION}' AND l.status='resolved' AND d.reflex_id=? {where} "
+                               "ORDER BY l.labeled_us DESC LIMIT ?",
+                               (reflex_id or self.reflex.reflex_id, self.config.brier_window)).fetchall()
         if not rows:
             return None, 0
         return binary_brier(tuple(float(r["confidence"]) for r in rows), tuple(int(r["hit"]) for r in rows)), len(rows)
+
+    def brier_by_reflex(self) -> dict:
+        rows = self.db.execute("SELECT d.reflex_id, l.confidence, l.hit FROM labels l JOIN decisions d USING(decision_id) "
+                               f"WHERE l.label_version='{LABEL_VERSION}' AND l.status='resolved' ORDER BY l.labeled_us DESC LIMIT ?",
+                               (self.config.brier_window,)).fetchall()
+        return _brier_groups(rows)
 
     # ---------- hard risk (code only; the model never reaches this) ----------
     def risk_check(self, side: str, instrument: str, notional: Decimal, account: dict) -> tuple[str, ...]:
@@ -713,7 +725,16 @@ class PaperRuntime:
                 snap = self.snapshot(instrument, book, event_us, received_us, cutoff, account)
             except Exception:
                 continue  # the per-instrument decision records the reason
-            if snap.history >= MIN_HISTORY or account["positions"].get(instrument, Decimal(0)) > 0:
+            held = account["positions"].get(instrument, Decimal(0))
+            if held > 0:
+                try:
+                    rules = self.market_rules(instrument, cutoff)
+                except Unavailable:
+                    rules = self._rules.get(instrument)
+                bid = Decimal(str(max(p for p, _ in _levels(book.get("bids")))))
+                if rules.is_dust(held, bid) if rules else held < LOT:
+                    held = Decimal(0)  # dust is flat: it never justifies a REFLEX call
+            if snap.history >= MIN_HISTORY or held > 0:
                 snaps[instrument] = snap
         if not snaps:
             return
@@ -786,6 +807,8 @@ class PaperRuntime:
         if judgment is not None and judgment.escalation_confidence < 0.60 and not warm:  # short history is not judged
             escalate.append("LOW_CONFIDENCE")
         reasons, action = reflex_notes + list(escalate) + (["WARMUP"] if warm else []), "hold"
+        # The REFLEX call takes wall-clock time: re-check the book age with the real clock before any fill.
+        book_fresh = self.clock_us() - event_us <= self.config.max_book_age_us
         fill, exploration = None, False
         if (self.config.data_dir / "KILL").exists():
             reasons.append("KILL_SWITCH")  # armed kill file: no order path is entered at all
@@ -797,7 +820,12 @@ class PaperRuntime:
                 reasons += ["EXIT_REFUSED_MARKET_HALT", exit_reason]
             elif blocked := self.risk_check("sell", instrument, Decimal(0), account):
                 reasons += blocked
+            elif not book_fresh and (bids := self._refetch_bids(instrument)) is None:
+                reasons += ["EXIT_STALE_BOOK", exit_reason]
             else:
+                if not book_fresh:
+                    reasons.append("EXIT_BOOK_REFETCHED")
+                    bid = Decimal(str(max(p for p, _ in bids)))
                 raw_limit = bid * (1 - self.config.max_slippage_bps / Decimal(10_000))
                 limit = rules.round_limit(raw_limit, "sell") if rules else raw_limit
                 qty = rules.floor_qty(held) if rules else MarketRules._step(held, LOT, ROUND_FLOOR)
@@ -811,6 +839,8 @@ class PaperRuntime:
             pass  # escalation, warmup and a REFLEX outage block entries only
         elif entry_block:
             reasons.append(entry_block)
+        elif not book_fresh:
+            reasons.append("STALE_AFTER_REFLEX")
         elif not gate:
             reasons.append("ENTRY_GATE_REFUSED")
         else:
@@ -852,6 +882,18 @@ class PaperRuntime:
         return {"status": "warmup" if warm and action == "hold" else action, "reasons": reasons, "decision_id": decision_id,
                 "judgment": _judgment_dict(judgment) if judgment else None, "history": snap.history,
                 "gate_open": gate and not warm, "snapshot": json.loads(snap.wire()), "token_estimate": snap.token_estimate()}
+
+    def _refetch_bids(self, instrument: str):
+        """One fresh public book for an exit whose decision book aged during the REFLEX call; None if still stale."""
+        try:
+            book, event_us, _ = self.observe(instrument)
+            now = self.clock_us()
+            bids = _levels(book.get("bids"))
+            if not bids or event_us > now or now - event_us > self.config.max_book_age_us:
+                return None
+            return bids
+        except Exception:
+            return None
 
     def _entry_notional(self, instrument, judgment: Judgment, account, rules: MarketRules) -> tuple[Decimal, bool, list[str]]:
         """Quarter-Kelly notional capped (never refused) by position room and cash; explore only while unsupported."""
@@ -902,6 +944,7 @@ class PaperRuntime:
                   "day_open_usd": mark["day_open_usd"], "positions": {k: str(v) for k, v in self.positions().items()},
                   "latches": sorted(self.latched()), "brier": brier, "brier_window_labels": resolved,
                   "brier_directional": self.brier("directional")[0], "brier_neutral": self.brier("neutral")[0],
+                  "brier_by_reflex": self.brier_by_reflex(),
                   "resolved_labels": self.db.execute("SELECT COUNT(*) FROM labels WHERE label_version=? AND status='resolved'", (LABEL_VERSION,)).fetchone()[0],  # index-only
                   "unresolvable_labels": self.db.execute("SELECT COUNT(*) FROM labels WHERE label_version=? AND status='unresolvable'", (LABEL_VERSION,)).fetchone()[0],
                   "labeled_this_cycle": labeled,
@@ -957,7 +1000,8 @@ def nightly_review(db_path: Path, out_dir: Path, *, now_us: int | None = None, b
         decisions = [dict(r) for r in db.execute("SELECT * FROM decisions WHERE created_us>=? AND created_us<? ORDER BY created_us",
                                                  window)]
         # Legacy mid-based labels (no label_version) are never mixed into executable metrics.
-        labels = [dict(r) for r in db.execute("SELECT * FROM labels WHERE label_version=? AND labeled_us>=? AND labeled_us<?",
+        labels = [dict(r) for r in db.execute("SELECT l.*, d.reflex_id FROM labels l LEFT JOIN decisions d USING(decision_id) "
+                                              "WHERE l.label_version=? AND l.labeled_us>=? AND l.labeled_us<?",
                                               (LABEL_VERSION, *window))]
         escalations = db.execute("SELECT code, COUNT(*) n FROM escalations WHERE created_us>=? AND created_us<? GROUP BY code",
                                  window).fetchall()
@@ -988,6 +1032,7 @@ def nightly_review(db_path: Path, out_dir: Path, *, now_us: int | None = None, b
                "resolved_labels": len(resolved), "unresolvable_labels": len(labels) - len(resolved),
                "brier": score(resolved), "brier_directional": score(directional),
                "brier_neutral": score([l for l in resolved if l["direction"] == "neutral"]), "buckets": buckets,
+               "brier_by_reflex": _brier_groups(resolved),
                "escalations": {r["code"]: r["n"] for r in escalations}}
     archive_hash = content_hash(json.dumps(metrics, sort_keys=True, default=str))
     proposal = (brain or DeterministicBrain()).review(job_id="nightly-" + day, archive_hash=archive_hash, metrics=metrics)
@@ -1005,6 +1050,13 @@ def nightly_review(db_path: Path, out_dir: Path, *, now_us: int | None = None, b
               "consider tightening the direction rubric or the 0.80 entry gate." for b in overconfident] or ["- No bucket shows supported overconfidence."]
     (out_dir / f"schema-proposal-{day}.md").write_text("\n".join(lines) + "\n")
     return report
+
+
+def _brier_groups(rows) -> dict:
+    groups: dict[str, list] = {}
+    for r in rows:
+        groups.setdefault(r["reflex_id"] or "unknown", []).append((float(r["confidence"]), int(r["hit"])))
+    return {rid: {"brier": binary_brier(tuple(p for p, _ in v), tuple(y for _, y in v)), "n": len(v)} for rid, v in sorted(groups.items())}
 
 
 def _judgment_dict(j: Judgment) -> dict:

@@ -254,6 +254,227 @@ class JevRuntimeTests(RuntimeCase):
         self.assertEqual({"REFLEX_UNAVAILABLE:no_api_key"}, {r["reasons"][0] for r in status["instruments"].values()})
 
 
+class HttpTransportTests(unittest.TestCase):
+    """Real httpx streaming through MockTransport and a local slow server: the deadline and size bound are wall-clock."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = Path(self.tmp.name)
+
+    def reflex_over(self, handler=None, *, url=None, budget_ms=250):
+        import httpx
+        from bot.autonomous.jev_reflex import make_http_transport
+        transport = make_http_transport(httpx.MockTransport(handler) if handler else None)
+        kw = {"endpoint": url} if url else {}
+        reflex = JevReflex(data_dir=self.dir, api_key="test-key", transport=transport, budget_ms=budget_ms, **kw)
+        (self.dir / APPROVED_SCHEMA_FILE).write_text(json.dumps(reflex.schema))
+        return reflex
+
+    def judge(self, reflex):
+        import time
+        started = time.monotonic()
+        out = reflex.judge_batch({"BTC-USD": snapshot("BTC-USD")})
+        return out, time.monotonic() - started
+
+    @staticmethod
+    def ok_body(request):
+        return json.dumps(echo()(json.loads(request.content))).encode()
+
+    def test_valid_streamed_response(self):
+        import httpx
+        out, _ = self.judge(self.reflex_over(lambda request: httpx.Response(200, content=self.ok_body(request))))
+        self.assertEqual("trending", out["BTC-USD"].regime.value)
+
+    def test_slow_trickle_hits_the_hard_deadline(self):
+        import httpx, time
+        def handler(request):
+            body = self.ok_body(request)
+            def trickle():
+                for k in range(0, len(body), 64):
+                    time.sleep(0.05)  # each chunk is fast; the total is not
+                    yield body[k:k + 64]
+            return httpx.Response(200, content=trickle())
+        out, elapsed = self.judge(self.reflex_over(handler))
+        self.assertEqual({"timeout"}, set(out.values()))
+        self.assertLess(elapsed, 0.6)
+
+    def test_stall_before_response_is_bounded_by_the_worker_join(self):
+        import httpx, time
+        def handler(request):
+            time.sleep(1.5)  # e.g. DNS or connect stall, not covered by per-phase timeouts
+            return httpx.Response(200, content=self.ok_body(request))
+        out, elapsed = self.judge(self.reflex_over(handler))
+        self.assertEqual({"timeout"}, set(out.values()))
+        self.assertLess(elapsed, 0.5)
+
+    def test_oversized_content_length_is_rejected_up_front(self):
+        import httpx
+        from bot.autonomous.jev_client import _MAX_RESPONSE_BYTES
+        read = []
+        def handler(request):
+            def stream():
+                read.append(1)
+                yield b"{}"
+            return httpx.Response(200, headers={"Content-Length": str(_MAX_RESPONSE_BYTES + 1)}, content=stream())
+        out, _ = self.judge(self.reflex_over(handler))
+        self.assertEqual({"response_size"}, set(out.values()))
+        self.assertEqual([], read)
+
+    def test_streamed_body_is_cut_at_the_size_bound(self):
+        import httpx
+        from bot.autonomous.jev_client import _MAX_RESPONSE_BYTES
+        sent = []
+        def handler(request):
+            def flood():
+                for _ in range(_MAX_RESPONSE_BYTES // 4096 + 50):
+                    sent.append(4096)
+                    yield b"x" * 4096
+            return httpx.Response(200, content=flood())
+        out, _ = self.judge(self.reflex_over(handler, budget_ms=1000))
+        self.assertEqual({"response_size"}, set(out.values()))
+        self.assertLess(sum(sent), _MAX_RESPONSE_BYTES + 3 * 4096)
+
+    def test_local_slow_server_is_bounded(self):
+        import threading, time
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        class Slow(BaseHTTPRequestHandler):
+            def do_POST(self):
+                self.rfile.read(int(self.headers["Content-Length"]))
+                self.send_response(200)
+                self.end_headers()
+                for _ in range(20):
+                    try:
+                        self.wfile.write(b" ")
+                        self.wfile.flush()
+                    except OSError:
+                        return
+                    time.sleep(0.05)
+            def log_message(self, *args):
+                pass
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Slow)
+        server.daemon_threads = True
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        out, elapsed = self.judge(self.reflex_over(url=f"http://127.0.0.1:{server.server_port}/v1/systemone"))
+        self.assertEqual({"timeout"}, set(out.values()))
+        self.assertLess(elapsed, 0.6)
+
+    def test_httpx_timeout_exception_maps_to_timeout(self):
+        import httpx
+        def handler(request):
+            raise httpx.ReadTimeout("slow", request=request)
+        out, _ = self.judge(self.reflex_over(handler))
+        self.assertEqual({"timeout"}, set(out.values()))
+
+
+class TemplateBindingTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = Path(self.tmp.name)
+
+    def test_approved_hash_covers_template_and_type_mapping(self):
+        reflex = JevReflex(data_dir=self.dir, api_key="k", transport=lambda *a: (200, None, b""))
+        for path, value in ((("types", "toxic_flow"), "choice"), (("question_template",), "Answer freely: {kind}")):
+            with self.subTest(path):
+                tampered = json.loads(json.dumps(reflex.schema))
+                target = tampered
+                for key in path[:-1]:
+                    target = target[key]
+                target[path[-1]] = value
+                (self.dir / APPROVED_SCHEMA_FILE).write_text(json.dumps(tampered))
+                self.assertEqual("schema_hash_mismatch", reflex.gate())
+
+    def test_every_sent_question_is_rendered_from_the_schema(self):
+        reflex = JevReflex(data_dir=self.dir, api_key="k", transport=lambda *a: (200, None, b""))
+        questions = reflex.questions(("BTC-USD",))
+        for kind in ("regime", "direction", "setup_quality", "risk_state", "toxic_flow"):
+            q = questions[f"BTC-USD:{kind}"]
+            self.assertEqual(reflex.schema["types"][kind], q["type"])
+            self.assertEqual(reflex.schema["question_template"].format(
+                schema_hash=reflex.schema_hash, instrument="BTC-USD", instrument_json=json.dumps("BTC-USD"),
+                fields=reflex.schema["fields"], horizon=reflex.schema["horizon"], kind=kind,
+                instructions=reflex.schema["rubrics"][kind]["instructions"]), q["instructions"])
+            self.assertEqual(reflex.schema["rubrics"][kind]["criteria"], q["criteria"])
+
+
+class Slow:
+    """Non-batch reflex that takes ``seconds`` of the injected clock to answer."""
+    reflex_id = "fixed-test"
+
+    def __init__(self, clock, judgment, seconds):
+        self.clock, self.judgment, self.seconds = clock, judgment, seconds
+
+    def judge(self, snapshot):
+        self.clock.us += int(self.seconds * 1_000_000)
+        return self.judgment
+
+
+class PostReflexFreshnessTests(RuntimeCase):
+    def test_entry_holds_when_the_book_aged_during_the_reflex(self):
+        from bot.autonomous.runtime import AdvisoryRisk as _A  # noqa: F401
+        from tests.autonomous.test_runtime import GOOD
+        rt = self.runtime(GOOD, explore_fraction=0.001)
+        self.advance(rt, 20)
+        rt.reflex = Slow(self.clock, GOOD, 11)
+        result = self.advance(rt, 1)["instruments"]["AAVE-USD"]
+        self.assertIn("STALE_AFTER_REFLEX", result["reasons"])
+        self.assertEqual(0, rt.db.execute("SELECT COUNT(*) FROM fills").fetchone()[0])
+
+    def test_exit_refetches_a_stale_book_once(self):
+        from dataclasses import replace
+        from tests.autonomous.test_runtime import GOOD
+        rt = self.runtime(GOOD, explore_fraction=0.001)
+        self.assertEqual("buy", self.advance(rt, 21)["instruments"]["AAVE-USD"]["status"])
+        rt.reflex = Slow(self.clock, replace(GOOD, risk_state=AdvisoryRisk.REDUCE), 11)
+        calls = rt.book_source.calls
+        result = self.advance(rt, 1)["instruments"]["AAVE-USD"]
+        self.assertEqual("sell", result["status"], result["reasons"])
+        self.assertIn("EXIT_BOOK_REFETCHED", result["reasons"])
+        self.assertEqual(calls + 2, rt.book_source.calls)
+
+    def test_exit_holds_when_the_refetched_book_is_also_stale(self):
+        from dataclasses import replace
+        from tests.autonomous.test_runtime import GOOD
+        rt = self.runtime(GOOD, explore_fraction=0.001)
+        self.assertEqual("buy", self.advance(rt, 21)["instruments"]["AAVE-USD"]["status"])
+        rt.reflex = Slow(self.clock, replace(GOOD, risk_state=AdvisoryRisk.REDUCE), 11)
+        original, n = rt.book_source, {"calls": 0}
+        def source(product):
+            from tests.autonomous.test_runtime import stamp
+            n["calls"] += 1
+            book = original(product)
+            if n["calls"] == 2:  # the post-reflex re-fetch is stale too
+                book["exchange_time"] = stamp(self.clock.us - 20_000_000)
+            return book
+        rt.book_source = source
+        self.clock.us += 60_000_000
+        result = rt.cycle()["instruments"]["AAVE-USD"]
+        self.assertEqual("hold", result["status"])
+        self.assertIn("EXIT_STALE_BOOK", result["reasons"])
+
+
+class BatchMembershipTests(RuntimeCase):
+    def test_dust_only_instruments_are_not_sent_to_jev(self):
+        rt = JevRuntimeTests.jev_runtime(self)
+        rt.db.execute("INSERT INTO fills VALUES ('dust','d','AAVE-USD','buy','0.001','100','0.1','0',0,0)")
+        self.advance(rt, 5)
+        self.assertEqual([], self.transport.calls)
+
+    def test_status_and_nightly_group_brier_by_reflex(self):
+        from tests.autonomous.test_runtime import GOOD
+        rt = self.runtime(GOOD, horizon_candles=3)
+        self.advance(rt, 25)
+        status = json.loads((self.dir / "status.json").read_text())
+        self.assertIn("fixed-test", status["brier_by_reflex"])
+        self.assertEqual(status["brier"], status["brier_by_reflex"]["fixed-test"]["brier"])
+        from bot.autonomous.runtime import _day, nightly_review
+        report = nightly_review(self.dir / "runtime.sqlite3", self.dir / "reviews", now_us=self.clock.us, day=_day(self.clock.us))
+        self.assertIn("fixed-test", report["metrics"]["brier_by_reflex"])
+
+
 def START_PLUS(n):
     from tests.autonomous.test_runtime import START_US
     return START_US + 1_000_000 + n * 60_000_000
