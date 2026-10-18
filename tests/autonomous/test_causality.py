@@ -456,6 +456,18 @@ class CausalityTests(unittest.TestCase):
         self.assertFalse(self.engine.ingest(b).accepted)
         self.assertEqual((a,),self.engine.select(CausalCutoffs(100,100,0,'boot')))
 
+    def test_executable_book_comes_only_from_live_committed_stream(self):
+        from bot.autonomous.contracts import ExecutableBook
+        self.assertIsNone(self.engine.executable_book('venue','book','BTC-USD','paper'))
+        self.assertTrue(self.engine.ingest(event()).accepted)
+        book=self.engine.executable_book('venue','book','BTC-USD','paper')
+        self.assertIsInstance(book,ExecutableBook)
+        self.assertEqual(('paper','BTC-USD',90),(book.venue,book.instrument,book.observed_at_us))
+        self.assertEqual(content_hash(('executable-book-v1','s',1)),book.lineage_hash)
+        # A sequence gap makes the stream unhealthy: no book until a fresh snapshot.
+        self.assertFalse(self.engine.ingest(event('gap',3,payload=BookPayload((),(),False))).accepted)
+        self.assertIsNone(self.engine.executable_book('venue','book','BTC-USD','paper'))
+
     def test_engine_caches_are_bounded(self):
         cache=self.s._BoundedCache(3)
         for i in range(5):cache[i]=i

@@ -165,6 +165,13 @@ class JevContractTests(StateEncodingHelpers, unittest.TestCase):
         posted = json.loads(calls[0].content)
         self.assertEqual(len(posted["questions"]), 25)
         self.assertEqual(result.provider_status_code, 503)
+        from types import SimpleNamespace
+        from bot.autonomous.worker import PaperWorker
+        worker = PaperWorker(SimpleNamespace(venue=SimpleNamespace(venue="paper")))
+        held = worker.apply_jev_batch(result)
+        self.assertEqual(held["status"], "jev_hold")
+        self.assertFalse(held["dispatched"])
+        self.assertEqual(worker.considered, 0)
 
     def test_unmapped_schema_or_ineligible_candidate_fails_closed(self):
         class MissingResolver:
@@ -209,6 +216,15 @@ class JevContractTests(StateEncodingHelpers, unittest.TestCase):
         self.assertEqual(result.call_latency_ns, result.received_mono_ns - result.request_started_mono_ns)
         self.assertLessEqual(result.deadline_mono_ns, min(request.deadline_mono_ns,
                              state.snapshots[0].cutoffs.inference_deadline_mono_ns))
+        from types import SimpleNamespace
+        from bot.autonomous.worker import PaperWorker
+        worker = PaperWorker(SimpleNamespace(venue=SimpleNamespace(venue="paper")))
+        held = worker.apply_jev_batch(result)
+        self.assertLess(decision.risk_confidence, 0.60)
+        self.assertEqual(held["status"], "escalated")
+        self.assertEqual(held["gated"][0]["reason"], "PAUSE_CANDIDATE_AND_REVIEW")
+        self.assertFalse(held["dispatched"])
+        self.assertEqual(worker.considered, 0)
 
     def test_malformed_model_and_integer_json_numbers_fail_closed_or_normalize(self):
         state, bundle = self.state_and_bundle()

@@ -2,6 +2,8 @@
 
 Prepared October 17, 2026 from a read-only working-tree assessment, except for this document. Source references describe a moving, concurrently edited tree. No tests, services, authenticated provider calls, or deployment were run for this assessment. Presence of a module or test is not acceptance evidence.
 
+Subsequent implementation: commit `1fd3625` adds an injected, capability-bound managed IOC transport and a guard against managed legacy market orders. It deliberately has no production capability verifier or live wiring. `bot/autonomous/control.py` now provides an authenticated local protocol and ledger-backed status/kill path; integration and remaining command handlers still require validation. These additions supersede the module-absence observations below, without declaring Tasks 13 or 14 complete. Current checkpoint evidence belongs in `docs/checkpoints/2026-10-17-resumed-paper-authority.md`.
+
 ## Controlling scope
 
 The original prompt is `/home/reckless/.codex/attachments/3cabcece-5c39-4ee7-858d-7f5c81275c03/pasted-text-1.txt`. It requests a 24/7 autonomous agent with deep BRAIN research/review, Jev REFLEX judgments, causal numeric state below 400 provider tokens, deterministic sizing/risk/execution, primary-source candidate research, and governed overnight improvement. It does not itself describe a browser product, multiexchange charting, a manual order ticket, or a legacy strategy backtester.

@@ -126,18 +126,19 @@ class LedgerTests(unittest.TestCase):
         return now
 
 
-    def ready(self):
+    def ready(self, high_water='1'):
         now = self.seed(valid=True)
         from bot.autonomous.contracts import MarketRules
         c = self.ledger.connection
         c.execute("INSERT INTO candidate_results(decision_id,candidate_id,status,veto_codes_json,recorded_at_us) VALUES ('decision-test',1,'eligible','[]',?)", (now,))
-        c.execute("INSERT INTO equity_marks(mark_id,account_id,lineage_hash,equity_usd_u,units,nav,high_water_nav,day_open_nav,drawdown,daily_loss,valuation_version,marked_at_us,recorded_at_us) VALUES ('mark','paper-test',?,10000000000,'10000','1','1','1','0','0',0,?,?)", (HASH_A, now, now))
+        c.execute("INSERT INTO equity_marks(mark_id,account_id,lineage_hash,equity_usd_u,units,nav,high_water_nav,day_open_nav,drawdown,daily_loss,valuation_version,marked_at_us,recorded_at_us) VALUES ('mark','paper-test',?,10000000000,'10000','1',?,'1','0','0',0,?,?)", (HASH_A, high_water, now, now))
         c.execute("INSERT INTO balance_positions(account_id,asset,native_qty,cost_basis_usd_u,journal_sequence,version) VALUES ('paper-test','USD','10000',10000000000,0,0)")
-        c.execute("UPDATE account_control SET permit='entry',permit_epoch=1,lease_boot_id='test-boot',lease_deadline_mono_ns=?,active_release_hash=?,reconcile_id='reconcile',version=version+1", (time.monotonic_ns() + 100_000_000_000, RELEASE_HASH))
+        lease = time.monotonic_ns() + 100_000_000_000
+        c.execute("UPDATE account_control SET permit='entry',permit_epoch=1,lease_boot_id='test-boot',lease_deadline_mono_ns=?,active_release_hash=?,reconcile_id='reconcile',version=version+1", (lease, RELEASE_HASH))
         c.execute("UPDATE account_readiness SET ready=1,private_heartbeat_us=?,version=version+1 WHERE account_id='paper-test'", (now,))
         from bot.autonomous.contracts import ExactRatio, ExactNavEvidence
         exact=ExactNavEvidence('paper-test','mark',self.ledger._revision('paper-test'),0,10000000000,
-            ExactRatio('10000','1'),ExactRatio('1','1'),ExactRatio('1','1'),ExactRatio('1','1'),HASH_A)
+            ExactRatio('10000','1'),ExactRatio('1','1'),ExactRatio(*{'1':('1','1'),'1.2':('6','5')}[high_water]),ExactRatio('1','1'),HASH_A)
         fixture_observation={'heartbeat_at_us':now}
         c.execute("INSERT INTO accounting_evidence VALUES ('fixture-mark','paper-test','mark','local-paper',?,?,?,?,?,?)",
             (canonical_bytes(fixture_observation).decode(),content_hash(fixture_observation),now,now,now,now))
@@ -145,9 +146,10 @@ class LedgerTests(unittest.TestCase):
         limits = RiskLimits(armed=True,candidate_eligible=True,tokenizer_config_hash=HASH_A,calibration_config_hash=HASH_A)
         market = MarketRules('paper','AAVE-USD','AAVE','USD',Decimal('0.01'),Decimal('0.01'),Decimal('0.01'),Decimal('1'),Decimal('0.01'),2,HASH_A,now+100_000_000,True,True,now,10_000_000_000)
         self.ledger.configure_risk_checks(limits=limits, market=lambda _: market,
-            assess=lambda p,a,c,l,m,n: RiskVerdict(True,(),a.revision,content_hash(p)), boot_id='test-boot')
+            assess=lambda p,a,c,l,m,n,**kw: RiskVerdict(True,(),a.revision,content_hash(p)), boot_id='test-boot')
         p=order_proposal()
-        return dataclasses.replace(p, release_hash=RELEASE_HASH, decision=dataclasses.replace(p.decision,release_hash=RELEASE_HASH),control_epoch=1,deadline_mono_ns=time.monotonic_ns()+100_000_000_000)
+        # The proposal deadline must sit inside the control lease.
+        return dataclasses.replace(p, release_hash=RELEASE_HASH, decision=dataclasses.replace(p.decision,release_hash=RELEASE_HASH),control_epoch=1,deadline_mono_ns=lease-1_000_000_000)
 
     def reserve(self, p=None):
         p = self.ready() if p is None else p
@@ -299,7 +301,7 @@ class LedgerTests(unittest.TestCase):
         p=self.ready()
         limits,market,_,boot=self.ledger._risk_config
         self.ledger.configure_risk_checks(limits=limits,market=market,boot_id=boot,
-            assess=lambda p,a,c,l,m,n:RiskVerdict(True,(),a.revision,HASH_B))
+            assess=lambda p,a,c,l,m,n,**kw:RiskVerdict(True,(),a.revision,HASH_B))
         with self.assertRaises(ContractViolation):
             self.reserve(p)
 
@@ -345,7 +347,7 @@ class LedgerTests(unittest.TestCase):
         p=self.ready()
         limits,market,_,boot=self.ledger._risk_config
         observed=[]
-        def assessor(proposal,account,control,limits,market,now):
+        def assessor(proposal,account,control,limits,market,now,**kw):
             observed.append(len(account.reservations))
             return RiskVerdict(True,(),account.revision,content_hash(proposal))
         self.ledger.configure_risk_checks(limits=limits,market=market,boot_id=boot,assess=assessor)
@@ -623,6 +625,124 @@ class LedgerTests(unittest.TestCase):
         self.assertEqual(0,self.ledger.connection.execute('SELECT count(*) FROM review_sessions').fetchone()[0])
 
 
+class RiskAuthorityTests(unittest.TestCase):
+    """Task 11: the deterministic risk layer wired through durable reservation."""
+    setUp, tearDown = LedgerTests.setUp, LedgerTests.tearDown
+    seed, ready, reserve = LedgerTests.seed, LedgerTests.ready, LedgerTests.reserve
+
+    def next_decision(self, p, k):
+        """Fresh authority-issued decision for candle +k (same fixture rows)."""
+        c = self.ledger.connection
+        snap = content_hash(('snap', k))
+        c.execute("INSERT INTO snapshots SELECT ?,account_id,release_hash,candle_close_us+?,knowledge_cutoff_us+?,field_hash,state_json,tokenizer_hash,token_count,lineage_hash,account_revision,valid,invalid_reason,recorded_at_us FROM snapshots WHERE snapshot_id=?", (snap, k, k, HASH_B))
+        c.execute("INSERT INTO decisions SELECT ?,?,?,deadline_us,model_id,response_json,response_hash,status,reason,received_at_us,recorded_at_us FROM decisions WHERE decision_id='decision-test'", (f'decision-{k}', snap, f'request-{k}'))
+        c.execute("INSERT INTO candidate_results VALUES (?,1,'eligible',NULL,'[]',?)", (f'decision-{k}', time.time_ns()//1000))
+        return dataclasses.replace(p, action_id=f'action-{k}', candle_close_us=p.candle_close_us+k,
+            decision=dataclasses.replace(p.decision, decision_id=f'decision-{k}', request_id=f'request-{k}', snapshot_hash=snap))
+
+    def wire_real_risk(self):
+        from bot.autonomous import risk
+        limits, market, _, boot = self.ledger._risk_config
+        self.ledger.configure_risk_checks(limits=limits, market=market, assess=risk.assess, boot_id=boot)
+
+    def test_real_risk_assess_admits_valid_entry_through_reservation(self):
+        p = self.ready()
+        self.wire_real_risk()
+        self.assertEqual(IntentState.RESERVED, self.reserve(p).state)
+
+    def test_concurrent_entries_admit_only_residual_loss_capacity(self):
+        p = dataclasses.replace(self.ready(), loss_budget_usd_u=25_000_000)
+        self.wire_real_risk()
+        self.reserve(p)
+        for k in range(1, 4):
+            self.reserve(self.next_decision(p, k))
+        # Four $25 budgets fill the 1% pending-loss room on $10,000; the fifth is refused.
+        with self.assertRaisesRegex(ContractViolation, 'modeled loss capacity'):
+            self.reserve(self.next_decision(p, 4))
+        self.assertEqual(4, self.ledger.connection.execute('SELECT count(*) FROM reservations').fetchone()[0])
+
+    def test_concurrent_entries_admit_only_residual_asset_capacity(self):
+        p = dataclasses.replace(self.ready(), base_quantity=Decimal('3'), max_fee_usd_u=3_000_000)
+        self.wire_real_risk()
+        self.reserve(p)
+        with self.assertRaisesRegex(ContractViolation, 'position/gross capacity'):
+            self.reserve(self.next_decision(p, 1))
+        self.assertEqual(1, self.ledger.connection.execute('SELECT count(*) FROM reservations').fetchone()[0])
+
+    def test_ledger_gross_backstop_counts_existing_other_asset_holdings(self):
+        from unittest.mock import patch
+        from bot.autonomous.contracts import Holding
+        p = self.ready()  # Deliberately keeps the permissive assessor fixture.
+        account = self.ledger.account_view(p.account_id)
+        held = Holding("ETH-USD", "ETH", Decimal("1"), 1_950_000_000,
+            1_950_000_000, account.marked_at_us, HASH_A)
+        current = dataclasses.replace(account, holdings=(held,))
+        with patch.object(self.ledger, "_account_view", return_value=current):
+            with self.assertRaisesRegex(ContractViolation, "position/gross capacity"):
+                self.reserve(p)
+        self.assertEqual(0, self.ledger.connection.execute('SELECT count(*) FROM reservations').fetchone()[0])
+
+    def test_stale_account_revision_refuses_reservation(self):
+        p = self.ready()
+        g = self.ledger.connection.execute("SELECT generation FROM accounts").fetchone()[0]
+        with self.assertRaisesRegex(ContractViolation, 'stale account revision'):
+            self.ledger.reserve_intent(p, AccountRevision(99, 99), g, p.decision)
+
+    def test_breach_found_at_reservation_persists_latch_without_model(self):
+        p = self.ready(high_water='1.2')  # NAV 1 <= 0.85 * 1.2: drawdown boundary crossed.
+        self.wire_real_risk()
+        with self.assertRaises(ContractViolation):
+            self.reserve(p)
+        row = self.ledger.connection.execute('SELECT drawdown_latched FROM account_control').fetchone()
+        self.assertEqual(1, row[0])
+        self.assertEqual(1, self.ledger.connection.execute("SELECT count(*) FROM control_events WHERE kind='risk_halt'").fetchone()[0])
+        self.assertEqual(0, self.ledger.connection.execute('SELECT count(*) FROM reservations').fetchone()[0])
+
+    def test_assessor_alone_refuses_when_ledger_checks_pass(self):
+        p = self.ready()
+        limits, market, _, boot = self.ledger._risk_config
+        self.ledger.configure_risk_checks(limits=limits, market=market, boot_id=boot,
+            assess=lambda proposal, account, control, limits, market, now, **kw: RiskVerdict(False, ('ASSESSOR_ONLY',), account.revision, content_hash(proposal)))
+        with self.assertRaisesRegex(ContractViolation, 'current risk recheck refused'):
+            self.reserve(p)
+        self.assertEqual(0, self.ledger.connection.execute('SELECT count(*) FROM reservations').fetchone()[0])
+
+    def test_hard_kill_blocks_new_reserve_and_dispatch_of_a_reserved_intent(self):
+        p = self.ready()
+        prepared = self.reserve(p)
+        generation = self.ledger.connection.execute('SELECT generation FROM accounts').fetchone()[0]
+        self.ledger.connection.execute("UPDATE account_control SET hard_killed=1 WHERE account_id='paper-test'")
+        self.ledger.connection.commit()
+        with self.assertRaisesRegex(ContractViolation, 'disabled/stale control'):
+            self.ledger.mark_dispatching(prepared.intent_id, generation)
+        self.assertEqual('reserved', self.ledger.connection.execute('SELECT state FROM order_intents').fetchone()[0])
+        with self.assertRaisesRegex(ContractViolation, 'disabled/stale control'):
+            self.reserve(self.next_decision(p, 1))
+        self.assertEqual(1, self.ledger.connection.execute('SELECT count(*) FROM reservations').fetchone()[0])
+
+    def test_operator_kill_rejects_reserved_intent_and_releases_cash(self):
+        p = self.ready()
+        prepared = self.reserve(p)
+        self.assertTrue(self.ledger.latch_operator_kill(p.account_id))
+        self.assertEqual('rejected', self.ledger.connection.execute('SELECT state FROM order_intents').fetchone()[0])
+        self.assertEqual(0, self.ledger.connection.execute('SELECT cash_usd_u FROM reservations').fetchone()[0])
+        self.assertEqual((), self.ledger.account_view(p.account_id).reservations)
+        generation = self.ledger.connection.execute('SELECT generation FROM accounts').fetchone()[0]
+        with self.assertRaisesRegex(ContractViolation, 'disabled/stale control'):
+            self.ledger.mark_dispatching(prepared.intent_id, generation)
+
+    def test_drawdown_latch_rejects_a_reserved_buy_and_releases_cash(self):
+        from fractions import Fraction
+        p = self.ready()
+        self.reserve(p)
+        with self.ledger.transaction():
+            self.ledger._latch_losses(p.account_id, 'mark', Fraction(1), Fraction('6/5'), Fraction(1))
+        self.assertEqual((1, 0), tuple(self.ledger.connection.execute(
+            'SELECT drawdown_latched, daily_halted FROM account_control').fetchone()))
+        self.assertEqual('rejected', self.ledger.connection.execute('SELECT state FROM order_intents').fetchone()[0])
+        self.assertEqual(0, self.ledger.connection.execute('SELECT cash_usd_u FROM reservations').fetchone()[0])
+
+
 class AccountingTests(unittest.TestCase):
     """All observations below are local paper fixtures, not venue attestations."""
     def setUp(self):
@@ -676,7 +796,7 @@ class AccountingTests(unittest.TestCase):
         def market(_):
             return MarketRules('paper','AAVE-USD','AAVE','USD',Decimal('.01'),Decimal('.01'),Decimal('.01'),Decimal('1'),Decimal('.01'),2,HASH_A,self.now+100000000,True,True,self.now,10000000000)
         self.ledger.configure_risk_checks(limits=limits,market=market,
-            assess=lambda p,a,c,l,m,n:RiskVerdict(True,(),a.revision,content_hash(p)),
+            assess=lambda p,a,c,l,m,n,**kw:RiskVerdict(True,(),a.revision,content_hash(p)),
             boot_id='test-boot',monotonic_ns=lambda:1)
         p=order_proposal()
         return dataclasses.replace(p,release_hash=RELEASE_HASH,
@@ -765,6 +885,28 @@ class AccountingTests(unittest.TestCase):
                 self.now+=200000
                 mark=self.ledger.record_mark(evidence)
                 self.assertEqual(0,self.ledger.connection.execute('SELECT ready FROM exact_marks WHERE mark_id=?',(mark,)).fetchone()[0])
+
+    def test_ledger_written_loss_mark_halts_the_candle(self):
+        from types import SimpleNamespace
+        from fractions import Fraction
+        from bot.autonomous.worker import PaperWorker
+        self.initialize()
+        self.assertTrue(self.flow('loss', 1000000, 1500150000))
+        self.mark('worker-loss')
+        view = self.ledger.account_view('paper-test')
+        self.assertEqual(Fraction(85), view.exact_nav.nav.fraction())
+        worker = PaperWorker(SimpleNamespace(venue=SimpleNamespace(venue="paper")))
+        worker.attach_equity(self.ledger.connection, 'paper-test')
+
+        def consider(_cycle):
+            raise AssertionError('a ledger loss mark must halt before consider')
+
+        result = worker.on_close(4_000, consider)
+        self.assertEqual(result['status'], 'halted')
+        self.assertFalse(result['dispatched'])
+        self.assertEqual(worker.considered, 0)
+        self.assertEqual(1, self.ledger.connection.execute(
+            'SELECT drawdown_latched FROM account_control').fetchone()[0])
 
     def test_delayed_closed_redeposit_preserves_exact_loss_history_and_requires_new_mark(self):
         from fractions import Fraction
@@ -938,6 +1080,243 @@ class AccountingTests(unittest.TestCase):
         self.assertEqual(Decimal(50),self.ledger.account_view('paper-test').units)
         self.ledger.close();self.ledger=load_ledger().open(self.path)
         self.assertEqual((1,1,1),tuple(self.ledger.connection.execute('SELECT drawdown_latched,crisis_halted,hard_killed FROM account_control').fetchone()))
+
+    def test_filled_parent_allocates_one_reduction_while_drawdown_is_latched(self):
+        from bot.autonomous.contracts import MarketRules, Side
+        from bot.autonomous.risk import assess as real_assess
+        self.initialize()
+        self.intent('parent', quantity='1', price='100')
+        self.fill('parent-fill', 'parent', '1', '100', 'USD', '0')
+        self.ledger.connection.execute("UPDATE order_intents SET state='filled' WHERE intent_id='parent'")
+        self.ledger.connection.commit()
+        self.mark('held', books={'AAVE': {'at_us': self.now, 'quote_asset': 'USD', 'bids': [['100', '1']]}})
+        with self.ledger.transaction() as c:
+            c.execute("UPDATE account_control SET permit='entry',permit_epoch=1,lease_boot_id='test-boot',lease_deadline_mono_ns=100000000000,active_release_hash=?,version=version+1", (RELEASE_HASH,))
+        limits = RiskLimits(armed=True, candidate_eligible=True, tokenizer_config_hash=HASH_A, calibration_config_hash=HASH_A)
+        rules = MarketRules('paper', 'AAVE-USD', 'AAVE', 'USD', Decimal('.01'), Decimal('.01'), Decimal('.01'), Decimal('1'), Decimal('.01'), 2, HASH_A, self.now + 100_000_000, True, True, self.now, 10_000_000_000)
+        self.ledger.configure_risk_checks(limits=limits, market=lambda _: rules, assess=real_assess, boot_id='test-boot', monotonic_ns=lambda: 1)
+        self.ledger.connection.execute("UPDATE account_control SET drawdown_latched=1, daily_halted=1")
+        self.ledger.connection.commit()
+        sell = dataclasses.replace(order_proposal(), side=Side.SELL, reducing_only=True, decision=None,
+            release_hash=RELEASE_HASH, control_epoch=1, deadline_mono_ns=100_000_000_000,
+            base_quantity=Decimal('0.1'), action_slot='reduce:parent:1', action_id='reduce-parent')
+        view = self.ledger.account_view('paper-test')
+        self.assertTrue(view.ready, 'held account should be ready before the reduction')
+        generation = self.ledger.connection.execute('SELECT generation FROM accounts').fetchone()[0]
+        for forged in ('reduce:missing:1', 'reduce:parent:2', 'random-7'):
+            with self.assertRaises(ContractViolation):
+                self.ledger.reserve_intent(dataclasses.replace(sell, action_slot=forged, action_id='bad-' + forged),
+                    view.revision, generation, None)
+        prepared = self.ledger.reserve_intent(sell, view.revision, generation, None)
+        self.assertEqual('reserved', prepared.state.value if hasattr(prepared.state, 'value') else prepared.state)
+        self.assertEqual(0, self.ledger.connection.execute(
+            "SELECT cash_usd_u FROM reservations WHERE intent_id=?", (prepared.intent_id,)).fetchone()[0])
+        with self.assertRaises(ContractViolation):
+            self.ledger.reserve_intent(dataclasses.replace(sell, action_slot='reduce:parent:2', action_id='second'),
+                self.ledger.account_view('paper-test').revision, generation, None)
+        dispatched = self.ledger.mark_dispatching(prepared.intent_id, generation)
+        self.assertEqual(IntentState.DISPATCHING, dispatched.state)
+        from bot.autonomous.contracts import BookPayload, ExecutableBook
+        from bot.autonomous.execution import PaperVenue
+        book = ExecutableBook('paper', 'AAVE-USD', self.now, BookPayload(
+            ((Decimal('100'), Decimal('1')),), ((Decimal('101'), Decimal('1')),)), 'a' * 64)
+        execution = PaperVenue(slippage_bps=Decimal(0), clock_us=lambda: self.now).submit(dispatched, book, rules)
+        self.assertEqual(1, len(execution.fills))
+        self.assertEqual('sell', execution.fills[0]['side'])
+        before = self.balances()
+        self.fill('reduce-fill', prepared.intent_id, '0.1', '10', 'USD', '0', side='sell')
+        after = self.balances()
+        self.assertEqual('0.9', after['AAVE'])
+        self.assertEqual(Decimal(before['USD']) + Decimal('10'), Decimal(after['USD']))
+        self.assertEqual('0', self.ledger.connection.execute(
+            'SELECT remaining_qty FROM reservations WHERE intent_id=?', (prepared.intent_id,)).fetchone()[0])
+        self.assertEqual('dispatching', self.ledger.connection.execute(
+            'SELECT state FROM order_intents WHERE intent_id=?', (prepared.intent_id,)).fetchone()[0])
+        result = execution.results[0]
+        self.ledger.append_order_event(OrderEvent('evt-reduce-fill', prepared.intent_id, result.state, result,
+            self.now, self.now, result.venue_event_key))
+        self.assertEqual('filled', self.ledger.connection.execute(
+            'SELECT state FROM order_intents WHERE intent_id=?', (prepared.intent_id,)).fetchone()[0])
+        self.assertEqual((1, 1), tuple(self.ledger.connection.execute(
+            'SELECT drawdown_latched, daily_halted FROM account_control').fetchone()))
+        self.assertFalse(self.ledger.account_view('paper-test').ready)
+        self.mark('after-reduction', books={'AAVE': {'at_us': self.now, 'quote_asset': 'USD', 'bids': [['100', '0.9']]}})
+        refreshed = self.ledger.account_view('paper-test')
+        self.assertTrue(refreshed.ready)
+        self.assertEqual((1, 1), tuple(self.ledger.connection.execute(
+            'SELECT drawdown_latched, daily_halted FROM account_control').fetchone()))
+        from bot.autonomous.contracts import ControlState, Mode, Permit
+        buy = dataclasses.replace(order_proposal(), release_hash=RELEASE_HASH, control_epoch=1,
+            deadline_mono_ns=100_000_000_000,
+            decision=dataclasses.replace(order_proposal().decision, release_hash=RELEASE_HASH))
+        control = ControlState(mode=Mode.PAPER, permit=Permit.ENTRY, drawdown_latched=True, daily_halted=True,
+            control_epoch=1, boot_id='test-boot', deadman_deadline_mono_ns=100_000_000_000,
+            active_release_hash=RELEASE_HASH, reconciliation_ready=True, armed=True)
+        verdict = real_assess(buy, refreshed, control, limits, rules, self.now, now_mono_ns=1, current_boot_id='test-boot')
+        self.assertFalse(verdict.allowed)
+        self.assertIn('DRAWDOWN_LATCH', verdict.reason_codes)
+        with self.ledger.transaction() as c:
+            c.execute("INSERT INTO snapshots(snapshot_id,account_id,release_hash,candle_close_us,knowledge_cutoff_us,field_hash,state_json,lineage_hash,account_revision,valid,tokenizer_hash,token_count,recorded_at_us) VALUES (?,'paper-test',?,1000000,1000000,?,'{}',?,'{}',1,?,?,?)",
+                (HASH_B, RELEASE_HASH, HASH_A, HASH_B, HASH_A, 10, self.now))
+            c.execute("INSERT INTO decisions(decision_id,snapshot_id,request_id,deadline_us,model_id,status,recorded_at_us) VALUES ('decision-test',?,'request-test',?,'test','completed',?)",
+                (HASH_B, self.now + 100_000_000, self.now))
+            c.execute("INSERT INTO candidate_results(decision_id,candidate_id,status,veto_codes_json,recorded_at_us) VALUES ('decision-test',1,'eligible','[]',?)", (self.now,))
+        current = self.ledger.account_view('paper-test')
+        orders_before = self.ledger.connection.execute('SELECT count(*) FROM order_intents').fetchone()[0]
+        with self.assertRaisesRegex(ContractViolation, 'entry inhibited') as refusal:
+            self.ledger.reserve_intent(buy, current.revision, generation, buy.decision)
+        orders_after = self.ledger.connection.execute('SELECT count(*) FROM order_intents').fetchone()[0]
+        self.assertEqual(orders_before, orders_after)
+
+    def test_marked_fifteen_percent_drawdown_blocks_the_buy_and_allows_the_reduction(self):
+        from bot.autonomous.contracts import MarketRules, Side
+        from bot.autonomous.risk import assess as real_assess
+        self.initialize()
+        self.intent('parent', quantity='50', price='100')
+        self.fill('parent-fill', 'parent', '50', '5000', 'USD', '0')
+        self.ledger.connection.execute("UPDATE order_intents SET state='filled' WHERE intent_id='parent'")
+        self.ledger.connection.commit()
+        self.mark('held', books={'AAVE': {'at_us': self.now, 'quote_asset': 'USD', 'bids': [['100', '50']]}})
+        self.assertEqual((0, 0), tuple(self.ledger.connection.execute(
+            'SELECT drawdown_latched, daily_halted FROM account_control').fetchone()))
+        self.mark('breached', books={'AAVE': {'at_us': self.now, 'quote_asset': 'USD', 'bids': [['70', '50']]}})
+        view = self.ledger.account_view('paper-test')
+        flags = tuple(self.ledger.connection.execute(
+            'SELECT drawdown_latched, daily_halted FROM account_control').fetchone())
+        self.assertEqual(8_500_000_000, view.liquidation_equity_usd_u)
+        self.assertEqual((1, 1), flags)
+        self.assertTrue(view.ready)
+        with self.ledger.transaction() as c:
+            c.execute("UPDATE account_control SET permit='entry',permit_epoch=1,lease_boot_id='test-boot',lease_deadline_mono_ns=100000000000,active_release_hash=?,version=version+1", (RELEASE_HASH,))
+            c.execute("INSERT INTO snapshots(snapshot_id,account_id,release_hash,candle_close_us,knowledge_cutoff_us,field_hash,state_json,lineage_hash,account_revision,valid,tokenizer_hash,token_count,recorded_at_us) VALUES (?,'paper-test',?,1000000,1000000,?,'{}',?,'{}',1,?,?,?)",
+                (HASH_B, RELEASE_HASH, HASH_A, HASH_B, HASH_A, 10, self.now))
+            c.execute("INSERT INTO decisions(decision_id,snapshot_id,request_id,deadline_us,model_id,status,recorded_at_us) VALUES ('decision-test',?,'request-test',?,'test','completed',?)",
+                (HASH_B, self.now + 100_000_000, self.now))
+            c.execute("INSERT INTO candidate_results(decision_id,candidate_id,status,veto_codes_json,recorded_at_us) VALUES ('decision-test',1,'eligible','[]',?)", (self.now,))
+        limits = RiskLimits(armed=True, candidate_eligible=True, tokenizer_config_hash=HASH_A, calibration_config_hash=HASH_A)
+        rules = MarketRules('paper', 'AAVE-USD', 'AAVE', 'USD', Decimal('.01'), Decimal('.01'), Decimal('.01'), Decimal('1'), Decimal('.01'), 2, HASH_A, self.now + 100_000_000, True, True, self.now, 10_000_000_000)
+        self.ledger.configure_risk_checks(limits=limits, market=lambda _: rules, assess=real_assess, boot_id='test-boot', monotonic_ns=lambda: 1)
+        generation = self.ledger.connection.execute('SELECT generation FROM accounts').fetchone()[0]
+        current = self.ledger.account_view('paper-test')
+        buy = dataclasses.replace(order_proposal(), release_hash=RELEASE_HASH, control_epoch=1, deadline_mono_ns=100_000_000_000,
+            decision=dataclasses.replace(order_proposal().decision, release_hash=RELEASE_HASH))
+        with self.assertRaisesRegex(ContractViolation, 'entry inhibited') as refusal:
+            self.ledger.reserve_intent(buy, current.revision, generation, buy.decision)
+        sell = dataclasses.replace(buy, side=Side.SELL, reducing_only=True, decision=None, base_quantity=Decimal('0.1'),
+            limit_price=Decimal('70'), action_slot='reduce:parent:1', action_id='reduce-parent')
+        prepared = self.ledger.reserve_intent(sell, self.ledger.account_view('paper-test').revision, generation, None)
+        self.assertEqual(IntentState.RESERVED, prepared.state)
+        dispatched = self.ledger.mark_dispatching(prepared.intent_id, generation)
+        from bot.autonomous.contracts import BookPayload, ExecutableBook
+        from bot.autonomous.execution import PaperVenue
+        book = ExecutableBook('paper', 'AAVE-USD', self.now, BookPayload(
+            ((Decimal('70'), Decimal('50')),), ((Decimal('71'), Decimal('50')),)), 'b' * 64)
+        execution = PaperVenue(slippage_bps=Decimal(0), clock_us=lambda: self.now).submit(dispatched, book, rules)
+        self.assertEqual('70', execution.fills[0]['price'])
+        before = self.balances()
+        self.fill('reduce-fill', prepared.intent_id, '0.1', '7', 'USD', '0', side='sell')
+        after = self.balances()
+        self.assertEqual('49.9', after['AAVE'])
+        self.assertEqual(Decimal(before['USD']) + Decimal('7'), Decimal(after['USD']))
+        flags_after = tuple(self.ledger.connection.execute(
+            'SELECT drawdown_latched, daily_halted FROM account_control').fetchone())
+        self.assertEqual((1, 1), flags_after)
+        result = execution.results[0]
+        self.ledger.append_order_event(OrderEvent('evt-breach-fill', prepared.intent_id, result.state, result,
+            self.now, self.now, result.venue_event_key))
+        order_state = self.ledger.connection.execute(
+            'SELECT state FROM order_intents WHERE intent_id=?', (prepared.intent_id,)).fetchone()[0]
+        self.assertEqual('filled', order_state)
+        flags_closed = tuple(self.ledger.connection.execute(
+            'SELECT drawdown_latched, daily_halted FROM account_control').fetchone())
+        self.assertEqual((1, 1), flags_closed)
+        self.assertFalse(self.ledger.account_view('paper-test').ready)
+        self.mark('after-breach-exit', books={'AAVE': {'at_us': self.now, 'quote_asset': 'USD', 'bids': [['70', '49.9']]}})
+        remarked = self.ledger.account_view('paper-test')
+        self.assertTrue(remarked.ready)
+        self.assertEqual(8_500_000_000, remarked.liquidation_equity_usd_u)
+        flags_remarked = tuple(self.ledger.connection.execute(
+            'SELECT drawdown_latched, daily_halted FROM account_control').fetchone())
+        self.assertEqual((1, 1), flags_remarked)
+        with self.assertRaisesRegex(ContractViolation, 'entry inhibited') as remarked_buy:
+            self.ledger.reserve_intent(buy, remarked.revision, generation, buy.decision)
+        self.mark('recovered', books={'AAVE': {'at_us': self.now, 'quote_asset': 'USD', 'bids': [['100', '49.9']]}})
+        recovered = self.ledger.account_view('paper-test')
+        flags_recovered = tuple(self.ledger.connection.execute(
+            'SELECT drawdown_latched, daily_halted FROM account_control').fetchone())
+        self.assertEqual(9_997_000_000, recovered.liquidation_equity_usd_u)
+        self.assertEqual((1, 1), flags_recovered)
+        self.assertTrue(recovered.ready)
+        with self.assertRaisesRegex(ContractViolation, 'entry inhibited') as recovered_buy:
+            self.ledger.reserve_intent(buy, recovered.revision, generation, buy.decision)
+        self.now += 86_400_000_000
+        self.mark('next-midnight', books={'AAVE': {'at_us': self.now, 'quote_asset': 'USD', 'bids': [['100', '49.9']]}})
+        rolled = self.ledger.account_view('paper-test')
+        flags_rolled = tuple(self.ledger.connection.execute(
+            'SELECT drawdown_latched, daily_halted FROM account_control').fetchone())
+        self.assertEqual((1, 0), flags_rolled)
+        self.assertTrue(rolled.ready)
+        rolled_rules = MarketRules('paper', 'AAVE-USD', 'AAVE', 'USD', Decimal('.01'), Decimal('.01'), Decimal('.01'), Decimal('1'), Decimal('.01'), 2, HASH_A, self.now + 100_000_000, True, True, self.now, 10_000_000_000)
+        self.ledger.configure_risk_checks(limits=limits, market=lambda _: rolled_rules, assess=real_assess, boot_id='test-boot', monotonic_ns=lambda: 1)
+        next_release = content_hash({"release": "next-day"})
+        next_snapshot = content_hash({"snapshot": "next-day"})
+        with self.ledger.transaction() as c:
+            c.execute("INSERT INTO release_bundles(release_hash,manifest_json,expires_at_us,recorded_at_us) VALUES (?, '{}', ?, ?)",
+                (next_release, self.now + 100_000_000, self.now))
+            c.execute("UPDATE account_control SET active_release_hash=?,version=version+1 WHERE account_id='paper-test'", (next_release,))
+            c.execute("INSERT INTO snapshots(snapshot_id,account_id,release_hash,candle_close_us,knowledge_cutoff_us,field_hash,state_json,lineage_hash,account_revision,valid,tokenizer_hash,token_count,recorded_at_us) VALUES (?,'paper-test',?,1000000,1000000,?,'{}',?,'{}',1,?,?,?)",
+                (next_snapshot, next_release, HASH_A, HASH_B, HASH_A, 10, self.now))
+            c.execute("INSERT INTO decisions(decision_id,snapshot_id,request_id,deadline_us,model_id,status,recorded_at_us) VALUES ('decision-next',?,'request-next',?,'test','completed',?)",
+                (next_snapshot, self.now + 100_000_000, self.now))
+            c.execute("INSERT INTO candidate_results(decision_id,candidate_id,status,veto_codes_json,recorded_at_us) VALUES ('decision-next',1,'eligible','[]',?)", (self.now,))
+        rolled_buy_proposal = dataclasses.replace(buy, release_hash=next_release,
+            decision=dataclasses.replace(buy.decision, decision_id='decision-next', request_id='request-next',
+                snapshot_hash=next_snapshot, release_hash=next_release))
+        with self.assertRaisesRegex(ContractViolation, 'entry inhibited') as rolled_buy:
+            self.ledger.reserve_intent(rolled_buy_proposal, self.ledger.account_view('paper-test').revision, generation, rolled_buy_proposal.decision)
+        second = dataclasses.replace(sell, release_hash=next_release, limit_price=Decimal('100'),
+            action_slot='reduce:parent:2', action_id='reduce-next-day')
+        second_prepared = self.ledger.reserve_intent(second, self.ledger.account_view('paper-test').revision, generation, None)
+        self.assertEqual(IntentState.RESERVED, second_prepared.state)
+        flags_exit = tuple(self.ledger.connection.execute(
+            'SELECT drawdown_latched, daily_halted FROM account_control').fetchone())
+        self.assertEqual((1, 0), flags_exit)
+        dispatched_next = self.ledger.mark_dispatching(second_prepared.intent_id, generation)
+        next_book = ExecutableBook('paper', 'AAVE-USD', self.now, BookPayload(
+            ((Decimal('100'), Decimal('49.9')),), ((Decimal('101'), Decimal('49.9')),)), 'c' * 64)
+        next_execution = PaperVenue(slippage_bps=Decimal(0), clock_us=lambda: self.now).submit(
+            dispatched_next, next_book, rolled_rules)
+        self.assertEqual('100', next_execution.fills[0]['price'])
+        self.fill('reduce-next', second_prepared.intent_id, '0.1', '10', 'USD', '0', side='sell')
+        next_result = next_execution.results[0]
+        self.ledger.append_order_event(OrderEvent('evt-next-day', second_prepared.intent_id, next_result.state, next_result,
+            self.now, self.now, next_result.venue_event_key))
+        next_state = self.ledger.connection.execute(
+            'SELECT state FROM order_intents WHERE intent_id=?', (second_prepared.intent_id,)).fetchone()[0]
+        self.assertEqual('filled', next_state)
+        self.assertEqual('49.8', self.balances()['AAVE'])
+        flags_filled = tuple(self.ledger.connection.execute(
+            'SELECT drawdown_latched, daily_halted FROM account_control').fetchone())
+        self.assertEqual((1, 0), flags_filled)
+        self.assertFalse(self.ledger.account_view('paper-test').ready)
+        self.mark('after-next-day', books={'AAVE': {'at_us': self.now, 'quote_asset': 'USD', 'bids': [['100', '49.8']]}})
+        after_next = self.ledger.account_view('paper-test')
+        flags_after_next = tuple(self.ledger.connection.execute(
+            'SELECT drawdown_latched, daily_halted FROM account_control').fetchone())
+        self.assertTrue(after_next.ready)
+        self.assertEqual(9_997_000_000, after_next.liquidation_equity_usd_u)
+        self.assertEqual((1, 0), flags_after_next)
+        with self.assertRaisesRegex(ContractViolation, 'entry inhibited') as after_next_buy:
+            self.ledger.reserve_intent(rolled_buy_proposal, after_next.revision, generation, rolled_buy_proposal.decision)
+
+    def test_rollover_mark_keeps_drawdown_latch_and_clears_daily_halt(self):
+        self.initialize()
+        with self.ledger.transaction() as c:
+            c.execute("UPDATE account_control SET drawdown_latched=1, daily_halted=1 WHERE account_id='paper-test'")
+        self.now += 86_400_000_000
+        self.mark('next-midnight')
+        row = self.ledger.connection.execute('SELECT drawdown_latched, daily_halted FROM account_control').fetchone()
+        self.assertEqual((1, 0), tuple(row))
 
     def test_transfer_cost_triggers_daily_halt_atomically_and_utc_rollover(self):
         self.initialize()

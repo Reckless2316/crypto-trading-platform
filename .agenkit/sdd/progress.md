@@ -1,5 +1,83 @@
 # Autonomous agent implementation
 
+## Resumed — current local software checkpoint
+
+The operator resumed the active goal and reconfirmed approval for implementation,
+verification and commits. This entry supersedes the paused status below. The
+feature branch and inherited working-tree edits are preserved.
+
+Committed this continuation: `85f2f98` (master context/additive platform scope) and
+`1fd3625` (inert capability-bound managed IOC transport). Transport tests: 16 OK;
+independent review found no blocking issue within that deliberately partial slice.
+
+Current paper/runtime work closes independently reproduced bugs: canceled partial
+entry reduction, final-book sizing verification, held-gross backstop, per-fill fee
+budget conservation, and report-only CLI invoking authority recovery. Each has a
+regression; the first four were reviewed, and the read-only CLI fix was re-reviewed
+against the original active-DISPATCHING reproduction. Temporary local Cursor
+diagnostics are removed from autonomous modules/tests and public metrics.
+
+Authenticated control status/kill passed independent scoped review and 12 tests,
+including real sockets, a real ledger and the authority mutex. Remaining command
+handlers are explicitly unavailable; no permissive arm or kill-reset default is
+provided. Full working-tree suites: 525 tests OK on Python 3.12.14 and 525 OK on
+Python 3.14.4. Independent staged-source checkout: 523 tests OK on Python 3.12.14,
+excluding inherited dashboard/deployment edits and their two additional API tests.
+
+Full Tasks 12–22 remain unaccepted. See
+`docs/checkpoints/2026-10-17-resumed-paper-authority.md` and `master-context.md` for
+the current scope and unresolved integration requirements. No live provider call,
+real order, deployment, release activation or arming was performed in this
+continuation. The platform goal remains active.
+
+## PAUSED — 2026-10-17, operator instruction (graceful pause)
+
+Committed baseline: `b2555dc` (Tasks 4/5 remediation and Tasks 6–10 accepted). Everything below is **uncommitted** in the working tree; the repository suite passed at pause (see the run recorded with this checkpoint).
+
+**Task 12 (order authority/paper)** — the review returned spec FAIL (I1–I6). Remediated test-first in the tree, but **not yet re-reviewed**:
+- **I1:** `Ledger.reject_undispatched` releases capacity atomically only from RESERVED; a final-check race leaves DISPATCHING, PENDING and the reservation kept.
+- **I2/I3:** recording failures and unaccounted fills become UNKNOWN with a PENDING receipt; evidence and events use the ledger clock.
+- **I3/I4:** `PaperVenue` rounds to tick and lot adversely, rounds the fee up to µUSD, and caps the fee rate at the market fee bound (otherwise venue REJECTED).
+- **I5:** `sizing_entry_verifier(ledger, evidence_for, limits)` is bound to the proposal's own persisted decision and full identity.
+- `market_source` is now required; the book is re-read before dispatch; `StateEngine.executable_book` added as the production book source.
+- `tests/autonomous/test_execution_recovery.py`: 21 tests.
+- **Open I6:** `cancel/control/reconcile` and the `paper_coinbase_adapter` boundary are proposed for deferral to Tasks 13–14 (**needs operator sign-off**); reduction/exit slots; cost-convention check (M-b); engine-backed authority integration test; per-account lock test.
+
+**Task 11 (risk)** — the review returned spec FAIL. **Not yet fixed:**
+- **C1 Critical:** the asset cap is keyed by instrument string (`risk.py`, `h.instrument == proposal.instrument`), so a holding valued via a USDC book (`AAVE-USDC`) escapes the 5% cap. Key it on `base_asset`, and make the ledger backstop (`_risk_check` asset/gross) include held liquidation value per base asset.
+- **I1:** drawdown/daily latches veto reducing exits. Gate them on buys; keep kill/arming/lease for all sides.
+- **I2:** add a ledger test where only `assess` can veto (assert "current risk recheck refused").
+- **I3:** ledger `hard_killed` tests for `reserve_intent` and `mark_dispatching` (kill set after reserve).
+- **I4:** test that a rollover mark keeps `drawdown_latched` and resets the daily halt.
+- **Minors:** reduce check pools reservations across sides/instruments (M2); `_latch_current_losses` is defence in depth (M1).
+- Reviewer harnesses: scratchpad `review11/` and `review12/`.
+
+**Resume order:** Task 11 C1 (test-first), then Task 11 I1–I4, then Task 12 re-review together with Task 11 re-review, then one commit of Tasks 11–12. No live calls, deployment, activation or arming occurred.
+
+## Operator rule — 2026-10-17: pause gracefully at 5% session limit remaining
+
+This session cannot read the session-usage meter. Mitigation: checkpoint this log after each step, keep the tree resumable, and commit accepted work promptly so an operator interrupt at about 5% remaining loses nothing.
+
+**In flight at this checkpoint:** Task 12 remediation of review findings I1–I5 (spec FAIL). Ledger `reject_undispatched` (atomic, RESERVED-only release) was added and `append_order_event` no longer zeroes reservations. `execution.py` was rewritten: tick/lot/µUSD-correct PaperVenue fed by the market fee bound; recording failures and unaccounted fills become UNKNOWN with a PENDING receipt; the verifier is bound to the persisted decision via `evidence_for`; `market_source` is required; the book is re-read before dispatch. **Tests not yet updated to the new APIs.** Task 11 review is still running. `StateEngine.executable_book` was added (test passing).
+
+## 2026-10-17 — Task 11 completed and Task 12 paper authority built (uncommitted, reviews pending)
+
+Committed baseline: `b2555dc` (Tasks 4/5 remediation and Tasks 6–10 accepted, 392 tests).
+
+Task 11 (operator approved):
+- **Integration bug fixed:** the ledger risk hook omitted `now_mono_ns`/`current_boot_id`, so the real `risk.assess` could never be wired (it always vetoed). Every earlier ledger test used a permissive stub. Once wired, the real assess caught a fixture whose proposal deadline exceeded the lease; the fixture was corrected.
+- New `Ledger._latch_current_losses` runs before every reservation, in its own commit, so a breach found at order time persists drawdown/daily latches without any model call.
+- `RiskAuthorityTests` cover real-assess reservation, residual pending-loss competition (fifth $25 entry refused), residual asset competition, stale revision, and latch-on-reservation. `test_pending_sell_gives_no_buy_capacity_credit` added.
+
+Task 12 (operator approved) — `bot/autonomous/execution.py`:
+- `economic_action_key`; `PaperVenue` (IOC against the supplied causal book, levels within the limit, adverse slippage and fee, remainder cancelled; it emits results and fill evidence only).
+- `OrderAuthority.submit` (per-account lock): the authority-owned `book_source` (callers cannot pass a book or market) must supply a fresh book; then `entry_verifier` (production `sizing_entry_verifier` recomputes `size_entry` and requires equality); then `reserve_intent`, then `mark_dispatching` (a refusal appends REJECTED), then the venue call outside any SQL transaction (an exception appends UNKNOWN); then order events plus `import_local_evidence` and `record_fill`. A retry that already left reservation is never re-dispatched.
+- Ledger changes: a REJECTED event on a never-dispatched intent zeroes its reservation (capacity released; safe because no venue exposure); an UNKNOWN event invalidates account readiness until reconciliation.
+- 15 tests: partial, full and nonfill IOC; risk veto; sizing not reproduced; missing book; final-check refusal releasing capacity (survives reopen); venue failure leading to UNKNOWN with capacity retained (survives reopen); same candle under a second release; idempotent retry; stale epoch, forged decision and invented slot; venue called outside a transaction. Mutation run: 7 of 7 guards killed.
+- Not yet: reduction/exit slots (the ledger still refuses non-entry slots, so oversell is impossible but exits are unimplemented); production `book_source` from `StateEngine.book` with committed lineage; cost-convention check (M-b); fixture JSONL files named in the brief.
+
+Suites: repository-wide 413 OK.
+
 ## 2026-10-17 — Task 8 accepted on substance; Task 9 remediation; Task 10 entry composition (uncommitted)
 
 Third review round:

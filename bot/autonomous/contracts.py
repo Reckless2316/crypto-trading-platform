@@ -1085,6 +1085,8 @@ class Reservation(Record):
     remaining_quantity: Decimal
     state: IntentState
     version: int = 0
+    instrument: str = "unspecified"
+    side: str = "unspecified"
     def _validate(self):
         if min(self.cash_usd_u, self.gross_usd_u, self.loss_budget_usd_u, self.version) < 0 or self.remaining_quantity > self.base_quantity:
             raise ContractViolation("negative reservation")

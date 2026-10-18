@@ -154,9 +154,30 @@ class RiskAdmissionTests(unittest.TestCase):
         self.assertFalse(verdict.allowed)
         self.assertIn('ACCOUNT_UNREADY', verdict.reason_codes)
 
+    def test_drawdown_and_daily_latches_block_buys_and_allow_reducing_sells(self):
+        from dataclasses import replace
+        from bot.autonomous.contracts import Balance, Holding, Permit, Side
+        from tests.autonomous.support import order_proposal
+        holding = Holding('AAVE-USD', 'AAVE', D('1'), 100_000_000, 100_000_000, 1_000_000, 'a'*64)
+        account = replace(self.account, balances=(Balance('USD', D('9000'), 9_000_000_000),
+            Balance('AAVE', D('1'), 100_000_000)), holdings=(holding,))
+        reduce = replace(order_proposal(), side=Side.SELL, reducing_only=True, decision=None,
+            base_quantity=D('0.1'), max_fee_usd_u=2_000_000)
+        latched = replace(self.control, permit=Permit.REDUCE_ONLY, drawdown_latched=True, daily_halted=True)
+        verdict = self.assess(proposal=reduce, account=account, control=latched)
+        self.assertTrue(verdict.allowed, verdict.reason_codes)
+        self.assertEqual(verdict.halt_transitions, ())
+        killed = self.assess(proposal=reduce, account=account, control=replace(latched, hard_killed=True, armed=False))
+        self.assertFalse(killed.allowed)
+        self.assertIn('HARD_KILL', killed.reason_codes)
+        buy = self.assess(control=replace(self.control, drawdown_latched=True, daily_halted=True))
+        self.assertFalse(buy.allowed)
+        self.assertIn('DRAWDOWN_LATCH', buy.reason_codes)
+        self.assertIn('DAILY_HALT', buy.reason_codes)
+
     def test_sell_cannot_exceed_owned_or_reserved_inventory(self):
         from dataclasses import replace
-        from bot.autonomous.contracts import Balance, Side
+        from bot.autonomous.contracts import Balance, Holding, IntentState, Reservation, Side
         from tests.autonomous.support import order_proposal
         from bot.autonomous.risk import assess
         proposal = replace(order_proposal(), side=Side.SELL, reducing_only=True, decision=None,
@@ -169,6 +190,19 @@ class RiskAdmissionTests(unittest.TestCase):
             current_boot_id='boot-test')
         self.assertFalse(verdict.allowed)
         self.assertIn('INSUFFICIENT_UNRESERVED_BASE', verdict.reason_codes)
+        foreign = Reservation('btc-buy', 0, D('1'), 100_000_000, 0, D('1'), IntentState.RESERVED, instrument='BTC-USD', side='buy')
+        owned = replace(account, holdings=(Holding('AAVE-USD', 'AAVE', D('1'), 100_000_000, 100_000_000, 1_000_000, 'a'*64),),
+            reservations=(foreign,), open_intent_ids=('btc-buy',))
+        smaller = replace(proposal, base_quantity=D('0.1'))
+        verdict = assess(smaller, owned, replace(self.control, permit=Permit.REDUCE_ONLY),
+            self.limits, self.market, 1_000_000, now_mono_ns=1_000_000_000, current_boot_id='boot-test')
+        self.assertTrue(verdict.allowed, verdict.reason_codes)
+        same = replace(foreign, intent_id='aave-sell', instrument='AAVE-USD', side='sell', cash_usd_u=0, gross_usd_u=0)
+        blocked = assess(smaller, replace(owned, reservations=(same,), open_intent_ids=('aave-sell',)),
+            replace(self.control, permit=Permit.REDUCE_ONLY), self.limits, self.market, 1_000_000,
+            now_mono_ns=1_000_000_000, current_boot_id='boot-test')
+        self.assertFalse(blocked.allowed)
+        self.assertIn('INSUFFICIENT_UNRESERVED_BASE', blocked.reason_codes)
 
     def test_asset_gross_and_pending_loss_caps_include_reservations(self):
         from dataclasses import replace
@@ -177,6 +211,10 @@ class RiskAdmissionTests(unittest.TestCase):
             1_000_000, 'a'*64)
         account = replace(self.account, holdings=(holding,))
         verdict = self.assess(account=account)
+        self.assertFalse(verdict.allowed)
+        self.assertIn('ASSET_CAP', verdict.reason_codes)
+        cross_book = replace(holding, instrument='AAVE-USDC')
+        verdict = self.assess(account=replace(self.account, holdings=(cross_book,)))
         self.assertFalse(verdict.allowed)
         self.assertIn('ASSET_CAP', verdict.reason_codes)
         holding = replace(holding, instrument='OTHER-USD', base_asset='OTHER',
@@ -204,6 +242,18 @@ class RiskAdmissionTests(unittest.TestCase):
             open_intent_ids=('buy-pending',)))
         self.assertFalse(verdict.allowed)
         self.assertIn('GROSS_CAP', verdict.reason_codes)
+
+    def test_pending_sell_gives_no_buy_capacity_credit(self):
+        from dataclasses import replace
+        from bot.autonomous.contracts import Balance, Holding, IntentState, Reservation
+        held = replace(self.account,
+            holdings=(Holding('AAVE-USD','AAVE',D('4.5'),450_000_000,450_000_000,1_000_000,'f'*64),),
+            balances=self.account.balances+(Balance('AAVE',D('4.5'),450_000_000),),
+            reservations=(Reservation('sell-all',0,D('4.5'),450_000_000,0,D('4.5'),IntentState.RESERVED),),
+            open_intent_ids=('sell-all',))
+        verdict = self.assess(account=held)
+        self.assertFalse(verdict.allowed)
+        self.assertIn('ASSET_CAP', verdict.reason_codes)
 
     def test_loss_threshold_neighbors_use_exact_nav_not_display_ratios(self):
         from dataclasses import replace

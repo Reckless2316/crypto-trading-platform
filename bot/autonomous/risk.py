@@ -132,6 +132,7 @@ def assess(proposal: OrderProposal, account: AccountView, control: ControlState,
         _append(reasons, "UNVALUED_HOLDING")
 
     evidence = account.exact_nav
+    hit_drawdown = hit_daily = False
     if evidence is None or evidence.account_id != account.account_id or evidence.revision != account.revision or evidence.equity_usd_u != account.liquidation_equity_usd_u:
         _append(reasons, "EXACT_NAV_UNAVAILABLE")
     elif account.liquidation_equity_usd_u <= 0 or evidence.nav.fraction() <= 0 or evidence.high_water_nav.fraction() <= 0 or evidence.day_open_nav.fraction() <= 0:
@@ -141,14 +142,16 @@ def assess(proposal: OrderProposal, account: AccountView, control: ControlState,
         # Decimal loss_fractions/loss_limit_reasons are reporting helpers only.
         # Admission is decided exclusively by the authoritative integer cross-products.
         hit_drawdown, hit_daily = loss_triggers(n, h, d)
-        if hit_drawdown:
+        if buy and hit_drawdown:
             _append(reasons, "DRAWDOWN_LATCH")
-        if hit_daily:
+        if buy and hit_daily:
             _append(reasons, "DAILY_HALT")
-    if control.drawdown_latched:
+    if buy and control.drawdown_latched:
         _append(reasons, "DRAWDOWN_LATCH")
-    if control.daily_halted:
+    if buy and control.daily_halted:
         _append(reasons, "DAILY_HALT")
+    if not buy and (hit_drawdown or hit_daily or control.drawdown_latched or control.daily_halted):
+        pass
     if control.crisis_halted and buy:
         _append(reasons, "CRISIS_HALT")
 
@@ -191,12 +194,18 @@ def assess(proposal: OrderProposal, account: AccountView, control: ControlState,
 
         if reduce:
             owned = sum((b.quantity for b in account.balances if b.asset == market.base_asset), Decimal(0))
-            reserved = sum((r.remaining_quantity for r in pending), Decimal(0))
+            same_base_sells = tuple(r for r in pending if r.side == "sell" and r.instrument.split("-", 1)[0] == market.base_asset)
+            if len(same_base_sells) != len(pending):
+                pass
+            reserved = sum((r.remaining_quantity for r in same_base_sells), Decimal(0))
             if proposal.base_quantity > owned - reserved:
                 _append(reasons, "INSUFFICIENT_UNRESERVED_BASE")
         if buy and evidence is not None and account.liquidation_equity_usd_u > 0:
             equity_u = account.liquidation_equity_usd_u
-            held_asset_u = sum(h.liquidation_value_usd_u for h in account.holdings if h.instrument == proposal.instrument)
+            instrument_held_u = sum(h.liquidation_value_usd_u for h in account.holdings if h.instrument == proposal.instrument)
+            held_asset_u = sum(h.liquidation_value_usd_u for h in account.holdings if h.base_asset == market.base_asset)
+            if held_asset_u != instrument_held_u:
+                pass
             pending_gross_u = sum(r.gross_usd_u for r in pending)
             if (held_asset_u + pending_gross_u + notional_u) * 100 > equity_u * 5:
                 _append(reasons, "ASSET_CAP")

@@ -353,6 +353,81 @@ class CalibrationTests(unittest.TestCase):
             finally: ledger.close()
 
 
+    def test_resolved_ledger_label_scores_brier_without_approval(self):
+        from bot.autonomous.worker import PaperWorker
+        from types import SimpleNamespace
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = Ledger.open(Path(directory) / "ledger.sqlite3")
+            try:
+                ledger.create_paper_account("paper-calibration")
+                now = 20_000_000_000
+                ledger._clock_us = lambda: now
+                release = content_hash({})
+                ledger.connection.execute("INSERT INTO release_bundles VALUES (?,?,NULL,?,?)", (release, "{}", now + 100_000_000, now))
+                close = now - 1000
+                ledger.connection.execute("INSERT INTO snapshots VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    ("snapshot-cal", "paper-calibration", release, close, close, "b" * 64, "{}", "d" * 64, 0, "c" * 64, "{}", 1, None, now))
+                judgment = CandidateDecision("aave", Regime.TRENDING, Direction.LONG, 2, AdvisoryRisk.SAFE,
+                    DirectionDistribution(.7, .2, .1), .7, .7, .7, .7, .1)
+                batch = DecisionBatch("request-cal", content_hash({}), release, "model-v1", 100, 90, now,
+                    (judgment,), None, schema_hash="a" * 64)
+                batch_json = batch.to_json()
+                ledger.connection.execute("INSERT INTO decisions VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                    ("decision-cal", "snapshot-cal", "request-cal", now, "model-v1", batch_json,
+                     content_hash(__import__("json").loads(batch_json)), "completed", None, now, now))
+                ledger.connection.execute("INSERT INTO candidate_results VALUES (?,?,?,?,?,?)",
+                    ("decision-cal", 1, "hold", "{}", "[]", now))
+                ledger.append_forecast(forecast_id="forecast-cal", decision_id="decision-cal", candidate_id=1,
+                    side="buy", execution_policy_hash="e" * 64, eligibility=False, recorded_at_us=now)
+                label = ledger.connection.execute("SELECT * FROM outcome_labels WHERE forecast_id='forecast-cal'").fetchone()
+
+                class SyntheticVerifier(OutcomeEvidenceVerifier):
+                    def verify(self, request):
+                        quote = request.forecast_at_us + 100
+                        closes = tuple((quote // HOUR_US + i) * HOUR_US for i in range(1, 5))
+                        return VerifiedOutcomeEvidence(self, request.request_hash, quote, quote + 1, quote + 2,
+                            closes, closes[-1], closes[-1] + 1, closes[-1] + 2, closes[-1] + 3,
+                            Decimal("2"), Decimal("100"), Decimal("101"), Decimal(".5"), Decimal(".5"),
+                            Decimal(".25"), "f" * 64, ("e" * 64,), None)
+
+                ledger.configure_outcome_verifier(SyntheticVerifier())
+                resolve_at = label["maturity_us"] + HOUR_US
+                ledger._clock_us = lambda: resolve_at + 10
+                ledger.revise_outcome_label(label["label_id"], "resolved", {"net_return": "999"}, recorded_at_us=resolve_at)
+                ledger.connection.execute(
+                    "INSERT INTO order_intents VALUES (?,?,?,1,?,?,?,'AAVE-USD','buy','1','100',1000,?,'filled',NULL,0,0,0,?,?,?)",
+                    ("intent-cal", "paper-calibration", "decision-cal", release, close, "entry", "client-cal",
+                     "{}", "{}", resolve_at))
+                ledger.connection.execute(
+                    "INSERT INTO fills VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    ("fill-cal", "paper-calibration", "intent-cal", "paper", "trade-cal", "order-cal", "AAVE-USD",
+                     "buy", "1", "100", "100", "USD", "0.1", close, close, "a" * 64, resolve_at))
+                from bot.autonomous.brain import BrainProposal
+
+                class ProposingBrain:
+                    model_id = "test-brain"
+
+                    def review(self, *, job_id, archive_hash, metrics):
+                        return BrainProposal("propose_schema", "brier recorded", "a human still has to accept it",
+                            (archive_hash,), schema_diff="research-only", model_id=self.model_id)
+
+                worker = PaperWorker(SimpleNamespace(venue=SimpleNamespace(venue="paper")))
+                worker.review_brain = ProposingBrain()
+                worker.attach_activity(ledger.connection, "paper-calibration", "a" * 64)
+                result = worker.on_clock(resolve_at)
+                self.assertTrue(result["reviewed"])
+                self.assertFalse(result["dispatched"])
+                report = worker.activity_reports[0]
+                self.assertFalse(report.approved)
+                self.assertEqual(report.status, "pending_agenkit")
+                self.assertEqual(report.schema_diff, "research-only")
+                self.assertEqual(report.resolved, 1)
+                self.assertEqual(report.included_ids, ("fill-cal",))
+                self.assertAlmostEqual(report.binary_brier, (0.7 - 1) ** 2)
+            finally:
+                ledger.close()
+
+
 class EdgeGateTests(unittest.TestCase):
     """Attestation from ledger label events plus a ledger-verified decision are both required for an edge."""
     _observations = CalibrationTests._observations

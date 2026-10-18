@@ -20,7 +20,7 @@ from typing import Callable, Iterator
 from .contracts import (
     AccountRevision, AccountView, AppendResult, Balance, ContractViolation, CausalCutoffs,
     ControlState, DecisionReference, IntentState, ManifestEntry, MarketRules, Mode,
-    OrderEvent, OrderProposal, Permit, PersistenceUnavailable, PreparedIntent,
+    OrderEvent, OrderProposal, OrderReference, Permit, PersistenceUnavailable, PreparedIntent, VenueOrderResult,
     Reservation, RiskLimits, RiskVerdict, SessionArchive, SessionCutoff, ReviewJob,
     candidate_wire_id, canonical_bytes, checked_money, content_hash, decimal_text, CANDIDATE_WIRE_IDS,
     decimal_value, strict_json, ExactRatio, ExactNavEvidence, Holding,
@@ -706,7 +706,7 @@ class Ledger:
         intents = self.connection.execute('SELECT * FROM order_intents WHERE account_id=? ORDER BY intent_id',(account_id,)).fetchall()
         # Retain even terminal reservations until the reconciler explicitly verifies
         # cumulative fills and final fees. Terminal order status alone proves neither.
-        reservations = tuple(self._reservation(r) for r in self.connection.execute('SELECT r.* FROM reservations r JOIN order_intents i USING(intent_id) WHERE i.account_id=? AND (r.cash_usd_u>0 OR r.gross_usd_u>0 OR r.loss_budget_usd_u>0 OR r.remaining_qty!=\'0\') ORDER BY r.intent_id',(account_id,)))
+        reservations = tuple(self._reservation(r) for r in self.connection.execute('SELECT r.*, i.instrument, i.side FROM reservations r JOIN order_intents i USING(intent_id) WHERE i.account_id=? AND (r.cash_usd_u>0 OR r.gross_usd_u>0 OR r.loss_budget_usd_u>0 OR r.remaining_qty!=\'0\') ORDER BY r.intent_id',(account_id,)))
         mark = self.connection.execute('SELECT * FROM equity_marks WHERE account_id=? ORDER BY rowid DESC LIMIT 1',(account_id,)).fetchone()
         reconcile = self.connection.execute('SELECT * FROM reconciliations WHERE reconcile_id=? AND account_id=?',(control['reconcile_id'],account_id)).fetchone()
         ready = bool(runtime['ready'] and mark and reconcile and reconcile['status']=='completed' and reconcile['finished_at_us'] is not None and runtime['private_heartbeat_us'] is not None and mark['valuation_version']==runtime['valuation_version'] and mark['equity_usd_u']>0)
@@ -741,13 +741,13 @@ class Ledger:
 
     @staticmethod
     def _reservation(row: sqlite3.Row) -> Reservation:
-        return Reservation(row['intent_id'],row['cash_usd_u'],decimal_value(row['base_qty']),row['gross_usd_u'],row['loss_budget_usd_u'],decimal_value(row['remaining_qty']),IntentState(row['state']),row['version'])
+        return Reservation(row['intent_id'],row['cash_usd_u'],decimal_value(row['base_qty']),row['gross_usd_u'],row['loss_budget_usd_u'],decimal_value(row['remaining_qty']),IntentState(row['state']),row['version'],row['instrument'],row['side'])
 
     def _prepared(self, intent_id: str) -> PreparedIntent:
         row = self.connection.execute('SELECT * FROM order_intents WHERE intent_id=?',(intent_id,)).fetchone()
         if row is None:
             raise ContractViolation('unknown intent')
-        reservation = self.connection.execute('SELECT * FROM reservations WHERE intent_id=?',(intent_id,)).fetchone()
+        reservation = self.connection.execute('SELECT r.*, i.instrument, i.side FROM reservations r JOIN order_intents i USING(intent_id) WHERE r.intent_id=?',(intent_id,)).fetchone()
         if reservation is None:
             raise PersistenceUnavailable('intent missing reservation')
         return PreparedIntent(intent_id,OrderProposal.from_json(row['proposal_json']),self._reservation(reservation),row['client_order_id'],row['generation'],AccountRevision.from_json(row['prepared_revision_json']),IntentState(row['state']))
@@ -827,8 +827,10 @@ class Ledger:
                     raise ContractViolation('insufficient unreserved base')
             if not proposal.reducing_only:
                 equity = Decimal(account.liquidation_equity_usd_u)
-                asset_pending = sum(r['gross_usd_u'] for r in self.connection.execute('SELECT r.gross_usd_u FROM reservations r JOIN order_intents i USING(intent_id) WHERE i.account_id=? AND i.instrument=? AND i.side=\'buy\' AND i.intent_id!=?',(proposal.account_id,proposal.instrument,exclude_intent_id or '')))
-                if notional+asset_pending>equity*limits.max_position_fraction or notional+sum(r.gross_usd_u for r in pending)>equity*limits.max_gross_fraction:
+                held_asset = sum(h.liquidation_value_usd_u for h in account.holdings if h.base_asset == market.base_asset)
+                asset_pending = sum(row['gross_usd_u'] for row in self.connection.execute('SELECT i.instrument, r.gross_usd_u FROM reservations r JOIN order_intents i USING(intent_id) WHERE i.account_id=? AND i.side=\'buy\' AND i.intent_id!=?',(proposal.account_id,exclude_intent_id or '')) if str(row['instrument']).split('-', 1)[0] == market.base_asset)
+                held_gross = sum(h.liquidation_value_usd_u for h in account.holdings)
+                if notional+asset_pending+held_asset>equity*limits.max_position_fraction or held_gross+notional+sum(r.gross_usd_u for r in pending)>equity*limits.max_gross_fraction:
                     raise ContractViolation('position/gross capacity exceeded')
                 if proposal.loss_budget_usd_u<=0 or proposal.loss_budget_usd_u>equity*limits.max_entry_loss_fraction or proposal.loss_budget_usd_u+sum(r.loss_budget_usd_u for r in pending)>equity*limits.max_pending_loss_fraction:
                     raise ContractViolation('modeled loss capacity exceeded')
@@ -841,10 +843,44 @@ class Ledger:
         assess_account = replace(account,
             reservations=tuple(r for r in account.reservations if r.intent_id!=exclude_intent_id),
             open_intent_ids=tuple(i for i in account.open_intent_ids if i!=exclude_intent_id)) if exclude_intent_id else account
-        verdict = assess(proposal,assess_account,control,limits,market,now)
+        verdict = assess(proposal,assess_account,control,limits,market,now,now_mono_ns=mono,current_boot_id=boot_id)
         if type(verdict) is not RiskVerdict or not verdict.allowed or verdict.account_revision!=account.revision or verdict.proposal_hash!=content_hash(proposal) or verdict.halt_transitions or verdict.escalation_codes:
             raise ContractViolation('current risk recheck refused/unbound')
         return account, cash, notional
+
+    def _require_reduction_slot(self, proposal: OrderProposal) -> None:
+        slot = proposal.action_slot
+        parent_id, sep, ordinal_text = slot.rpartition(":")
+        if not parent_id.startswith("reduce:") or not sep or not ordinal_text.isdigit() or ordinal_text.startswith("0"):
+            raise ContractViolation("authority-allocated reduction/replacement slot unavailable")
+        parent_id = parent_id.removeprefix("reduce:")
+        if not parent_id or any(ch in parent_id for ch in "%_"):
+            raise ContractViolation("authority-allocated reduction/replacement slot unavailable")
+        ordinal = int(ordinal_text)
+        parent = self.connection.execute(
+            "SELECT account_id,candidate_id,instrument,side,state FROM order_intents WHERE intent_id=?",
+            (parent_id,)).fetchone()
+        wire_id = candidate_wire_id(proposal.candidate_id)
+        if (parent is None or parent["account_id"] != proposal.account_id or parent["instrument"] != proposal.instrument
+                or parent["side"] != "buy" or parent["state"] not in ("filled", "partial", "canceled") or parent["candidate_id"] != wire_id):
+            raise ContractViolation("reduction parent is not a filled entry")
+        # IOC cancellation describes the unfilled remainder. Its accounted fills
+        # still created inventory that must remain eligible for a reducing exit.
+        # A terminal status alone is not evidence that any base was acquired.
+        fills = self.connection.execute(
+            "SELECT base_qty FROM fills WHERE intent_id=? AND account_id=? AND side='buy'",
+            (parent_id, proposal.account_id)).fetchall()
+        if not any(decimal_value(fill["base_qty"]) > 0 for fill in fills):
+            raise ContractViolation("reduction parent has no accounted fills")
+        prefix = f"reduce:{parent_id}:"
+        prior = self.connection.execute(
+            "SELECT count(*) FROM order_intents WHERE account_id=? AND action_slot LIKE ?",
+            (proposal.account_id, prefix + "%")).fetchone()[0]
+        open_prior = self.connection.execute(
+            "SELECT count(*) FROM order_intents WHERE account_id=? AND action_slot LIKE ? AND state NOT IN ('filled','canceled','rejected')",
+            (proposal.account_id, prefix + "%")).fetchone()[0]
+        if prior + 1 != ordinal or open_prior:
+            raise ContractViolation("reduction ordinal is not the next authority allocation")
 
     def _check_decision(self, proposal: OrderProposal, decision: DecisionReference | None) -> None:
         if not proposal.reducing_only:self._check_source_health()
@@ -863,11 +899,26 @@ class Ledger:
         if not proposal.reducing_only and (candidate is None or candidate[0]!='eligible'):
             raise ContractViolation('decision candidate not eligible')
 
+    def _latch_current_losses(self, account_id: str) -> None:
+        """Persist drawdown/daily latches from current exact NAV in their own commit.
+
+        Called before any reservation so a breach found at order time is durable even
+        though the reservation itself is refused and rolled back. No model is involved.
+        """
+        account = self._account_view(account_id)
+        evidence = account.exact_nav
+        if evidence is None or evidence.account_id != account_id:
+            return
+        with self.transaction():
+            self._latch_losses(account_id, evidence.mark_id, evidence.nav.fraction(),
+                evidence.high_water_nav.fraction(), evidence.day_open_nav.fraction())
+
     def reserve_intent(self, proposal: OrderProposal, expected: AccountRevision,
             generation: int, decision: DecisionReference | None) -> PreparedIntent:
         if type(proposal) is not OrderProposal or type(expected) is not AccountRevision:
             raise ContractViolation('typed proposal/revision required')
         if not proposal.reducing_only:self._check_source_health()
+        self._latch_current_losses(proposal.account_id)
         with self.transaction() as c:
             wire_id = candidate_wire_id(proposal.candidate_id)
             existing = c.execute('SELECT intent_id,proposal_json,generation FROM order_intents WHERE account_id=? AND candle_close_us=? AND candidate_id=? AND action_slot=?',(proposal.account_id,proposal.candle_close_us,wire_id,proposal.action_slot)).fetchone()
@@ -875,9 +926,11 @@ class Ledger:
                 if existing['proposal_json']!=proposal.to_json() or existing['generation']!=generation or generation!=self._require_account(proposal.account_id)['generation']:
                     raise ContractViolation('economic action identity conflict')
                 return self._prepared(existing['intent_id'])
-            # Only the initial semantic slot is currently implemented. Replacement
-            # and reduction ordinals are allocated by later authority integration.
-            if proposal.action_slot!='entry' or proposal.reducing_only:
+            # The next reduction slot is a pure function of the filled parent entry.
+            # A caller-chosen string is not an allocation.
+            if proposal.reducing_only:
+                self._require_reduction_slot(proposal)
+            elif proposal.action_slot!='entry':
                 raise ContractViolation('authority-allocated reduction/replacement slot unavailable')
             self._check_decision(proposal,decision)
             account,cash,notional = self._risk_check(proposal,expected,generation)
@@ -936,11 +989,34 @@ class Ledger:
             self._append_order_evidence(event.event_id,event.intent_id,event.kind.value,event.to_json(),event.received_at_us,self._clock_us(),event.event_at_us,event.venue_event_key)
             c.execute('UPDATE order_intents SET state=?,venue_order_id=?,version=version+1 WHERE intent_id=?',(event.kind.value,event.result.reference.venue_order_id,event.intent_id))
             c.execute('UPDATE reservations SET state=?,version=version+1,updated_at_us=? WHERE intent_id=?',(event.kind.value,self._clock_us(),event.intent_id))
-            # Status never journals money or releases capacity. Confirmed fills,
-            # final fees and terminal reconciliation own that atomic operation.
-            if event.result.filled_quantity>0:
+            # Status never journals money or releases capacity; see reject_undispatched.
+            # A fill or an unknown venue outcome makes current account state unproven.
+            if event.result.filled_quantity>0 or event.kind is IntentState.UNKNOWN:
                 self.invalidate_account(account_id)
             return AppendResult(True,event.event_id,self._revision(account_id))
+
+    def reject_undispatched(self, intent_id: str, reason: str) -> bool:
+        """Reject an intent that never left RESERVED and release its capacity atomically.
+
+        Returns False, changing nothing, if the intent is no longer RESERVED: then some
+        dispatch may have reached a venue and only venue evidence or reconciliation decides.
+        """
+        if type(reason) is not str or not reason:
+            raise ContractViolation('rejection reason required')
+        with self.transaction() as c:
+            intent = self._prepared(intent_id)
+            if intent.state is not IntentState.RESERVED:
+                return False
+            p = intent.proposal
+            now = self._clock_us()
+            reference = OrderReference(p.account_id, intent_id, intent.client_order_id, None)
+            result = VenueOrderResult(reference, IntentState.REJECTED, Decimal(0), p.base_quantity, now,
+                'authority-rejected', reason)
+            event = OrderEvent('reject-'+intent_id, intent_id, IntentState.REJECTED, result, now, now, 'authority-rejected-'+intent_id)
+            self._append_order_evidence(event.event_id, intent_id, 'rejected', event.to_json(), now, now, now, event.venue_event_key)
+            c.execute("UPDATE order_intents SET state='rejected',version=version+1 WHERE intent_id=?", (intent_id,))
+            c.execute("UPDATE reservations SET state='rejected',cash_usd_u=0,gross_usd_u=0,loss_budget_usd_u=0,remaining_qty='0',version=version+1,updated_at_us=? WHERE intent_id=?", (now, intent_id))
+            return True
 
     def _append_order_evidence(self, event_id: str, intent_id: str, kind: str,
             payload_json: str, received_at_us: int, recorded_at_us: int,
@@ -1543,6 +1619,51 @@ class Ledger:
                 (reason,now,account_id))
             return True
 
+    def latch_operator_kill(self, account_id: str) -> bool:
+        """Set the hard kill that order admission reads. This never clears it."""
+        if type(account_id) is not str or not account_id:
+            raise ContractViolation("invalid operator kill")
+        event_id = "hard-kill-" + content_hash((account_id,))
+        reason = "operator_kill"
+        with self.transaction() as c:
+            self._require_account(account_id)
+            row = c.execute(
+                "SELECT hard_killed, permit_epoch FROM account_control WHERE account_id=?",
+                (account_id,)).fetchone()
+            previous = c.execute(
+                "SELECT account_id, request_id, reason FROM control_events WHERE event_id=?",
+                (event_id,)).fetchall()
+            if previous:
+                if len(previous) != 1 or tuple(previous[0]) != (account_id, event_id, reason):
+                    raise ContractViolation("operator kill identity conflict")
+                if not row["hard_killed"]:
+                    now = self._clock_us()
+                    c.execute(
+                        """UPDATE account_control SET hard_killed=1, version=version+1,
+                           halt_reason=?, updated_at_us=? WHERE account_id=?""",
+                        (reason, now, account_id))
+                self._release_killed_reservations(account_id)
+                return False
+            now = self._clock_us()
+            c.execute(
+                "INSERT INTO control_events VALUES (?,?,?,?,'hard_kill','operator',?,?)",
+                (event_id, account_id, event_id, row["permit_epoch"], reason, now))
+            c.execute(
+                """UPDATE account_control SET hard_killed=1, version=version+1,
+                   halt_reason=?, updated_at_us=? WHERE account_id=?""",
+                (reason, now, account_id))
+            self._release_killed_reservations(account_id)
+            return True
+
+    def _release_killed_reservations(self, account_id: str) -> None:
+        """Reject orders that never left RESERVED. In-flight orders stay for reconciliation."""
+        ids = [row[0] for row in self.connection.execute(
+            "SELECT intent_id FROM order_intents WHERE account_id=? AND state='reserved'", (account_id,))]
+        released = 0
+        for intent_id in ids:
+            if self.reject_undispatched(intent_id, "hard_kill"):
+                released += 1
+
     def _job_revision(self, job: ReviewJob) -> AccountRevision:
         accounts = set()
         for sql,value in (
@@ -2044,6 +2165,17 @@ class Ledger:
         key='loss-'+content_hash(mark_id)
         c.execute("UPDATE account_control SET drawdown_latched=?,daily_halted=?,version=version+1,updated_at_us=? WHERE account_id=?",(drawdown_next,daily_next,now,account_id))
         c.execute("INSERT INTO control_events VALUES (?,?,?,?,'risk_halt','accounting',?,?)",(key,account_id,key,old['permit_epoch'],'exact NAV loss boundary/UTC rollover',now))
+        if drawdown_next or daily_next:
+            self._release_inhibited_entries(account_id)
+
+    def _release_inhibited_entries(self, account_id: str) -> None:
+        """Drop reserved buys when a loss latch closes new exposure. Sells stay for an exit."""
+        ids = [row[0] for row in self.connection.execute(
+            "SELECT intent_id FROM order_intents WHERE account_id=? AND state='reserved' AND side='buy'", (account_id,))]
+        released = 0
+        for intent_id in ids:
+            if self.reject_undispatched(intent_id, "risk_halt"):
+                released += 1
 
     def _write_mark(self, e: sqlite3.Row, mark_id: str, equity: int, units: Fraction,
             high: Fraction, day: Fraction, holdings: tuple[Holding,...], reconcile_id: str | None,

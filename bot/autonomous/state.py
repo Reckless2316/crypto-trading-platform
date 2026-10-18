@@ -23,7 +23,7 @@ from pathlib import Path
 from types import MappingProxyType
 
 from .contracts import (BookPayload, CandlePayload, CausalCutoffs, ContractViolation,
-    AccountRevision, ApprovedBundle, EncodedState, Feature, FieldDictionary,
+    AccountRevision, ApprovedBundle, EncodedState, ExecutableBook, Feature, FieldDictionary,
     HistoricalInventory, IngestResult, NumericSnapshot, ProviderTokenCounter,
     Record, SharedContext, SourceEvent, StateHold, StateHoldDraft, StateUnavailable,
     TokenAccountingUnavailable, TokenCount, canonical_bytes, content_hash,
@@ -61,6 +61,124 @@ def book_metrics(bids, asks, band_bps=10.0):
     if not all(math.isfinite(x) for x in result):
         raise ValueError('nonfinite book feature')
     return result
+
+
+def hold_public_top(bids, asks, event_us: int, sequence: int, symbol: str = "BTC-USD", prior=(), candle_close_us: int | None = None, shared=None, causal_inventory=None) -> dict:
+    """Build one causal snapshot from a public top of book and hold it. This does not submit."""
+    from .contracts import CandidateBundle, CandidateDefinition, GateApproval
+    if type(event_us) is not int or event_us < 0 or type(sequence) is not int or sequence < 0:
+        raise ValueError("invalid public book time")
+    if type(symbol) is not str or not symbol.endswith("-USD"):
+        raise ValueError("invalid public book symbol")
+
+    def ordered(rows, reverse):
+        return tuple(sorted(((Decimal(str(price)), Decimal(str(size))) for price, size in rows), reverse=reverse))
+
+    def one_event(level_bids, level_asks, at_us, level_sequence):
+        payload = BookPayload(ordered(level_bids, True), ordered(level_asks, False))
+        return SourceEvent("public-top", "coinbase", "book", symbol, "public-top", 0,
+            at_us, at_us, at_us, payload, content_hash(payload), level_sequence)
+
+    event = one_event(bids, asks, event_us, sequence)
+    earlier = tuple(one_event(old_bids, old_asks, old_us, old_sequence)
+                    for old_bids, old_asks, old_us, old_sequence in prior
+                    if type(old_us) is int and old_us <= event_us and type(old_sequence) is int)
+    events = tuple(sorted((event, *earlier), key=lambda item: (item.event_at_us, item.sequence)))
+    if candle_close_us is None:
+        candle_close_us = event_us
+    if type(candle_close_us) is not int or candle_close_us < event_us:
+        raise ValueError("invalid public book time")
+    cutoffs = CausalCutoffs(candle_close_us, candle_close_us, 1, "public-top")
+    if causal_inventory is not None and causal_inventory.cutoffs != cutoffs:
+        causal_inventory = None
+    dictionary = default_field_dictionary()
+    candidate_id = symbol[:-4].lower()
+    candidates = (CandidateDefinition(candidate_id, symbol, False, True, ()),)
+    bundle = CandidateBundle("public-top", "a" * 64, dictionary.dictionary_hash, "b" * 64, "c" * 64,
+        "d" * 64, "e" * 64, "f" * 64, "1" * 64, event_us + 10**12, candidates, ())
+    approved = ApprovedBundle(bundle, (GateApproval("evaluation", "public-top", bundle.bundle_hash, "2" * 64, 1),),
+        2, "3" * 64)
+
+    class _Release:
+        def __init__(self, engine, release_hash):
+            self._source_engine = engine
+            self._release_hash = release_hash
+        def execute(self, *_args, **_kwargs):
+            return self
+        def fetchone(self):
+            return (self._release_hash,)
+        def inventory_as_of(self, account_id, frozen):
+            if causal_inventory is None:
+                return HistoricalInventory(frozen, account_id, AccountRevision(), (), "c" * 64)
+            if causal_inventory.account_id != account_id or causal_inventory.cutoffs != frozen:
+                raise StateUnavailable("causal inventory cutoff mismatch")
+            return causal_inventory
+
+    engine = object.__new__(StateEngine)
+    ledger = _Release(engine, bundle.bundle_hash)
+    ledger.connection = ledger
+    engine.ledger = ledger
+    engine._inventory_reconstructed = causal_inventory is not None
+    engine._snapshot_inputs = {}
+    engine._snapshot_evidence = {}
+    engine._snapshot_inventory = {}
+    engine.account_id = causal_inventory.account_id if causal_inventory is not None else "paper"
+    engine.select = lambda _cutoffs, **_window: events
+    snapshot = engine.snapshot(symbol, cutoffs)
+    supplied = dict(shared or {})
+    supplied.setdefault("dictionary_version", (1.0, True))
+    supplied.setdefault("candle_close_ms", (candle_close_us / 1000, True))
+    measured = {feature.name: feature for feature in snapshot.features}
+    one_hour = measured.get("return_1h")
+    if symbol == "BTC-USD" and one_hour is not None and one_hour.valid and "btc_return_1h" not in supplied:
+        supplied["btc_return_1h"] = (one_hour.value, True)
+    if symbol == "ETH-USD" and one_hour is not None and one_hour.valid and "eth_return_1h" not in supplied:
+        supplied["eth_return_1h"] = (one_hour.value, True)
+    features = []
+    for field in dictionary.shared_fields:
+        item = supplied.get(field.name)
+        if item is None:
+            features.append(Feature(field.name, 0.0, False))
+        else:
+            features.append(Feature(field.name, float(item[0]), bool(item[1])))
+    context = SharedContext(tuple(features), sum(1 << index for index, feature in enumerate(features) if feature.valid))
+
+    class _Counter:
+        def count_state(self, _raw):
+            raise AssertionError("ineligible public book must not be tokenized")
+
+    outcome = encode_state((snapshot,), context, dictionary, _Counter(),
+        candidate_order=(candidate_id,), ranked_bundle=approved)
+    values = {feature.name: feature for feature in snapshot.features}
+    shared_values = {feature.name: feature for feature in context.features}
+    base_asset = symbol[:-4]
+    other_inventory = [] if causal_inventory is None else [
+        [asset, str(quantity)] for asset, quantity in causal_inventory.quantities if asset != base_asset]
+    return {"reason": outcome.reason, "mid_valid": values["mid"].valid,
+            "eligible_valid": values["eligible"].valid, "rv_valid": values["rv_60m"].valid,
+            "minute_books": getattr(engine, "_minute_books", None), "tokens": None,
+            "token_counter_called": False,
+            "feature_bytes": len(canonical_bytes({
+                "candidate": [(feature.name, feature.value if feature.valid else None) for feature in snapshot.features],
+                "shared": [(feature.name, feature.value if feature.valid else None) for feature in context.features],
+            })),
+            "drawdown_valid": shared_values["drawdown"].valid, "drawdown": shared_values["drawdown"].value,
+            "daily_loss_valid": shared_values["daily_loss"].valid, "daily_loss": shared_values["daily_loss"].value,
+            "base_inventory": values["base_inventory"].value,
+            "base_inventory_valid": values["base_inventory"].valid,
+            "inventory_usd_valid": values["inventory_usd"].valid,
+            "other_inventory": other_inventory,
+            "inventory_source": "causal_journal" if causal_inventory is not None else "unreconstructed",
+            "spread_bps": values["spread_bps"].value, "spread_valid": values["spread_bps"].valid,
+            "roundtrip_cost_bps": values["estimated_roundtrip_cost_bps"].value,
+            "roundtrip_cost_valid": values["estimated_roundtrip_cost_bps"].valid,
+            "fees_included": False,
+            "position_headroom": values["position_headroom"].value,
+            "position_headroom_valid": values["position_headroom"].valid,
+            "btc_return_1h": shared_values["btc_return_1h"].value,
+            "btc_return_1h_valid": shared_values["btc_return_1h"].valid,
+            "eth_return_1h": shared_values["eth_return_1h"].value,
+            "eth_return_1h_valid": shared_values["eth_return_1h"].valid}
 
 
 def _wire_values(features, definitions, identity=None):
@@ -460,6 +578,22 @@ class StateEngine:
         value=self._books.get(key)
         return value[1] if value else None
 
+    def executable_book(self, source, stream, instrument, venue):
+        """The live sequence-verified book as an ExecutableBook, or None when unhealthy.
+
+        This is the only production book source for order authority. Lineage binds the
+        committed source event that produced the current book state.
+        """
+        book=self.book(source,stream,instrument)
+        if book is None or not self.entries_ready:
+            return None
+        sequence,_,event_id=self._books[(source,stream,instrument)]
+        row=self.ledger.connection.execute('SELECT event_at_us FROM source_events WHERE event_id=?',(event_id,)).fetchone()
+        if row is None:
+            return None
+        return ExecutableBook(venue,instrument,row['event_at_us'],book,
+            content_hash(('executable-book-v1',event_id,sequence)))
+
     def snapshot(self, symbol: str, cutoffs: CausalCutoffs) -> NumericSnapshot:
         """Build candidate features only from events visible at the frozen cutoffs.
 
@@ -505,6 +639,7 @@ class StateEngine:
                 event_at,sample=timeline[index]
                 if ambiguous or sample is None or boundary-event_at>self.BOUNDARY_MAX_AGE_US:continue
                 per_minute[boundary].append(sample[1])
+        self._minute_books = sum(1 for books in per_minute.values() if len(books) == 1)
         metrics=None
         try:
             close_books=per_minute[cutoffs.candle_close_us]
@@ -548,7 +683,7 @@ class StateEngine:
         historical=dict(inventory.quantities)
         try:base_quantity=historical.get(base_asset,Decimal(0));base_inventory=float(base_quantity)
         except (TypeError,ValueError,OverflowError):base_inventory=float('nan')
-        inventory_valid=math.isfinite(base_inventory)
+        inventory_valid=math.isfinite(base_inventory) and getattr(self, "_inventory_reconstructed", True)
         feature_values={
             'mid':(metrics[0],True) if metrics else (0.0,False),
             'spread_bps':(metrics[1],True) if metrics else (0.0,False),
@@ -559,7 +694,9 @@ class StateEngine:
             'inventory_usd':(base_inventory*metrics[0] if metrics and inventory_valid else 0.0,inventory_valid and metrics is not None and math.isfinite(base_inventory*metrics[0])),
             'eligible':(0.0,False), 'evidence_age_minutes':(0.0,False),
             'evidence_expiry_minutes':(0.0,False), 'thesis_condition_bits':(0.0,False),
-            'position_headroom':(0.0,False), 'estimated_roundtrip_cost_bps':(0.0,False),
+            'position_headroom':(0.0,False),
+            # Buy the ask and sell the bid pays the quoted spread once. Unobserved fees stay out.
+            'estimated_roundtrip_cost_bps':(metrics[1],True) if metrics else (0.0,False),
         }
         names=('candidate_id','mid','spread_bps','imbalance','rv_60m','rv_samples','return_1h',
             'base_inventory','inventory_usd','eligible','evidence_age_minutes','evidence_expiry_minutes',
