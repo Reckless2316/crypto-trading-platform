@@ -10,4 +10,4 @@ __pycache__/
 .pytest_cache/
 .agenkit/memory/codemap.json
 .agenkit/memory/manifest.json
-data/autonomous/runtime/
+data/autonomous/runtime*/
