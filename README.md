@@ -31,6 +31,14 @@ cp .env.example .env
 
 Create the OKX key with Read + Trade permissions only (never Withdraw) and test with an OKX demo-trading key first. Paper trading is simulated locally and fills at the latest stored Coinbase hourly close; it does not place orders on OKX.
 
+## Stream exchange data to log files
+
+```sh
+.venv/bin/python -m data.stream            # optional: --interval 2 --log-dir logs/stream --max-ticks N
+```
+
+Polls OKX public tickers for BTC, ETH and XRP (vs USDT) and appends JSON lines to `logs/stream/BTC-USDT.log`, `ETH-USDT.log` and `XRP-USDT.log` (one file per coin). Ctrl-C stops it. No credentials are used.
+
 ## Using the dashboard
 
 1. Open <http://127.0.0.1:8000>, choose exchange/symbol/timeframe, and click **Fetch & store candles**.
