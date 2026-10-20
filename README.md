@@ -1,8 +1,8 @@
 # SURGE
 
-SURGE is a local-first crypto market research and trading dashboard. It collects and stores public candle history from Coinbase, Binance, and Kraken; charts prices; runs technical and statistical strategies; backtests on stored data; and provides a persistent paper account with risk controls. An explainable local strategy ensemble can automate paper trading when separately enabled and armed.
+SURGE is a local-first crypto market research and trading dashboard. It collects and stores public candle history from Coinbase, Binance, Kraken, and OKX; charts prices; runs technical and statistical strategies; backtests on stored data; and provides a persistent paper account with risk controls. An explainable local strategy ensemble can automate paper trading when separately enabled and armed.
 
-Public candles come from Coinbase, Binance, and Kraken. A private Coinbase Advanced or Binance spot account is a CCXT credential slot (`SURGE_LIVE_EXCHANGE`, `SURGE_COINBASE_*` or `SURGE_BINANCE_*`) for a future authority process. The dashboard does not load those keys, and no running service is logged into an exchange. Read [live setup and deployment limits](deploy/DEPLOYMENT.md) before configuring exchange access. SURGE is a prototype and makes no profitability claims.
+Public candles come from Coinbase, Binance, Kraken, and OKX. A private Coinbase Advanced or Binance spot account is a CCXT credential slot (`SURGE_LIVE_EXCHANGE`, `SURGE_COINBASE_*` or `SURGE_BINANCE_*`) for a future authority process. The dashboard does not load those keys, and no running service is logged into an exchange. Read [live setup and deployment limits](deploy/DEPLOYMENT.md) before configuring exchange access. SURGE is a prototype and makes no profitability claims.
 
 ## Install and open the web UI
 
@@ -15,6 +15,28 @@ python3 -m venv .venv
 ```
 
 Open <http://127.0.0.1:8000>. The page serves the operator deck: Coinbase candlesticks, the paper-runtime snapshot, the strategy queue (including Markov and the Elliott Wave heuristic), and the paper STOP/KILL file commands. Those commands do not submit an exchange order. The web process does not read exchange API keys. `POST /api/live/orders` stays unavailable until an authority-owned venue path exists.
+
+## OKX
+
+OKX is a first-class exchange. In the dashboard pick **OKX** in the exchange selector (symbols like `BTC-USDT`) and press **Fetch & store candles**; strategy analysis and backtests then run on the stored OKX candles. OKX public candles need no credentials.
+
+Live credentials (optional, for a future authority process; the web dashboard never loads them and `POST /api/live/orders` stays unavailable):
+
+```sh
+cp .env.example .env
+# set SURGE_LIVE_EXCHANGE=okx, SURGE_OKX_API_KEY, SURGE_OKX_API_SECRET, SURGE_OKX_API_PASSPHRASE,
+# SURGE_LIVE_MAX_ORDER_QUOTE, then SURGE_LIVE_TRADING_ENABLED=true and
+# SURGE_LIVE_TRADING_ARMED=I_ACCEPT_LIVE_TRADING_RISK
+```
+
+Create the OKX key with Read + Trade permissions only (never Withdraw) and test with an OKX demo-trading key first. Paper trading is simulated locally and fills at the latest stored Coinbase hourly close; it does not place orders on OKX.
+
+## Using the dashboard
+
+1. Open <http://127.0.0.1:8000>, choose exchange/symbol/timeframe, and click **Fetch & store candles**.
+2. Review the chart and strategy queue; run a strategy or backtest on stored candles.
+3. Paper automation is off by default: use the paper controls to arm (max 30 minutes), and STOP/KILL to halt.
+4. Run tests with `pip install -r requirements-dev.txt && .venv/bin/python -m pytest tests`.
 
 ## Run with Docker
 

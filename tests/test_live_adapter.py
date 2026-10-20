@@ -367,3 +367,10 @@ class BoundedSessionTests(unittest.TestCase):
         ManagedBoundedTransport(client=client, account_id='managed-1', capability_verifier=None,
             clock_us=lambda: 1, monotonic_ns=lambda: 1)
         self.assertEqual({'data': [1, 2]}, client.fetch('https://example.invalid/api'))
+
+
+def test_okx_config_reads_passphrase():
+    cfg = LiveConfig.from_env({
+        "SURGE_LIVE_EXCHANGE": "okx", "SURGE_OKX_API_KEY": "k", "SURGE_OKX_API_SECRET": "s",
+        "SURGE_OKX_API_PASSPHRASE": "p", "SURGE_LIVE_MAX_ORDER_QUOTE": "10"})
+    assert (cfg.exchange_id, cfg.api_key, cfg.api_passphrase) == ("okx", "k", "p")
