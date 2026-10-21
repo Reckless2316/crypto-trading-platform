@@ -179,7 +179,7 @@ def init_db() -> None:
           VALUES('paper_default',10000,10000);
         INSERT OR IGNORE INTO runtime_state(id,kill_switch,armed_until) VALUES(1,1,0);
         INSERT OR IGNORE INTO automation_state(id,enabled,last_candle_ts) VALUES(1,0,0);
-        CREATE INDEX IF NOT EXISTS idx_candles_recent ON candles(symbol,timeframe,ts_open DESC);
+        DROP INDEX IF EXISTS idx_candles_recent;
         CREATE INDEX IF NOT EXISTS idx_orders_recent ON orders(created_at DESC);
         """)
         con.commit()
