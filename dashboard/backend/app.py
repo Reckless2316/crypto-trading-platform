@@ -1309,12 +1309,12 @@ def get_candles(symbol: str = "BTC-USD", timeframe: str = "1h", limit: int = 100
                 exchange: str = "coinbase"):
     if exchange not in {"coinbase", "binance", "kraken"}:
         raise HTTPException(status_code=422, detail="Unsupported exchange")
-    candles = CandleHistoryStore(DB_FILE).load(exchange, symbol, timeframe)
+    limit = min(max(limit, 1), 1000)
+    candles = CandleHistoryStore(DB_FILE).load(exchange, symbol, timeframe, limit=limit)
     if not candles and exchange == "coinbase":
         with closing(db()) as con:
-            rows = con.execute("SELECT ts_open,open,high,low,close,volume FROM candles WHERE symbol=? AND timeframe=? ORDER BY ts_open DESC LIMIT ?", (symbol, timeframe, min(max(limit, 1), 1000))).fetchall()
+            rows = con.execute("SELECT ts_open,open,high,low,close,volume FROM candles WHERE symbol=? AND timeframe=? ORDER BY ts_open DESC LIMIT ?", (symbol, timeframe, limit)).fetchall()
         return list(reversed([dict(row) for row in rows]))
-    candles = candles[-min(max(limit, 1), 1000):]
     return [{"ts_open": c.ts_open, "open": c.open, "high": c.high, "low": c.low,
              "close": c.close, "volume": c.volume, "ts_close": c.ts_close} for c in candles]
 

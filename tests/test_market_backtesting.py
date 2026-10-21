@@ -32,6 +32,9 @@ class HistoryTests(unittest.TestCase):
             self.assertEqual([x.close for x in store.load("binance", "BTCUSDT", "1m")], [10, 11])
             self.assertEqual([x.close for x in store.load("coinbase", "BTCUSDT", "1m")], [12])
             self.assertEqual([x.ts_open for x in store.load("binance", "BTCUSDT", "1m", 120_000, 180_000)], [120_000])
+            self.assertEqual([x.close for x in store.load("binance", "BTCUSDT", "1m", limit=1)], [11])
+            self.assertEqual(store.load("binance", "BTCUSDT", "1m", limit=5), store.load("binance", "BTCUSDT", "1m"))
+            self.assertEqual(store.load("binance", "BTCUSDT", "1m", limit=0), [])
 
     def test_fetch_paginates_and_persists(self):
         fake = FakeCollector()

@@ -53,6 +53,14 @@ class PlatformApiTests(unittest.TestCase):
         with closing(platform_app.db()) as con:
             return con.execute("SELECT COUNT(*) FROM orders").fetchone()[0]
 
+    def test_candles_endpoint_returns_latest_window_ascending(self):
+        candles = self.seed_candles(count=10)
+
+        rows = self.client.get("/api/candles", params={"limit": 3}).json()
+
+        self.assertEqual([r["ts_open"] for r in rows], [c.ts_open for c in candles[-3:]])
+        self.assertEqual(len(self.client.get("/api/candles", params={"limit": 500}).json()), 10)
+
     def test_strategy_run_records_signal_without_opt_in_order(self):
         self.seed_candles()
 
