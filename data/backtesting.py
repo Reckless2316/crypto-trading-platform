@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, asdict
 from math import isfinite
-from typing import Callable, Sequence
+from typing import Callable, Iterator, Sequence
 
 from .collectors.collector_base import Candle
 
@@ -43,6 +43,33 @@ class BacktestResult:
         return data
 
 
+class _PrefixView(Sequence):
+    """Read-only view of the first n candles; avoids copying the prefix every bar."""
+
+    __slots__ = ("_bars", "_n")
+
+    def __init__(self, bars: Sequence[Candle], n: int):
+        self._bars = bars
+        self._n = n
+
+    def __len__(self) -> int:
+        return self._n
+
+    def __getitem__(self, index):
+        if isinstance(index, slice):
+            start, stop, step = index.indices(self._n)
+            return tuple(self._bars[start:stop:step])
+        if index < 0:
+            index += self._n
+        if not 0 <= index < self._n:
+            raise IndexError("candle index out of range")
+        return self._bars[index]
+
+    def __iter__(self) -> Iterator[Candle]:
+        for i in range(self._n):
+            yield self._bars[i]
+
+
 class BacktestEngine:
     """Run a bool signal against ordered candles; buys/sells fill next bar open.
 
@@ -77,7 +104,7 @@ class BacktestEngine:
         # No strategy has access to the current bar before its open fill.
         for i, bar in enumerate(bars):
             if i:
-                target_long = bool(signal_fn(tuple(bars[:i])))
+                target_long = bool(signal_fn(_PrefixView(bars, i)))
                 if target_long and qty == 0:
                     entry_price = bar.open
                     qty = cash / (entry_price * (1 + self.fee_rate))
@@ -157,9 +184,9 @@ def ema_crossover_signal(fast_period: int = 12, slow_period: int = 26) -> Signal
     def signal(history: Sequence[Candle]) -> bool:
         if len(history) < slow_period:
             return False
-        closes = [c.close for c in history]
-        fast = _ema(closes[-max(slow_period * 3, fast_period):], fast_period)
-        slow = _ema(closes[-slow_period * 3:], slow_period)
+        closes = [c.close for c in history[-slow_period * 3:]]
+        fast = _ema(closes, fast_period)
+        slow = _ema(closes, slow_period)
         return fast > slow
     return signal
 
@@ -174,8 +201,8 @@ def markov_momentum_signal(lookback: int = 100, threshold: float = 0.5) -> Signa
         raise ValueError("lookback must be >= 3 and threshold must be in [0, 1]")
 
     def signal(history: Sequence[Candle]) -> bool:
-        changes = [history[i].close >= history[i - 1].close for i in range(1, len(history))]
-        changes = changes[-lookback:]
+        recent = history[-(lookback + 1):]
+        changes = [recent[i].close >= recent[i - 1].close for i in range(1, len(recent))]
         if len(changes) < 2:
             return False
         current = changes[-1]
