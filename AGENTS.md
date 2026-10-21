@@ -18,3 +18,14 @@ Before reading or grepping source to locate code, consult AgenKit local memory:
 
 If the `agenkit` CLI is unavailable, read `.agenkit/memory/MEMORY.md` first, then fall
 back to targeted reads. See the `codebase-memory` skill for the full workflow.
+
+## Cursor Cloud specific instructions
+
+Paper mode needs no exchange secrets. Leave live trading disabled, and do not create `.env` unless you are intentionally testing that path.
+
+Cloud Agents install dependencies with `python3 -m pip install --user -r requirements-dev.txt` and symlink `uvicorn` into `/usr/local/bin`, because `~/.local/bin` is not on the default PATH. `python3 -m uvicorn` works without that symlink.
+
+The boot service is host Python, not Docker Compose. It listens at `http://127.0.0.1:8000`. SQLite is created at `data/surge.sqlite3`, which is gitignored. Fetching candles calls public Coinbase, Binance, or Kraken endpoints and needs outbound network. `python3 -m unittest discover -s tests` does not. `python3 tests/smoke_deployment.py` expects the service to already be running.
+
+`./deploy/deploy.sh` remains the Docker Compose path for machines that have Docker. This environment does not start a Docker daemon.
+
