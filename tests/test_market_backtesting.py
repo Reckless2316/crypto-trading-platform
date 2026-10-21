@@ -2,7 +2,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from data.backtesting import BacktestEngine, markov_momentum_signal
+from data.backtesting import BacktestEngine, _ema, ema_crossover_signal, markov_momentum_signal
 from data.collectors.collector_base import Candle, Collector
 from data.history import CandleHistoryStore, ExchangeHistory
 
@@ -72,6 +72,40 @@ class BacktestTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             BacktestEngine().run([candle(60_000, 1), candle(60_000, 2)], lambda _history: False)
         self.assertFalse(markov_momentum_signal()( [candle(0, 1)] ))
+
+    def test_signals_match_full_history_reference_and_prefix_is_a_view(self):
+        prices = [10 + ((i * 7) % 13) + (i % 5) * 0.5 for i in range(150)]
+        bars = [candle(i * 60_000, p) for i, p in enumerate(prices)]
+
+        def ref_markov(history, lookback=20, threshold=0.5):
+            changes = [history[i].close >= history[i - 1].close for i in range(1, len(history))][-lookback:]
+            if len(changes) < 2:
+                return False
+            current = changes[-1]
+            following = [changes[i + 1] for i in range(len(changes) - 1) if changes[i] == current]
+            p = sum(following) / len(following) if following else sum(changes) / len(changes)
+            return p > threshold
+
+        def ref_ema(history, fast_p=5, slow_p=12):
+            if len(history) < slow_p:
+                return False
+            closes = [c.close for c in history]
+            return _ema(closes[-max(slow_p * 3, fast_p):], fast_p) > _ema(closes[-slow_p * 3:], slow_p)
+
+        seen = []
+        markov, ema = markov_momentum_signal(20), ema_crossover_signal(5, 12)
+
+        def probe(history):
+            prefix = tuple(history)
+            seen.append(len(prefix))
+            self.assertEqual(history[-3:], prefix[-3:])
+            self.assertEqual(history[-1], prefix[-1])
+            self.assertEqual(markov(history), ref_markov(prefix))
+            self.assertEqual(ema(history), ref_ema(prefix))
+            return len(prefix) % 3 != 0
+
+        BacktestEngine().run(bars, probe)
+        self.assertEqual(seen, list(range(1, len(bars))))
 
 
 if __name__ == "__main__":
