@@ -187,6 +187,11 @@ class FrontendBootstrapTests(unittest.TestCase):
         self.assertIn("history.replaceState", source)  # the token leaves the address bar immediately
         self.assertIn("control_epoch", source)
 
+    def test_okx_market_symbols_use_usdt_pair_format(self):
+        from dashboard.backend import app as web
+        source = Path(web.FRONTEND).read_text()
+        self.assertIn("exchange==='okx'?`${asset}-USDT`", source)
+
 
 class RealControlServerTests(Fixture):
     def test_launcher_reads_status_from_a_real_unix_control_server(self):
