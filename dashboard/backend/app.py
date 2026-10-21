@@ -491,7 +491,7 @@ def _product_symbol(symbol: str) -> str:
 
 
 def _load_closed_candles(exchange: str, symbol: str, timeframe: str) -> list:
-    if exchange not in {"coinbase", "binance", "kraken"} or timeframe not in _TIMEFRAMES:
+    if exchange not in {"coinbase", "binance", "kraken", "okx"} or timeframe not in _TIMEFRAMES:
         raise HTTPException(status_code=422, detail="Unsupported exchange or timeframe")
     candle_rows = CandleHistoryStore(DB_FILE).load(exchange, symbol, timeframe)
     if not candle_rows and exchange == "coinbase":
@@ -639,7 +639,7 @@ def autonomous_runtime_command(command: RuntimeFileCommand):
 @app.post("/api/ai/analyze")
 def ai_analyze(symbol: str = "BTC-USD", exchange: str = "coinbase"):
     """Run the onboard explainable ensemble on stored closed candles; never submits orders."""
-    if exchange not in {"coinbase", "binance", "kraken"}:
+    if exchange not in {"coinbase", "binance", "kraken", "okx"}:
         raise HTTPException(status_code=422, detail="Unsupported exchange")
     candles = CandleHistoryStore(DB_FILE).load(exchange, symbol, "1h")
     if not candles and exchange == "coinbase":
@@ -732,7 +732,7 @@ def live_order_history(limit: int = 20):
 
 @app.post("/api/backtest")
 def run_backtest(request: BacktestRequest):
-    if request.exchange not in {"coinbase", "binance", "kraken"}:
+    if request.exchange not in {"coinbase", "binance", "kraken", "okx"}:
         raise HTTPException(status_code=422, detail="Unsupported exchange")
     try:
         candles = CandleHistoryStore(DB_FILE).load(request.exchange, request.symbol, request.timeframe,
@@ -778,7 +778,7 @@ def run_backtest(request: BacktestRequest):
 @app.post("/api/market/refresh")
 def refresh_market(symbol: str = "BTC-USD", timeframe: str = "1h", limit: int = 100,
                    exchange: str = "coinbase"):
-    if not symbol or not symbol.replace("-", "").isalnum() or exchange not in {"coinbase", "binance", "kraken"}:
+    if not symbol or not symbol.replace("-", "").isalnum() or exchange not in {"coinbase", "binance", "kraken", "okx"}:
         raise HTTPException(status_code=422, detail="Unsupported symbol or timeframe")
     if timeframe not in {"1m", "5m", "15m", "1h", "4h", "1d"}:
         raise HTTPException(status_code=422, detail="Unsupported symbol or timeframe")
@@ -1307,7 +1307,7 @@ def research_observations():
 @app.get("/api/candles")
 def get_candles(symbol: str = "BTC-USD", timeframe: str = "1h", limit: int = 100,
                 exchange: str = "coinbase"):
-    if exchange not in {"coinbase", "binance", "kraken"}:
+    if exchange not in {"coinbase", "binance", "kraken", "okx"}:
         raise HTTPException(status_code=422, detail="Unsupported exchange")
     limit = min(max(limit, 1), 1000)
     candles = CandleHistoryStore(DB_FILE).load(exchange, symbol, timeframe, limit=limit)
@@ -1331,7 +1331,7 @@ def run_strategy(symbol: str = "BTC-USD", strategy: str = "ema_12_26_crossover",
                  exchange: str = "coinbase"):
     if execute:
         return unavailable("Authority strategy execution handler unavailable")
-    if exchange not in {"coinbase", "binance", "kraken"}:
+    if exchange not in {"coinbase", "binance", "kraken", "okx"}:
         raise HTTPException(status_code=422, detail="Unsupported exchange")
     candle_rows = CandleHistoryStore(DB_FILE).load(exchange, symbol, "1h")
     if not candle_rows and exchange == "coinbase":
