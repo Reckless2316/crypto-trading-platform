@@ -8,6 +8,7 @@ import os
 import sqlite3
 import stat
 import time
+from collections import deque
 from contextlib import closing
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -331,6 +332,58 @@ def portfolio(con: sqlite3.Connection) -> dict:
     return {"account": ACCOUNT_ID, "mode": "paper", "cash": state["cash"], "market_value": market_value,
             "equity": state["cash"] + market_value, "starting_equity": state["starting_equity"],
             "realized_pnl": realized, "unrealized_pnl": unrealized, "positions": positions}
+
+
+_OBS_STARTED = time.time()
+_OBS_EVENTS: deque = deque(maxlen=50)
+_OBS_ROUTES: dict = {}
+
+
+@app.middleware("http")
+async def observe_requests(request: Request, call_next):
+    started = time.perf_counter()
+    status_code = 500
+    try:
+        response = await call_next(request)
+        status_code = response.status_code
+        return response
+    finally:
+        path = request.url.path
+        if path != "/api/observability":
+            ms = (time.perf_counter() - started) * 1000
+            stat_row = _OBS_ROUTES.setdefault(path, {"count": 0, "errors": 0, "total_ms": 0.0, "max_ms": 0.0})
+            stat_row["count"] += 1
+            stat_row["errors"] += status_code >= 400
+            stat_row["total_ms"] += ms
+            stat_row["max_ms"] = max(stat_row["max_ms"], ms)
+            if status_code >= 400 or request.method != "GET":
+                _OBS_EVENTS.appendleft({"time": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                    "method": request.method, "path": path, "status": status_code, "ms": round(ms, 1)})
+
+
+@app.get("/api/observability")
+def observability():
+    """Plain-language health, traffic and recent-event snapshot for the dashboard."""
+    db_ok, candles = True, 0
+    try:
+        with closing(db()) as con:
+            con.execute("SELECT 1").fetchone()
+            try:
+                candles = con.execute("SELECT COUNT(*) FROM candles").fetchone()[0]
+            except sqlite3.OperationalError:
+                candles = 0
+    except sqlite3.Error:
+        db_ok = False
+    routes = [{"path": path, "count": r["count"], "errors": r["errors"],
+               "avg_ms": round(r["total_ms"] / r["count"], 1), "max_ms": round(r["max_ms"], 1)}
+              for path, r in _OBS_ROUTES.items()]
+    routes.sort(key=lambda r: r["count"], reverse=True)
+    total = sum(r["count"] for r in routes)
+    errors = sum(r["errors"] for r in routes)
+    collector = getattr(app.state, "market_data", {"last_success": None, "candles": 0, "error": None})
+    return {"uptime_seconds": int(time.time() - _OBS_STARTED), "database": "ok" if db_ok else "down",
+            "stored_candles": candles, "collector": collector, "requests": total, "errors": errors,
+            "routes": routes[:10], "events": list(_OBS_EVENTS)[:20], "mode": "paper"}
 
 
 @app.get("/")
