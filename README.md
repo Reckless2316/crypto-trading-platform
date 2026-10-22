@@ -4,6 +4,8 @@ SURGE is a local-first crypto market research and trading dashboard. It collects
 
 Public candles come from Coinbase, Binance, Kraken, and OKX. A private Coinbase Advanced or Binance spot account is a CCXT credential slot (`SURGE_LIVE_EXCHANGE`, `SURGE_COINBASE_*` or `SURGE_BINANCE_*`) for a future authority process. The dashboard does not load those keys, and no running service is logged into an exchange. Read [live setup and deployment limits](deploy/DEPLOYMENT.md) before configuring exchange access. SURGE is a prototype and makes no profitability claims.
 
+New here? Read the [beginner setup guide](SETUP.md).
+
 ## Install and open the web UI
 
 Python 3.12 or newer. From this directory:

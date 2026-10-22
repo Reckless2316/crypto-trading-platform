@@ -53,6 +53,20 @@ class PlatformApiTests(unittest.TestCase):
         with closing(platform_app.db()) as con:
             return con.execute("SELECT COUNT(*) FROM orders").fetchone()[0]
 
+    def test_observability_reports_health_and_buckets_unknown_paths(self):
+        platform_app._OBS_ROUTES.clear()
+        for n in range(30):
+            self.client.get(f"/scanner-probe-{n}")
+        self.client.get("/health")
+        body = self.client.get("/api/observability").json()
+        self.assertEqual(body["database"], "ok")
+        self.assertEqual(body["mode"], "paper")
+        paths = {r["path"]: r for r in body["routes"]}
+        self.assertEqual(paths["<unmatched>"]["count"], 30)
+        self.assertEqual(paths["<unmatched>"]["errors"], 30)
+        self.assertIn("/health", paths)
+        self.assertLessEqual(len(platform_app._OBS_ROUTES), 3)   # 30 random URLs did not add 30 keys
+
     def test_sources_registry_reads_store_without_network(self):
         with patch.object(platform_app, "probe_all", side_effect=AssertionError("GET must not probe")):
             body = self.client.get("/api/sources").json()
