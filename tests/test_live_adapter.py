@@ -369,8 +369,74 @@ class BoundedSessionTests(unittest.TestCase):
         self.assertEqual({'data': [1, 2]}, client.fetch('https://example.invalid/api'))
 
 
+def test_okx_us_uses_okx_credentials_and_requires_passphrase():
+    env = {"SURGE_LIVE_EXCHANGE": "okxus", "SURGE_OKX_API_KEY": "k", "SURGE_OKX_API_SECRET": "s",
+           "SURGE_LIVE_MAX_ORDER_QUOTE": "10", "SURGE_LIVE_TRADING_ENABLED": "true",
+           "SURGE_LIVE_TRADING_ARMED": "I_ACCEPT_LIVE_TRADING_RISK"}
+    cfg = LiveConfig.from_env(env)
+    assert (cfg.exchange_id, cfg.api_key, cfg.api_passphrase) == ("okxus", "k", "")
+    try:
+        LiveCoinbaseAccount(cfg, user_armed=True, client=object())
+    except LiveTradingDisabled as exc:
+        assert "passphrase" in str(exc)
+    else:
+        raise AssertionError("OKX US without a passphrase must stay disabled")
+
+
 def test_okx_config_reads_passphrase():
     cfg = LiveConfig.from_env({
         "SURGE_LIVE_EXCHANGE": "okx", "SURGE_OKX_API_KEY": "k", "SURGE_OKX_API_SECRET": "s",
         "SURGE_OKX_API_PASSPHRASE": "p", "SURGE_LIVE_MAX_ORDER_QUOTE": "10"})
     assert (cfg.exchange_id, cfg.api_key, cfg.api_passphrase) == ("okx", "k", "p")
+
+
+class VenueCheckTests(unittest.TestCase):
+    def test_check_is_read_only_and_flags_risky_keys(self):
+        from bot.venue_check import check
+
+        class Client:
+            hostname = "us.okx.com"
+
+            def __init__(self):
+                self.calls = []
+
+            def privateGetAccountConfig(self):
+                self.calls.append("config")
+                return {"data": [{"perm": "read_only,withdraw,trade", "ip": "", "acctLv": "1"}]}
+
+            def fetch_trading_fee(self, symbol):
+                self.calls.append("fee")
+                return {"maker": 0.002, "taker": 0.0035}
+
+            def fetch_balance(self):
+                self.calls.append("balance")
+                return {"total": {"USDT": 0, "BTC": 0.5}}
+
+            def __getattr__(self, name):   # any order or transfer method would land here
+                raise AssertionError(f"venue check must not call {name}")
+
+        client = Client()
+        env = {"SURGE_LIVE_EXCHANGE": "okxus", "SURGE_OKX_API_KEY": "KEY-XYZ", "SURGE_OKX_API_SECRET": "SECRET-XYZ",
+               "SURGE_OKX_API_PASSPHRASE": "PASS-XYZ", "SURGE_LIVE_TRADING_ENABLED": "true",
+               "SURGE_LIVE_TRADING_ARMED": "I_ACCEPT_LIVE_TRADING_RISK"}
+        seen = []
+        lines = check(env, client_factory=lambda cfg: seen.append(cfg) or client)
+        self.assertEqual(client.calls, ["config", "fee", "balance"])
+        self.assertFalse(seen[0].enabled or seen[0].armed)          # live flags are forced off
+        text = "\n".join(lines)
+        self.assertIn("WARNING: this key can withdraw", text)
+        self.assertIn("no IP allowlist", text)
+        self.assertIn("maker 0.2000%, taker 0.3500%", text)
+        self.assertIn("['BTC']", text)
+        for secret in ("KEY-XYZ", "SECRET-XYZ", "PASS-XYZ"):
+            self.assertNotIn(secret, text)
+
+    def test_read_env_takes_only_surge_settings(self):
+        import tempfile
+        from pathlib import Path
+        from bot.venue_check import read_env
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / ".env"
+            path.write_text("SURGE_LIVE_EXCHANGE=okxus\nALPACA_SECRET_KEY=x\n# SURGE_OKX_API_KEY=commented\n")
+            self.assertEqual(read_env(path, {"SURGE_OKX_API_KEY": "env"}),
+                             {"SURGE_LIVE_EXCHANGE": "okxus", "SURGE_OKX_API_KEY": "env"})

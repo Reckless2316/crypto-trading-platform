@@ -11,3 +11,5 @@ __pycache__/
 .agenkit/memory/codemap.json
 .agenkit/memory/manifest.json
 data/autonomous/runtime*/
+data/cache/
+docs/research/2026-10-25-fade-forced-flush/trades_*.jsonl
