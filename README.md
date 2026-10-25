@@ -4,6 +4,8 @@ SURGE is a local-first crypto market research and trading dashboard. It collects
 
 Public candles come from Coinbase, Binance, Kraken, and OKX. A private Coinbase Advanced or Binance spot account is a CCXT credential slot (`SURGE_LIVE_EXCHANGE`, `SURGE_COINBASE_*` or `SURGE_BINANCE_*`) for a future authority process. The dashboard does not load those keys, and no running service is logged into an exchange. Read [live setup and deployment limits](deploy/DEPLOYMENT.md) before configuring exchange access. SURGE is a prototype and makes no profitability claims.
 
+New here? Read the [beginner setup guide](SETUP.md).
+
 ## Install and open the web UI
 
 Python 3.12 or newer. From this directory:
@@ -35,7 +37,7 @@ Create the OKX key with Read + Trade permissions only (never Withdraw) and test 
 
 The platform's primary trading venue is **OKX US** (CCXT `okxus`, `SURGE_LIVE_EXCHANGE=okxus`). It is
 the cheapest US-accessible exchange on the source list for spot. It excludes New York, Texas and US
-territories; the operator is in Colorado. US-regulated perps on Kraken are far cheaper but have no documented API yet.
+territories. US-regulated perps on Kraken are far cheaper but have no documented API yet.
 The operator's account is fee tier Lv1, confirmed through the API: 0.20% maker and 0.35% taker.
 Prefer limit orders and low-turnover strategies. Reasoning, fee tables and sources:
 [docs/research/2026-10-25-venue-selection.md](docs/research/2026-10-25-venue-selection.md). Live trading

@@ -8,6 +8,7 @@ import os
 import sqlite3
 import stat
 import time
+from collections import deque
 from contextlib import closing
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -359,6 +360,83 @@ def portfolio(con: sqlite3.Connection) -> dict:
     return {"account": ACCOUNT_ID, "mode": "paper", "cash": state["cash"], "market_value": market_value,
             "equity": state["cash"] + market_value, "starting_equity": state["starting_equity"],
             "realized_pnl": realized, "unrealized_pnl": unrealized, "positions": positions}
+
+
+_OBS_STARTED = time.time()
+_OBS_EVENTS: deque = deque(maxlen=50)
+_OBS_ROUTES: dict = {}
+
+
+_ROUTE_PATHS: frozenset = frozenset()
+
+
+def _route_paths() -> frozenset:
+    # Routes are all registered at import time; build the set once, on first request.
+    global _ROUTE_PATHS
+    if not _ROUTE_PATHS:
+        _ROUTE_PATHS = frozenset(getattr(route, "path", "") for route in app.routes)
+    return _ROUTE_PATHS
+
+
+@app.middleware("http")
+async def observe_requests(request: Request, call_next):
+    started = time.perf_counter()
+    status_code = 500
+    try:
+        response = await call_next(request)
+        status_code = response.status_code
+        return response
+    finally:
+        # Stats are keyed by registered route, so unknown URLs (scanners, typos) share one bucket
+        # instead of growing the table without bound.
+        path = request.url.path if request.url.path in _route_paths() else "<unmatched>"
+        if path != "/api/observability":
+            ms = (time.perf_counter() - started) * 1000
+            stat_row = _OBS_ROUTES.setdefault(path, {"count": 0, "errors": 0, "total_ms": 0.0, "max_ms": 0.0})
+            stat_row["count"] += 1
+            stat_row["errors"] += status_code >= 400
+            stat_row["total_ms"] += ms
+            stat_row["max_ms"] = max(stat_row["max_ms"], ms)
+            if status_code >= 400 or request.method != "GET":
+                _OBS_EVENTS.appendleft({"time": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                    "method": request.method, "path": path, "status": status_code, "ms": round(ms, 1)})
+
+
+def _stored_candle_count() -> tuple[bool, int]:
+    """Exchange-aware history plus legacy Coinbase rows that history does not already mirror."""
+    try:
+        with closing(db()) as con:
+            con.execute("SELECT 1").fetchone()
+            try:
+                history = con.execute("SELECT COUNT(*) FROM candle_history").fetchone()[0]
+                legacy = con.execute("""SELECT COUNT(*) FROM candles c WHERE NOT EXISTS (
+                    SELECT 1 FROM candle_history h WHERE h.exchange='coinbase' AND h.symbol=c.symbol
+                    AND h.timeframe=c.timeframe AND h.ts_open=c.ts_open)""").fetchone()[0]
+            except sqlite3.OperationalError:   # candle_history is created on first exchange fetch
+                history = 0
+                legacy = con.execute("SELECT COUNT(*) FROM candles").fetchone()[0]
+            return True, history + legacy
+    except sqlite3.Error:
+        return False, 0
+
+
+@app.get("/api/observability")
+async def observability():
+    """Plain-language health, traffic and recent-event snapshot for the dashboard."""
+    # Async on purpose: the middleware mutates _OBS_ROUTES on the event loop, so reading it here
+    # (not in a worker thread) cannot race. Only the SQLite read is moved off the loop.
+    routes = [{"path": path, "count": r["count"], "errors": r["errors"],
+               "avg_ms": round(r["total_ms"] / r["count"], 1), "max_ms": round(r["max_ms"], 1)}
+              for path, r in _OBS_ROUTES.items()]
+    events = list(_OBS_EVENTS)[:20]
+    db_ok, candles = await asyncio.to_thread(_stored_candle_count)
+    routes.sort(key=lambda r: r["count"], reverse=True)
+    total = sum(r["count"] for r in routes)
+    errors = sum(r["errors"] for r in routes)
+    collector = getattr(app.state, "market_data", {"last_success": None, "candles": 0, "error": None})
+    return {"uptime_seconds": int(time.time() - _OBS_STARTED), "database": "ok" if db_ok else "down",
+            "stored_candles": candles, "collector": collector, "requests": total, "errors": errors,
+            "routes": routes[:10], "events": events, "mode": "paper"}
 
 
 @app.get("/")

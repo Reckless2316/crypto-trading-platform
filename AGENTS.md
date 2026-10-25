@@ -36,7 +36,7 @@ The operator has an OKX account and API keys. **OKX US (CCXT `okxus`, `us.okx.co
 primary trading venue** (`SURGE_LIVE_EXCHANGE=okxus`). It is the lowest-fee US-accessible exchange
 on the operator's source list that has a trading API; see
 `docs/research/2026-10-25-venue-selection.md`. It is spot only and excludes NY, TX and US
-territories; the operator is in Colorado. Their key was verified on 2026-10-25: it is valid on
+territories; the operator's state is served. Their key was verified on 2026-10-25: it is valid on
 `us.okx.com` only (the global host answers "API key doesn't exist"). It has `read_only,trade`
 permissions, no withdraw, and fee tier Lv1 (0.20% maker / 0.35% taker). Build and test with that in mind:
 

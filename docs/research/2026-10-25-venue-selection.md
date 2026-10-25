@@ -12,8 +12,8 @@ US-accessible exchange on the list. It has a working trading API (CCXT `okxus`, 
 verified live today), and the operator already has an OKX account and keys. It is now the
 default `SURGE_LIVE_EXCHANGE`. Live trading stays disabled and unarmed.
 
-**Confirmed against the operator's account (2026-10-25).** The operator is in Colorado, which OKX
-US serves. Their API key authenticates on `us.okx.com`, and OKX's trade-fee endpoint reports tier
+**Confirmed against the operator's account (2026-10-25).** The operator's state is one OKX US
+serves. Their API key authenticates on `us.okx.com`, and OKX's trade-fee endpoint reports tier
 **Lv1: 0.20% maker, 0.35% taker** for BTC-USDT, matching the schedule below.
 
 **Caveats that could change the answer:**

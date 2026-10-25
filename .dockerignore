@@ -8,6 +8,10 @@ __pycache__/
 *.sqlite*
 *.log
 tests/
-research/
+# The dashboard imports research/autonomous; everything else under research/ stays out.
+research/*
+!research/autonomous/
+data/cache/
+data/autonomous/
 monitoring/
 security/

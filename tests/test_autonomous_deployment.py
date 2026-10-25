@@ -368,7 +368,8 @@ class LockFileTests(unittest.TestCase):
         lines = [l.strip() for l in LOCK.read_text().splitlines() if l.strip() and not l.startswith("#")]
         self.assertTrue(lines)
         for line in lines:
-            self.assertRegex(line, r"^[A-Za-z0-9_.\-\[\]]+==[0-9][^ ;]*$", line)
+            # Exact pin, optionally followed by a PEP 508 marker (coincurve applies only below 3.14).
+            self.assertRegex(line, r"^[A-Za-z0-9_.\-\[\]]+==[0-9][^ ;]*( ; [a-z_]+ *[<>=!]=? *\"[^\"]+\")?$", line)
         pinned = {re.split(r"[\[=]", l, maxsplit=1)[0].lower().replace("_", "-") for l in lines}
         for req in (ROOT / "requirements.txt").read_text().splitlines():
             req = req.strip()
