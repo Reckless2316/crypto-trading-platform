@@ -22,7 +22,9 @@ from dashboard.backend.authority_client import (allowed_host, check_local_post, 
 
 from bot.risk_gates import RiskGates
 from bot.onboard_ai import OnboardTradingAgent
+from data.binance_archive import ARCHIVE_EXCHANGE
 from data.call_log import DataCallLog
+from data.sources import SOURCES, Fetcher, SnapshotStore, probe_all
 from data.public_metrics import fetch_coinbase_book, fetch_global, fetch_listed_markets
 from data.collectors.coinbase_collector import CoinbaseCollector
 from data.collectors.collector_base import Candle
@@ -216,26 +218,46 @@ async def collector_loop() -> None:
         await asyncio.sleep(interval)
 
 
+async def sources_loop() -> None:
+    """Snapshot every registered data source. SURGE_SOURCES_INTERVAL=0 turns this off."""
+    interval = int(os.environ.get("SURGE_SOURCES_INTERVAL", "900"))
+    if interval <= 0:
+        return
+    await asyncio.sleep(30)   # let the service settle; short-lived clients never reach a probe
+    while True:
+        try:
+            results = await asyncio.to_thread(probe_all, Fetcher(DataCallLog(DB_FILE)))
+            await asyncio.to_thread(SnapshotStore(DB_FILE).save, results)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("Source snapshot round failed: %s", exc)
+        await asyncio.sleep(max(60, interval))
+
+
 @app.on_event("startup")
 async def start_collector() -> None:
     provider_names = {"SURGE_COINBASE_API_KEY", "SURGE_COINBASE_API_SECRET",
-        "SURGE_BINANCE_API_KEY", "SURGE_BINANCE_API_SECRET", "TYPESAFE_API_KEY", "SURGE_BRAIN_API_KEY"}
+        "SURGE_BINANCE_API_KEY", "SURGE_BINANCE_API_SECRET", "SURGE_OKX_API_KEY", "SURGE_OKX_API_SECRET",
+        "SURGE_OKX_API_PASSPHRASE", "TYPESAFE_API_KEY", "SURGE_BRAIN_API_KEY"}
     if any(os.environ.get(name) for name in provider_names):
         raise RuntimeError("Dashboard must start without provider credentials")
     init_db()
     app.state.market_data = {"last_success": None, "candles": 0, "error": None}
     app.state.collector_task = asyncio.create_task(collector_loop())
+    app.state.sources_task = asyncio.create_task(sources_loop())
 
 
 @app.on_event("shutdown")
 async def stop_collector() -> None:
-    task = getattr(app.state, "collector_task", None)
-    if task:
-        task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
+    for name in ("collector_task", "sources_task"):
+        task = getattr(app.state, name, None)
+        if task:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
 
 
 class OrderRequest(BaseModel):
@@ -490,8 +512,13 @@ def _product_symbol(symbol: str) -> str:
     return symbol
 
 
+# Exchanges whose candles can be read from the store: the four fetchable ones plus the Binance
+# archive import (python -m data.binance_archive import), which is never fetched by this service.
+STORED_EXCHANGES = frozenset({"coinbase", "binance", "kraken", "okx", ARCHIVE_EXCHANGE})
+
+
 def _load_closed_candles(exchange: str, symbol: str, timeframe: str) -> list:
-    if exchange not in {"coinbase", "binance", "kraken", "okx"} or timeframe not in _TIMEFRAMES:
+    if exchange not in STORED_EXCHANGES or timeframe not in _TIMEFRAMES:
         raise HTTPException(status_code=422, detail="Unsupported exchange or timeframe")
     candle_rows = CandleHistoryStore(DB_FILE).load(exchange, symbol, timeframe)
     if not candle_rows and exchange == "coinbase":
@@ -732,7 +759,7 @@ def live_order_history(limit: int = 20):
 
 @app.post("/api/backtest")
 def run_backtest(request: BacktestRequest):
-    if request.exchange not in {"coinbase", "binance", "kraken", "okx"}:
+    if request.exchange not in STORED_EXCHANGES:
         raise HTTPException(status_code=422, detail="Unsupported exchange")
     try:
         candles = CandleHistoryStore(DB_FILE).load(request.exchange, request.symbol, request.timeframe,
@@ -927,6 +954,32 @@ def refresh_swap_history():
         return fetch_swap_history(DataCallLog(DB_FILE))
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"public swap history request failed: {type(exc).__name__}")
+
+
+def _source_rows(latest: dict) -> list[dict]:
+    return [{"key": s.key, "name": s.name, "category": s.category, "method": s.method, "docs": s.docs,
+             "auth_env": s.auth_env, "key_configured": bool(s.auth_env and os.environ.get(s.auth_env)),
+             "official": s.official, "us_trading": s.us_trading, "notes": s.notes, "latest": latest.get(s.key)}
+            for s in SOURCES]
+
+
+@app.get("/api/sources")
+def data_sources():
+    """Registered data sources with their latest stored snapshot. Reads SQLite only; no network."""
+    return {"sources": _source_rows(SnapshotStore(DB_FILE).latest()),
+            "interval_seconds": int(os.environ.get("SURGE_SOURCES_INTERVAL", "900"))}
+
+
+@app.post("/api/sources/refresh")
+def refresh_sources(only: str | None = None):
+    """Probe sources now (public endpoints; optional data-API keys from the environment)."""
+    keys = only.split(",") if only else None
+    known = {s.key for s in SOURCES}
+    if keys and not set(keys) <= known:
+        raise HTTPException(status_code=400, detail=f"unknown sources: {sorted(set(keys) - known)}")
+    results = probe_all(Fetcher(DataCallLog(DB_FILE)), keys)
+    SnapshotStore(DB_FILE).save(results)
+    return {"sources": _source_rows(SnapshotStore(DB_FILE).latest())}
 
 
 @app.get("/api/data-calls")
@@ -1307,7 +1360,7 @@ def research_observations():
 @app.get("/api/candles")
 def get_candles(symbol: str = "BTC-USD", timeframe: str = "1h", limit: int = 100,
                 exchange: str = "coinbase"):
-    if exchange not in {"coinbase", "binance", "kraken", "okx"}:
+    if exchange not in STORED_EXCHANGES:
         raise HTTPException(status_code=422, detail="Unsupported exchange")
     limit = min(max(limit, 1), 1000)
     candles = CandleHistoryStore(DB_FILE).load(exchange, symbol, timeframe, limit=limit)
