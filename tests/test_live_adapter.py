@@ -369,6 +369,20 @@ class BoundedSessionTests(unittest.TestCase):
         self.assertEqual({'data': [1, 2]}, client.fetch('https://example.invalid/api'))
 
 
+def test_okx_us_uses_okx_credentials_and_requires_passphrase():
+    env = {"SURGE_LIVE_EXCHANGE": "okxus", "SURGE_OKX_API_KEY": "k", "SURGE_OKX_API_SECRET": "s",
+           "SURGE_LIVE_MAX_ORDER_QUOTE": "10", "SURGE_LIVE_TRADING_ENABLED": "true",
+           "SURGE_LIVE_TRADING_ARMED": "I_ACCEPT_LIVE_TRADING_RISK"}
+    cfg = LiveConfig.from_env(env)
+    assert (cfg.exchange_id, cfg.api_key, cfg.api_passphrase) == ("okxus", "k", "")
+    try:
+        LiveCoinbaseAccount(cfg, user_armed=True, client=object())
+    except LiveTradingDisabled as exc:
+        assert "passphrase" in str(exc)
+    else:
+        raise AssertionError("OKX US without a passphrase must stay disabled")
+
+
 def test_okx_config_reads_passphrase():
     cfg = LiveConfig.from_env({
         "SURGE_LIVE_EXCHANGE": "okx", "SURGE_OKX_API_KEY": "k", "SURGE_OKX_API_SECRET": "s",

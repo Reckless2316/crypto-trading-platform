@@ -31,6 +31,44 @@ cp .env.example .env
 
 Create the OKX key with Read + Trade permissions only (never Withdraw) and test with an OKX demo-trading key first. Paper trading is simulated locally and fills at the latest stored Coinbase hourly close; it does not place orders on OKX.
 
+## Primary venue: OKX US
+
+The platform's primary trading venue is **OKX US** (CCXT `okxus`, `SURGE_LIVE_EXCHANGE=okxus`). It is
+the cheapest US-accessible exchange on the source list for spot, but OKX US excludes New York, Texas
+and US territories. US-regulated perps on Kraken are far cheaper but have no documented API yet.
+Entry-tier spot fees are 0.20% maker and 0.35% taker, so prefer limit orders and low-turnover
+strategies. Reasoning, fee tables and sources:
+[docs/research/2026-10-25-venue-selection.md](docs/research/2026-10-25-venue-selection.md). Live trading
+stays disabled unless explicitly configured and armed.
+
+## Data sources
+
+SURGE reads 38 public market-data sources: 19 exchanges plus positioning, volatility, macro, ETF
+flow, prediction-market and on-chain feeds. The dashboard's **API status** panel shows each one,
+and the service snapshots them every 15 minutes (`SURGE_SOURCES_INTERVAL=0` turns that off).
+
+```sh
+.venv/bin/python -m data.sources status    # probe all sources once
+```
+
+33 work without setup from a US connection. A free `COINALYZE_API_KEY` unlocks Coinalyze plus
+Bybit and BitMEX, which refuse US IPs. See [docs/DATA_SOURCES.md](docs/DATA_SOURCES.md).
+
+## Historical archive and bracket backtests
+
+```sh
+.venv/bin/python -m data.binance_archive download --symbols BTCUSDT,ETHUSDT --start 2024-01-01
+.venv/bin/python -m data.binance_archive import --symbols BTCUSDT --timeframe 1h
+```
+
+The first command downloads Binance USD-M 5m klines, 5m open interest and funding from the free
+data.binance.vision archive, which works from the US. The second stores the candles for the
+dashboard under the exchange `binance-usdm-archive`. `data/event_backtest.py` simulates entries
+with a stop and a target, long or short. It uses stop-first fills, slippage, fees and funding, and
+measures results in R. `research/trade_stats.py` holds the day-clustered bootstrap and the
+random-subset filter test. For a worked, pre-registered example (a strategy that was killed),
+see [docs/research/2026-10-25-fade-forced-flush/](docs/research/2026-10-25-fade-forced-flush/RESULTS.md).
+
 ## Stream exchange data to log files
 
 ```sh
