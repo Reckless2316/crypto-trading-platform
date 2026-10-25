@@ -594,6 +594,28 @@ class StateEngine:
         return ExecutableBook(venue,instrument,row['event_at_us'],book,
             content_hash(('executable-book-v1',event_id,sequence)))
 
+    def verify_executable_book(self, candidate):
+        """Verify a dispatch book against the current committed, non-invalidated stream."""
+        self._require_owner()
+        if type(candidate) is not ExecutableBook or not self.entries_ready:
+            return False
+        matches=[(key,value) for key,value in self._books.items() if key[2]==candidate.instrument]
+        if len(matches)!=1:
+            return False
+        (source,stream,instrument),(sequence,book,event_id)=matches[0]
+        row=self.ledger.connection.execute(
+            "SELECT event_at_us,sequence FROM source_events WHERE event_id=? AND source=? AND stream=? "
+            "AND instrument=? AND sequence=? AND NOT EXISTS "
+            "(SELECT 1 FROM source_invalidations WHERE event_id=source_events.event_id)",
+            (event_id,source,stream,instrument,sequence)).fetchone()
+        manifest=self.ledger.connection.execute(
+            "SELECT 1 FROM event_segments WHERE source=? AND instrument=? AND first_sequence<=? "
+            "AND last_sequence>=? AND event_from_us<=? AND event_to_us>=?",
+            (source,instrument,sequence,sequence,row["event_at_us"],row["event_at_us"])).fetchone() if row else None
+        return (row is not None and manifest is not None and candidate.instrument==instrument
+            and candidate.observed_at_us==row["event_at_us"] and candidate.book==book
+            and candidate.lineage_hash==content_hash(("executable-book-v1",event_id,sequence)))
+
     def snapshot(self, symbol: str, cutoffs: CausalCutoffs, *, eligibility: bool | None = None) -> NumericSnapshot:
         """Build candidate features only from events visible at the frozen cutoffs.
 

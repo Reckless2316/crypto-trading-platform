@@ -172,9 +172,9 @@ class _Unaccounted(Exception):
 class OrderAuthority:
     """The only path from proposal to venue; one dispatch at a time per account.
 
-    `book_source` and `market_source` are trusted wiring (production: the state
-    engine's `executable_book` and a verified venue capability snapshot); callers of
-    `submit` can supply neither.
+    `book_source` and `market_source` are authority wiring. Separate verifiers must
+    establish committed book lineage and verified venue capabilities; missing or
+    failed verification refuses dispatch. Callers of `submit` can supply neither.
     """
 
     BOOK_MAX_AGE_US = 2_000_000
@@ -182,12 +182,20 @@ class OrderAuthority:
     def __init__(self, ledger, venue: VenuePort, *, book_source: Callable[[str], ExecutableBook | None],
                  market_source: Callable[[str], MarketRules],
                  entry_verifier: Callable[[OrderProposal, AccountView, ExecutableBook, MarketRules, int], bool],
-                 clock_us: Callable[[], int], reconciliation_source: Callable[[str], str] | None = None):
+                 clock_us: Callable[[], int], reconciliation_source: Callable[[str], str] | None = None,
+                 book_verifier: Callable[[ExecutableBook], bool] | None = None,
+                 market_capability_verifier: Callable[[MarketRules, int], bool] | None = None):
         self.ledger, self.venue, self.book_source, self.market_source = ledger, venue, book_source, market_source
         self.entry_verifier, self.clock_us = entry_verifier, clock_us
+        self.book_verifier, self.market_capability_verifier = book_verifier, market_capability_verifier
         self.reconciliation_source = reconciliation_source
         self._locks: dict[str, threading.Lock] = {}
         self._locks_guard = threading.Lock()
+        risk_config = getattr(ledger, "_risk_config", None)
+        if risk_config is not None and market_capability_verifier is not None:
+            limits, _, assess, boot_id = risk_config
+            ledger.configure_risk_checks(limits=limits, market=self._market_for_risk,
+                assess=assess, boot_id=boot_id)
 
     def _lock(self, account_id: str) -> threading.Lock:
         with self._locks_guard:
@@ -254,11 +262,35 @@ class OrderAuthority:
             self.ledger.invalidate_account(p.account_id)
 
     def _fresh_book(self, instrument: str, now: int) -> ExecutableBook | None:
-        book = self.book_source(instrument)
+        try:
+            book = self.book_source(instrument)
+            verified = (self.book_verifier is not None
+                and self.book_verifier(book) is True)
+        except Exception:
+            return None
         if (type(book) is not ExecutableBook or book.instrument != instrument
-                or not 0 <= now - book.observed_at_us <= self.BOOK_MAX_AGE_US):
+                or not 0 <= now - book.observed_at_us <= self.BOOK_MAX_AGE_US or not verified):
             return None
         return book
+
+    def _verified_market(self, instrument: str, now: int) -> MarketRules | None:
+        try:
+            market = self.market_source(instrument)
+            verified = (self.market_capability_verifier is not None
+                and self.market_capability_verifier(market, now) is True)
+        except Exception:
+            return None
+        if (type(market) is not MarketRules or market.instrument != instrument
+                or market.expires_at_us <= now or not market.spot_allowed
+                or not market.limit_ioc_verified or not verified):
+            return None
+        return market
+
+    def _market_for_risk(self, instrument: str) -> MarketRules:
+        market = self._verified_market(instrument, self.clock_us())
+        if market is None:
+            raise ContractViolation("verified market capability unavailable")
+        return market
 
     def submit(self, proposal: OrderProposal, *, decision: DecisionReference | None, request_id: str) -> IntentReceipt:
         """Admit, reserve, final-check and dispatch one proposal; never relaxes a refusal."""
@@ -273,20 +305,23 @@ class OrderAuthority:
             return self._receipt(request_id, ReceiptStatus.REJECTED, None, None, "BOOK_UNAVAILABLE")
         try:
             account = self.ledger.account_view(proposal.account_id)
-            market = self.market_source(proposal.instrument)
+            market = self._verified_market(proposal.instrument, self.clock_us())
+            if market is None:
+                return self._receipt(request_id, ReceiptStatus.REJECTED, None, None,
+                    "VERIFIED_MARKET_CAPABILITY_UNAVAILABLE")
             generation = self.ledger.connection.execute('SELECT generation FROM accounts WHERE account_id=?',
                 (proposal.account_id,)).fetchone()[0]
         except _REFUSALS + (TypeError, IndexError):
-            return self._receipt(request_id, ReceiptStatus.REJECTED, None, None, "ACCOUNT_OR_MARKET_UNAVAILABLE")
-        if type(market) is not MarketRules or market.instrument != proposal.instrument:
             return self._receipt(request_id, ReceiptStatus.REJECTED, None, None, "ACCOUNT_OR_MARKET_UNAVAILABLE")
         venue = getattr(self.venue, 'venue', None)
         expected_venue = self.ledger.connection.execute('SELECT venue FROM accounts WHERE account_id=?',
             (proposal.account_id,)).fetchone()[0]
         if ((account.mode is Mode.PAPER and venue != 'paper')
                 or (account.mode is Mode.LIVE and (venue != expected_venue or venue == 'paper'))
-                or account.mode is Mode.SHADOW):
+                or account.mode is Mode.SHADOW or market.venue != venue):
             return self._receipt(request_id, ReceiptStatus.REJECTED, None, None, "VENUE_MODE_MISMATCH")
+        if book.venue != market.venue:
+            return self._receipt(request_id, ReceiptStatus.REJECTED, None, None, "BOOK_MARKET_VENUE_MISMATCH")
         if not proposal.reducing_only and not self.entry_verifier(proposal, account, book, market, self.clock_us()):
             return self._receipt(request_id, ReceiptStatus.REJECTED, None, None, "ENTRY_SIZING_NOT_REPRODUCED")
         try:
@@ -310,6 +345,11 @@ class OrderAuthority:
         book = self._fresh_book(proposal.instrument, self.clock_us())
         if book is None:
             return self._refuse_undispatched(request_id, intent, "BOOK_STALE_AT_DISPATCH")
+        market = self._verified_market(proposal.instrument, self.clock_us())
+        if market is None:
+            return self._refuse_undispatched(request_id, intent, "MARKET_CAPABILITY_CHANGED_AT_DISPATCH")
+        if book.venue != market.venue or market.venue != venue:
+            return self._refuse_undispatched(request_id, intent, "BOOK_MARKET_VENUE_CHANGED_AT_DISPATCH")
         if not proposal.reducing_only:
             try:
                 # Reproduce economics against the book actually sent to the venue.
@@ -319,9 +359,7 @@ class OrderAuthority:
                 current = replace(current,
                     reservations=tuple(r for r in current.reservations if r.intent_id != intent.intent_id),
                     open_intent_ids=tuple(i for i in current.open_intent_ids if i != intent.intent_id))
-                market = self.market_source(proposal.instrument)
-                verified = (type(market) is MarketRules and market.instrument == proposal.instrument
-                    and self.entry_verifier(proposal, current, book, market, self.clock_us()))
+                verified = self.entry_verifier(proposal, current, book, market, self.clock_us())
             except _REFUSALS:
                 verified = False
             if not verified:
