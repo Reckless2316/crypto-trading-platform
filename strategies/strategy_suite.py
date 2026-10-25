@@ -5,6 +5,7 @@ module deliberately has no exchange or order-submission dependencies.
 """
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass
 import math
 import time
@@ -14,6 +15,11 @@ try:
     from prediction.markov_prototype import CryptoRegimeHMM
 except ImportError:  # Supports running this file directly from the strategies directory.
     from ..prediction.markov_prototype import CryptoRegimeHMM
+
+try:
+    from prediction.emission_model import classify_observation
+except ImportError:
+    from ..prediction.emission_model import classify_observation
 
 
 @dataclass(frozen=True)
@@ -260,3 +266,159 @@ def generate_signal(strategy_name: str, symbol: str, closes: list[float], **kwar
         return funcs[strategy_name](data, **kwargs)
     return strategy(data)
 
+
+class IncrementalBacktestSignal:
+    """Track the current long/flat decision without rebuilding candle prefixes."""
+
+    _WINDOWS = {
+        "bollinger_mean_reversion": 20,
+        "rsi_reversal": 15,
+        "donchian_breakout": 21,
+    }
+
+    def __init__(self, strategy_name: str, symbol: str):
+        if strategy_name not in STRATEGIES:
+            raise ValueError(f"Strategy is not implemented: {strategy_name}")
+        self.strategy_name = strategy_name
+        self.symbol = symbol
+        self.count = 0
+        self.closes = deque(maxlen=self._WINDOWS.get(strategy_name, 1))
+        self.highs = deque(maxlen=self._WINDOWS.get(strategy_name, 1))
+        self.lows = deque(maxlen=self._WINDOWS.get(strategy_name, 1))
+        self.previous_close: float | None = None
+        self.fast_seed: list[float] = []
+        self.slow_seed: list[float] = []
+        self.fast_ema: float | None = None
+        self.slow_ema: float | None = None
+        self.previous_ema_difference: float | None = None
+        self.macd_seed: list[float] = []
+        self.macd_signal: float | None = None
+        self.previous_macd_histogram: float | None = None
+        self.hmm = CryptoRegimeHMM() if strategy_name == "markov_regime" else None
+        self.hmm_scores: list[float] | None = None
+        self.wave_direction = 0
+        self.wave_extreme_index = 0
+        self.wave_extreme: float | None = None
+        self.wave_pivots = deque(maxlen=5)
+
+    def update(self, close: float, high: float, low: float) -> bool:
+        self.count += 1
+        self.closes.append(close)
+        self.highs.append(high)
+        self.lows.append(low)
+
+        if not self.symbol:
+            return False
+        if self.strategy_name in {"ema_12_26_crossover", "macd_crossover"}:
+            return self._update_ema(close)
+        if self.strategy_name == "markov_regime":
+            return self._update_markov(close)
+        if self.strategy_name == "elliott_wave_heuristic":
+            return self._update_elliott(close)
+        try:
+            return generate_signal(self.strategy_name, self.symbol, list(self.closes),
+                                   highs=list(self.highs), lows=list(self.lows))["direction"] == "long"
+        except (ValueError, TypeError):
+            return False
+
+    def _update_ema(self, close: float) -> bool:
+        if self.fast_ema is None:
+            self.fast_seed.append(close)
+            if len(self.fast_seed) == 12:
+                self.fast_ema = sum(self.fast_seed) / 12
+        else:
+            self.fast_ema = (2 / 13) * close + (1 - 2 / 13) * self.fast_ema
+
+        if self.slow_ema is None:
+            self.slow_seed.append(close)
+            if len(self.slow_seed) == 26:
+                self.slow_ema = sum(self.slow_seed) / 26
+        else:
+            self.slow_ema = (2 / 27) * close + (1 - 2 / 27) * self.slow_ema
+
+        if self.fast_ema is None or self.slow_ema is None:
+            return False
+        difference = self.fast_ema - self.slow_ema
+        is_long = (self.previous_ema_difference is not None
+                   and self.previous_ema_difference <= 0 < difference)
+        self.previous_ema_difference = difference
+
+        if self.strategy_name == "ema_12_26_crossover":
+            return is_long
+
+        if self.macd_signal is None:
+            self.macd_seed.append(difference)
+            if len(self.macd_seed) < 9:
+                return False
+            self.macd_signal = sum(self.macd_seed) / 9
+        else:
+            self.macd_signal = (2 / 10) * difference + (1 - 2 / 10) * self.macd_signal
+        histogram = difference - self.macd_signal
+        is_long = (self.previous_macd_histogram is not None
+                   and self.previous_macd_histogram <= 0 < histogram)
+        self.previous_macd_histogram = histogram
+        return is_long
+
+    def _update_markov(self, close: float) -> bool:
+        if self.previous_close is None:
+            self.previous_close = close
+            return False
+        change = (close / self.previous_close - 1) * 100
+        self.previous_close = close
+        model = self.hmm
+        symbol = classify_observation(change)
+        if self.hmm_scores is None:
+            self.hmm_scores = [
+                model._log(model.initial[i])
+                + model._log(model.emissions[state].get(symbol, 0.0))
+                for i, state in enumerate(model.states)
+            ]
+        else:
+            scores = self.hmm_scores
+            next_scores = []
+            for destination, state in enumerate(model.states):
+                candidates = [
+                    scores[source] + model._log(model.trans[source][destination])
+                    for source in range(len(model.states))
+                ]
+                best_source = max(range(len(candidates)), key=candidates.__getitem__)
+                next_scores.append(
+                    candidates[best_source] + model._log(model.emissions[state].get(symbol, 0.0))
+                )
+            self.hmm_scores = next_scores
+
+        current = model.states[max(range(len(self.hmm_scores)), key=self.hmm_scores.__getitem__)]
+        probabilities = model.predict_next_state_prob(model.states.index(current))
+        return probabilities.get("HU", 0.0) > probabilities.get("HD", 0.0)
+
+    def _update_elliott(self, close: float) -> bool:
+        if self.wave_extreme is None:
+            self.wave_extreme = close
+            return False
+
+        deviation = 0.005
+        if self.wave_direction == 0:
+            if close >= self.wave_extreme * (1 + deviation):
+                self.wave_direction, self.wave_extreme_index, self.wave_extreme = 1, self.count - 1, close
+            elif close <= self.wave_extreme * (1 - deviation):
+                self.wave_direction, self.wave_extreme_index, self.wave_extreme = -1, self.count - 1, close
+        elif self.wave_direction > 0:
+            if close > self.wave_extreme:
+                self.wave_extreme_index, self.wave_extreme = self.count - 1, close
+            elif close <= self.wave_extreme * (1 - deviation):
+                self.wave_pivots.append(self.wave_extreme)
+                self.wave_direction, self.wave_extreme_index, self.wave_extreme = -1, self.count - 1, close
+        else:
+            if close < self.wave_extreme:
+                self.wave_extreme_index, self.wave_extreme = self.count - 1, close
+            elif close >= self.wave_extreme * (1 + deviation):
+                self.wave_pivots.append(self.wave_extreme)
+                self.wave_direction, self.wave_extreme_index, self.wave_extreme = 1, self.count - 1, close
+
+        if self.count < 7:
+            return False
+        values = [*self.wave_pivots, self.wave_extreme]
+        if len(values) < 5:
+            return False
+        vals = values[-5:]
+        return vals[0] < vals[2] < vals[4] and vals[1] < vals[3]
