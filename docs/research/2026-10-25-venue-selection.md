@@ -12,10 +12,14 @@ US-accessible exchange on the list. It has a working trading API (CCXT `okxus`, 
 verified live today), and the operator already has an OKX account and keys. It is now the
 default `SURGE_LIVE_EXCHANGE`. Live trading stays disabled and unarmed.
 
-**Two caveats that could change the answer:**
+**Confirmed against the operator's account (2026-10-25).** The operator is in Colorado, which OKX
+US serves. Their API key authenticates on `us.okx.com`, and OKX's trade-fee endpoint reports tier
+**Lv1: 0.20% maker, 0.35% taker** for BTC-USDT, matching the schedule below.
 
-1. **OKX US does not serve New York, Texas or US territories.** If the operator lives there,
-   the fallback is Kraken (spot).
+**Caveats that could change the answer:**
+
+1. **OKX US does not serve New York, Texas or US territories.** A move to one of those would
+   make Kraken (spot) the fallback.
 2. **US-regulated perpetual futures are 10–100× cheaper than any US spot market**, but they are
    futures, not spot (see the table). Kraken Derivatives US charges about $0.0113 per 0.01 BTC
    contract per side, roughly 0.0014%. That makes it the lowest-fee US venue overall. But no
@@ -34,7 +38,7 @@ by default. VIP 1 (0.10% / 0.20%) roughly halves costs.
 
 | Venue | Product | Maker | Taker | Trading API | Source |
 |---|---|---|---|---|---|
-| **OKX US** | spot | **0.20%** | **0.35%** | yes (`okxus`) | OKX US schedule dated 2026-09-15, as reported by [CryptoSlate](https://cryptoslate.com/crypto-exchanges/okx-us-exchange-review/); VIP 1 0.10/0.20, VIP 9 −0.005/0.015. Stablecoin pairs differ ([OKX notice](https://www.okx.com/en-us/help/notice-fee-update-for-usdt-usd-usdg-usdt-rlusd-usdt-effective-sept-1)) |
+| **OKX US** | spot | **0.20%** | **0.35%** | yes (`okxus`) | **Confirmed by the operator's account (trade-fee API, tier Lv1).** OKX US schedule dated 2026-09-15, as reported by [CryptoSlate](https://cryptoslate.com/crypto-exchanges/okx-us-exchange-review/); VIP 1 0.10/0.20, VIP 9 −0.005/0.015. Stablecoin pairs differ ([OKX notice](https://www.okx.com/en-us/help/notice-fee-update-for-usdt-usd-usdg-usdt-rlusd-usdt-effective-sept-1)) |
 | Kraken | spot | 0.40% | 0.80% | yes | [Kraken fee schedule](https://www.kraken.com/features/fee-schedule) (official): $0+ tier; 0.22/0.38 from $10K; 0/0.10 from $10M |
 | Kraken Derivatives US | perps (Bitnomial) | ≈0.0014% | ≈0.0014% | **not documented** | [Kraken US futures fees](https://support.kraken.com/articles/us-futures-fees): $0.0113/contract/side all-in; [contract specs](https://support.kraken.com/articles/contract-specifications): BTC 0.01, ETH 0.5, SOL 5. Launched 2026-06-15 ([CoinDesk](https://www.coindesk.com/markets/2026/06/15/kraken-debuts-u-s-perpetual-futures-as-crypto-derivatives-move-onshore)) |
 | Coinbase (Advanced) | spot | ~0.50% | ~0.90% | yes | Not confirmed from Coinbase (pages refuse automated fetches). Newest reviews say 0.50/0.90 ([Altrady](https://www.altrady.com/blog/crypto-trading-platforms/coinbase-advanced-trade)); older ones say 0.40/0.60 |

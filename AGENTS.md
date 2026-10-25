@@ -36,11 +36,13 @@ The operator has an OKX account and API keys. **OKX US (CCXT `okxus`, `us.okx.co
 primary trading venue** (`SURGE_LIVE_EXCHANGE=okxus`). It is the lowest-fee US-accessible exchange
 on the operator's source list that has a trading API; see
 `docs/research/2026-10-25-venue-selection.md`. It is spot only and excludes NY, TX and US
-territories. Build and test with that in mind:
+territories; the operator is in Colorado. Their key was verified on 2026-10-25: it is valid on
+`us.okx.com` only (the global host answers "API key doesn't exist"). It has `read_only,trade`
+permissions, no withdraw, and fee tier Lv1 (0.20% maker / 0.35% taker). Build and test with that in mind:
 
 - **Secrets stay out of the repo.** Keys belong only in the local, gitignored `.env`, as
   `SURGE_OKX_API_KEY`, `SURGE_OKX_API_SECRET` and `SURGE_OKX_API_PASSPHRASE` (see `.env.example`).
-  As of 2026-10-25 the main checkout's `.env` does not contain them yet. Never commit, log, print
+  They are in the main checkout's `.env` (mode 600). Never commit, log, print
   or echo key values. Never ask the operator to paste keys into a chat. If code needs them, read
   them from the environment.
 - **Key permissions:** Read + Trade only, never Withdraw, with an IP allowlist where possible.
@@ -59,7 +61,8 @@ territories. Build and test with that in mind:
 
 ## Data sources
 
-`data/sources/` registers all 38 sources from the operator's API-status list
+`data/sources/` registers all 36 sources from the operator's API-status list ("Bentley" and
+"Market Intel Feed" are labels on it, not sources)
 (`python -m data.sources status`, dashboard panel, `docs/DATA_SOURCES.md`). Add a new source as a
 `Source` entry with a probe, and add a test that uses a fake session. Tests must not touch the
 network. Never route around a geo-block; use Coinalyze or the Binance archive instead.
