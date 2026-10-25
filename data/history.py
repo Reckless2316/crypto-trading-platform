@@ -33,7 +33,8 @@ class CandleHistoryStore:
                 open REAL NOT NULL, high REAL NOT NULL, low REAL NOT NULL,
                 close REAL NOT NULL, volume REAL NOT NULL, fetched_at_ms INTEGER NOT NULL,
                 PRIMARY KEY(exchange, symbol, timeframe, ts_open))""")
-            db.execute("CREATE INDEX IF NOT EXISTS idx_history_lookup ON candle_history(exchange,symbol,timeframe,ts_open)")
+            # The primary key already serves every lookup; a duplicate index only slows writes.
+            db.execute("DROP INDEX IF EXISTS idx_history_lookup")
             db.commit()
 
     def _connect(self):
