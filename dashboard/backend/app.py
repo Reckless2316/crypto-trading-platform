@@ -396,29 +396,41 @@ async def observe_requests(request: Request, call_next):
                     "method": request.method, "path": path, "status": status_code, "ms": round(ms, 1)})
 
 
-@app.get("/api/observability")
-def observability():
-    """Plain-language health, traffic and recent-event snapshot for the dashboard."""
-    db_ok, candles = True, 0
+def _stored_candle_count() -> tuple[bool, int]:
+    """Exchange-aware history plus legacy Coinbase rows that history does not already mirror."""
     try:
         with closing(db()) as con:
             con.execute("SELECT 1").fetchone()
             try:
-                candles = con.execute("SELECT COUNT(*) FROM candles").fetchone()[0]
-            except sqlite3.OperationalError:
-                candles = 0
+                history = con.execute("SELECT COUNT(*) FROM candle_history").fetchone()[0]
+                legacy = con.execute("""SELECT COUNT(*) FROM candles c WHERE NOT EXISTS (
+                    SELECT 1 FROM candle_history h WHERE h.exchange='coinbase' AND h.symbol=c.symbol
+                    AND h.timeframe=c.timeframe AND h.ts_open=c.ts_open)""").fetchone()[0]
+            except sqlite3.OperationalError:   # candle_history is created on first exchange fetch
+                history = 0
+                legacy = con.execute("SELECT COUNT(*) FROM candles").fetchone()[0]
+            return True, history + legacy
     except sqlite3.Error:
-        db_ok = False
+        return False, 0
+
+
+@app.get("/api/observability")
+async def observability():
+    """Plain-language health, traffic and recent-event snapshot for the dashboard."""
+    # Async on purpose: the middleware mutates _OBS_ROUTES on the event loop, so reading it here
+    # (not in a worker thread) cannot race. Only the SQLite read is moved off the loop.
     routes = [{"path": path, "count": r["count"], "errors": r["errors"],
                "avg_ms": round(r["total_ms"] / r["count"], 1), "max_ms": round(r["max_ms"], 1)}
               for path, r in _OBS_ROUTES.items()]
+    events = list(_OBS_EVENTS)[:20]
+    db_ok, candles = await asyncio.to_thread(_stored_candle_count)
     routes.sort(key=lambda r: r["count"], reverse=True)
     total = sum(r["count"] for r in routes)
     errors = sum(r["errors"] for r in routes)
     collector = getattr(app.state, "market_data", {"last_success": None, "candles": 0, "error": None})
     return {"uptime_seconds": int(time.time() - _OBS_STARTED), "database": "ok" if db_ok else "down",
             "stored_candles": candles, "collector": collector, "requests": total, "errors": errors,
-            "routes": routes[:10], "events": list(_OBS_EVENTS)[:20], "mode": "paper"}
+            "routes": routes[:10], "events": events, "mode": "paper"}
 
 
 @app.get("/")

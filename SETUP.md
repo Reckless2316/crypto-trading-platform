@@ -33,7 +33,20 @@ The **Quick start** box walks you through it:
 1. **Get prices** downloads candles from the selected exchange.
 2. **Ask a strategy** shows the current signal. It is not advice.
 3. **Test on history** backtests the strategy on stored candles.
-4. **Arm paper trading** asks for an approved release hash, then allows simulated orders for 30 minutes.
+4. **Arm paper trading** needs the authenticated authority setup (below). With the plain
+   launch command above, it returns "Operator session required".
+
+## Paper controls need the authority
+
+The plain `uvicorn` launch is a read-and-research dashboard. **Arm, disarm, kill, flatten and
+paper orders** go through a separate authority process with an operator session. Without one,
+they answer `401 Operator session required` by design. To use them, start the paper runtime and
+launch the dashboard through the authority launcher, as described in
+[docs/runbooks/autonomous-paper.md](docs/runbooks/autonomous-paper.md):
+
+```sh
+.venv/bin/python -m dashboard.launch --runtime-dir <runtime dir> --session-file <issued session file> --port 8000
+```
 
 ## Is it working?
 - **Observability** shows server health, request counts and recent errors. It refreshes every
@@ -47,7 +60,9 @@ The **Quick start** box walks you through it:
 - The web dashboard refuses to start if exchange **trading** keys are in its environment. It
   needs none to run.
 - Exchange keys should have Read + Trade permission only, never Withdraw.
-- The red **Kill switch** blocks new paper orders.
+- The red **Kill switch** blocks new paper orders. It needs the authority setup above. Without it,
+  the paper runtime can still be stopped by writing a `STOP` or `KILL` file in its data directory
+  (the Operator deck buttons do this).
 
 ## Stuck?
 - `command not found`: Python isn't installed or isn't on your PATH.

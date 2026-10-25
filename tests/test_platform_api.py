@@ -67,6 +67,13 @@ class PlatformApiTests(unittest.TestCase):
         self.assertIn("/health", paths)
         self.assertLessEqual(len(platform_app._OBS_ROUTES), 3)   # 30 random URLs did not add 30 keys
 
+    def test_observability_counts_history_and_legacy_candles_once(self):
+        from data.history import CandleHistoryStore
+        legacy = self.seed_candles(count=10)                       # legacy Coinbase table
+        CandleHistoryStore(self.db_path).save("coinbase", "BTC-USD", "1h", legacy[:4])   # mirrored: not double-counted
+        CandleHistoryStore(self.db_path).save("okx", "BTC-USDT", "1h", legacy[:3])       # history-only
+        self.assertEqual(self.client.get("/api/observability").json()["stored_candles"], 10 + 3)
+
     def test_sources_registry_reads_store_without_network(self):
         with patch.object(platform_app, "probe_all", side_effect=AssertionError("GET must not probe")):
             body = self.client.get("/api/sources").json()
