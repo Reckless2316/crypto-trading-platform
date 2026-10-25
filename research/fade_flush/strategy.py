@@ -12,7 +12,8 @@ from bisect import bisect_left, bisect_right
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 
-from .data import FIVE_MIN_MS, Series
+from data.binance_archive import FIVE_MIN_MS, Series
+from data.event_backtest import Bracket, CostModel, simulate_bracket
 
 M15 = 900_000
 H1 = 3_600_000
@@ -411,41 +412,11 @@ def simulate(sig: Signal, b15: Bars, funding: FundingIndex, params: Params) -> T
     if risk / entry < params.cost_gate_mult * params.round_trip_cost(sig.symbol):
         return "cost_gate"
 
-    one_r = entry + d * risk
-    touched = False
-    exit_fee = params.taker_fee
-    k = k0
-    last = min(len(b15.ts) - 1, k0 + params.max_hold_bars - 1)
-    while True:
-        o, h, l, c = b15.open[k], b15.high[k], b15.low[k], b15.close[k]
-        adverse, favorable = (l, h) if d == 1 else (h, l)
-        if (adverse - stop) * d <= 0:  # stop first when both are inside one bar
-            fill = stop if (o - stop) * d > 0 else o
-            exit_px, exit_reason = fill * (1 - d * slip), "stop"
-            break
-        if (favorable - target) * d > 0:
-            exit_px, exit_reason, exit_fee = target, "target", params.maker_fee
-            break
-        touched = touched or (favorable - one_r) * d >= 0
-        held = k - k0 + 1
-        if held >= params.max_hold_bars:
-            exit_px, exit_reason = c * (1 - d * slip), "max_hold"
-            break
-        if held >= params.time_stop_bars and not touched:
-            exit_px, exit_reason = c * (1 - d * slip), "time_stop"
-            break
-        if k + 1 > last or b15.ts[k + 1] != b15.ts[k] + M15:
-            exit_px, exit_reason = c * (1 - d * slip), "data_gap"
-            break
-        k += 1
-    exit_ts = b15.ts[k] + M15
-    gross = (exit_px - entry) * d          # slippage is already in both fill prices
-    fees = params.taker_fee * entry + exit_fee * exit_px
-    fund = d * funding.paid(entry_ts, exit_ts) * entry
-    return Trade(sig.symbol, sig.side, sig.signal_ts, entry_ts, exit_ts, entry, stop, target, target_r,
-                 risk / entry, exit_px, exit_reason, gross / risk, -fees / risk, -fund / risk,
-                 (gross - fees - fund) / risk, sig.flush, sig.crowd, sig.oi_z, sig.f_rank, sig.pen_atr,
-                 sig.level_source)
+    fill = simulate_bracket(b15, Bracket(sig.side, k0, stop, target, params.time_stop_bars, params.max_hold_bars),
+                            CostModel(params.taker_fee, params.maker_fee, slip), M15, funding.paid)
+    return Trade(sig.symbol, sig.side, sig.signal_ts, fill.entry_ts, fill.exit_ts, fill.entry, stop, target, target_r,
+                 risk / entry, fill.exit_price, fill.exit_reason, fill.gross_r, fill.fee_r, fill.funding_r,
+                 fill.net_r, sig.flush, sig.crowd, sig.oi_z, sig.f_rank, sig.pen_atr, sig.level_source)
 
 
 def run_symbol(series: Series, params: Params = Params()) -> tuple[list[Trade], dict[str, int], int]:

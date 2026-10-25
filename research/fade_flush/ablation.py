@@ -18,7 +18,8 @@ from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .data import DEFAULT_CACHE, SYMBOLS, load
+from data.binance_archive import DEFAULT_CACHE, SYMBOLS, load
+from research.trade_stats import clustered_ci, concentration as _concentration, mean_r as _mean_r, random_subset_test
 from .strategy import Params, Trade, run_symbol
 
 OOS_START = int(datetime(2024, 1, 1, tzinfo=timezone.utc).timestamp() * 1000)
@@ -48,28 +49,6 @@ def _month(ts: int) -> str:
     return _day(ts)[:7]
 
 
-def _clustered(trades: list[Trade], rng: random.Random, stat):
-    """Day-clustered bootstrap 95% CI of stat(list of trades)."""
-    by_day = defaultdict(list)
-    for t in trades:
-        by_day[_day(t.entry_ts)].append(t)
-    days = list(by_day.values())
-    if len(days) < 2:
-        return None
-    draws = []
-    for _ in range(BOOT):
-        sample = [t for _ in days for t in days[rng.randrange(len(days))]]
-        value = stat(sample)
-        if value is not None:
-            draws.append(value)
-    draws.sort()
-    return [draws[int(0.025 * len(draws))], draws[int(0.975 * len(draws)) - 1]]
-
-
-def _mean_r(trades):
-    return statistics.fmean(t.net_r for t in trades) if trades else None
-
-
 def summarize(trades: list[Trade], rng: random.Random) -> dict:
     if not trades:
         return {"n": 0}
@@ -81,7 +60,7 @@ def summarize(trades: list[Trade], rng: random.Random) -> dict:
         exits[t.exit_reason] += 1
     return {
         "n": len(r), "mean_r": statistics.fmean(r), "median_r": statistics.median(r),
-        "mean_r_ci95": _clustered(trades, rng, _mean_r), "total_r": sum(r),
+        "mean_r_ci95": clustered_ci(trades, _mean_r, rng, reps=BOOT), "total_r": sum(r),
         "win_rate": len(wins) / len(r),
         "profit_factor": sum(wins) / sum(losses) if losses and sum(losses) else None,
         "mean_gross_r": statistics.fmean(t.gross_r for t in trades),
@@ -101,33 +80,12 @@ def breakdown(trades: list[Trade], key) -> dict:
 
 
 def concentration(trades: list[Trade]) -> dict:
-    total = sum(t.net_r for t in trades)
-    out = {"total_r": total}
-    for name, key in (("symbol", lambda t: t.symbol), ("month", lambda t: _month(t.entry_ts))):
-        sums = defaultdict(float)
-        for t in trades:
-            sums[key(t)] += t.net_r
-        top = max(sums.items(), key=lambda kv: kv[1]) if sums else (None, 0.0)
-        out[f"top_{name}"] = top[0]
-        out[f"top_{name}_share"] = top[1] / total if total > 0 else None
-    return out
+    return _concentration(trades, {"symbol": lambda t: t.symbol, "month": lambda t: _month(t.entry_ts)})
 
 
 def filter_test(base: list[Trade], subset: list[Trade], rng: random.Random) -> dict:
     """Is the filtered subset better than random subsets of the base of the same size?"""
-    if not subset or len(subset) >= len(base):
-        return {"n_subset": len(subset)}
-    base_r = [t.net_r for t in base]
-    target = _mean_r(subset)
-    k = len(subset)
-    hits = sum(statistics.fmean(rng.sample(base_r, k)) >= target for _ in range(PERM))
-    ids = {id(t) for t in subset}
-
-    def diff(sample):
-        sub = [t for t in sample if id(t) in ids]
-        return _mean_r(sub) - _mean_r(sample) if sub else None
-    return {"n_subset": k, "diff_mean_r": target - _mean_r(base), "diff_ci95": _clustered(base, rng, diff),
-            "perm_p": (hits + 1) / (PERM + 1)}
+    return random_subset_test(base, subset, rng, reps=PERM, ci_reps=BOOT)
 
 
 def portfolio(trades: list[Trade]) -> dict:

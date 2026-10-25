@@ -1,7 +1,7 @@
 import random
 import unittest
 
-from research.fade_flush.data import Series
+from data.binance_archive import Series
 from research.fade_flush.strategy import (DAY, H1, M15, FundingIndex, Params, build_bars, detect,
                                           simulate, wilder_atr)
 

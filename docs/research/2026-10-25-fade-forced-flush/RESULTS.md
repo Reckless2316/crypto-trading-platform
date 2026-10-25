@@ -65,5 +65,5 @@ sweep as a breakout instead) is a **new hypothesis**. It needs its own pre-regis
 data it was not designed on, such as forward paper trading from 2026-10 or a different venue's
 history.
 
-Reproduce: `python3 -m research.fade_flush.data` (one-time download, about 550 MB), then
+Reproduce: `python3 -m data.binance_archive download` (one-time download, about 550 MB), then
 `python3 -m research.fade_flush.ablation`.

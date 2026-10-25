@@ -1,5 +1,8 @@
 """Download and load Binance USD-M futures history from the public data.binance.vision archive.
 
+    python -m data.binance_archive download --symbols BTCUSDT,ETHUSDT --start 2024-01-01
+    python -m data.binance_archive import --symbols BTCUSDT --timeframe 1h   # into the dashboard's candle store
+
 Three series per symbol, all public and credential-free:
 - 5m klines (monthly zips)
 - 5m open-interest snapshots from the "metrics" files (daily zips); OI is in coin units,
@@ -25,7 +28,8 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 BASE = "https://data.binance.vision/data/futures/um"
-DEFAULT_CACHE = Path(__file__).resolve().parents[2] / "data" / "cache" / "binance-vision"
+DEFAULT_CACHE = Path(__file__).resolve().parents[1] / "data" / "cache" / "binance-vision"
+ARCHIVE_EXCHANGE = "binance-usdm-archive"   # exchange name used in CandleHistoryStore
 SYMBOLS = ("BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT", "DOGEUSDT",
            "ADAUSDT", "AVAXUSDT", "LINKUSDT", "LTCUSDT", "DOTUSDT", "BCHUSDT")
 FIVE_MIN_MS = 300_000
@@ -144,14 +148,49 @@ def load(symbol: str, cache: Path = DEFAULT_CACHE) -> Series:
                   oi_ts, [oi[t] for t in oi_ts], f_ts, [funding[t] for t in f_ts])
 
 
+def candles(series: Series, timeframe: str = "5m"):
+    """The archive's 5m bars as platform Candles, aggregated to `timeframe` (complete buckets only)."""
+    from .collectors.collector_base import Candle
+    from .history import TIMEFRAME_MS
+    step = TIMEFRAME_MS[timeframe]
+    if step % FIVE_MIN_MS:
+        raise ValueError("timeframe must be a multiple of 5m")
+    need = step // FIVE_MIN_MS
+    out = []
+    i = 0
+    while i < len(series.ts):
+        bucket = series.ts[i] - series.ts[i] % step
+        j = i
+        while j < len(series.ts) and series.ts[j] - series.ts[j] % step == bucket:
+            j += 1
+        if j - i == need:
+            # Archive files carry volume, but Series keeps prices only; imported volume is 0.
+            out.append(Candle(series.open[i], max(series.high[i:j]), min(series.low[i:j]), series.close[j - 1],
+                              0.0, bucket, bucket + step))
+        i = j
+    return out
+
+
+def import_to_store(symbol: str, timeframe: str, db_path: Path, cache: Path = DEFAULT_CACHE) -> int:
+    from .history import CandleHistoryStore
+    return CandleHistoryStore(db_path).save(ARCHIVE_EXCHANGE, symbol, timeframe, candles(load(symbol, cache), timeframe))
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("command", nargs="?", default="download", choices=["download", "import"])
     parser.add_argument("--symbols", default=",".join(SYMBOLS))
     parser.add_argument("--start", default="2021-01-01")
     parser.add_argument("--end", default="2026-09-30")
     parser.add_argument("--cache", type=Path, default=DEFAULT_CACHE)
     parser.add_argument("--workers", type=int, default=16)
+    parser.add_argument("--timeframe", default="1h", help="import: candle size to store")
+    parser.add_argument("--db", type=Path, default=Path(__file__).resolve().parents[1] / "data" / "surge.sqlite3")
     args = parser.parse_args()
+    if args.command == "import":
+        for symbol in args.symbols.split(","):
+            print(symbol, import_to_store(symbol, args.timeframe, args.db, args.cache), "candles ->", args.db)
+        return
     counts = download(args.symbols.split(","), date.fromisoformat(args.start), date.fromisoformat(args.end),
                       args.cache, args.workers)
     print(json.dumps(counts))
