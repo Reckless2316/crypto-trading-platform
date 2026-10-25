@@ -1,10 +1,17 @@
 import tempfile
+import math
+import time
 import unittest
 from pathlib import Path
 
 from data.backtesting import BacktestEngine, _ema, ema_crossover_signal, markov_momentum_signal
 from data.collectors.collector_base import Candle, Collector
 from data.history import CandleHistoryStore, ExchangeHistory
+from strategies.strategy_suite import (
+    STRATEGY_CATALOG,
+    IncrementalBacktestSignal,
+    generate_signal,
+)
 
 
 def candle(ts, price):
@@ -109,6 +116,41 @@ class BacktestTests(unittest.TestCase):
 
         BacktestEngine().run(bars, probe)
         self.assertEqual(seen, list(range(1, len(bars))))
+
+    def test_incremental_catalog_signals_match_full_prefix_backtests(self):
+        bars = []
+        for index in range(3000):
+            price = 100 + index * 0.02 + 3 * math.sin(index * 0.09) + 5 * math.sin(index * 0.017)
+            bars.append(Candle(price, price + 1, price - 1, price, 1, index * 60_000, (index + 1) * 60_000))
+
+        for entry in STRATEGY_CATALOG:
+            strategy = entry["name"]
+
+            def full_prefix_signal(prefix):
+                try:
+                    signal = generate_signal(strategy, "BTC-USD",
+                        [float(c.close) for c in prefix],
+                        highs=[float(c.high) for c in prefix],
+                        lows=[float(c.low) for c in prefix])
+                    return signal["direction"] == "long"
+                except (ValueError, TypeError):
+                    return False
+
+            incremental = IncrementalBacktestSignal(strategy, "BTC-USD")
+            optimized = BacktestEngine().run(
+                bars, lambda prefix: incremental.update(prefix[-1].close, prefix[-1].high, prefix[-1].low))
+            reference = BacktestEngine().run(bars, full_prefix_signal)
+            self.assertEqual(optimized, reference, strategy)
+
+    def test_twenty_thousand_candle_ema_backtest_is_bounded(self):
+        bars = [candle(index * 60_000, 100 + index * 0.001 + math.sin(index / 20))
+                for index in range(20_000)]
+        signal = IncrementalBacktestSignal("ema_12_26_crossover", "BTC-USD")
+
+        started = time.perf_counter()
+        BacktestEngine().run(
+            bars, lambda prefix: signal.update(prefix[-1].close, prefix[-1].high, prefix[-1].low))
+        self.assertLess(time.perf_counter() - started, 10)
 
 
 if __name__ == "__main__":

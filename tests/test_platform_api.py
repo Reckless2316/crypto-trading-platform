@@ -144,6 +144,19 @@ class PlatformApiTests(unittest.TestCase):
         self.assertIn("Historical simulation only", body["caveat"])
         self.assertEqual(self.order_count(), 0)
 
+    def test_backtest_rejects_histories_over_the_candle_limit(self):
+        self.seed_candles(count=3)
+        with closing(platform_app.db()) as con:
+            con.execute("DELETE FROM candle_history")
+            con.commit()
+
+        with patch.object(platform_app, "MAX_BACKTEST_CANDLES", 2):
+            response = self.client.post("/api/backtest", json={"exchange": "coinbase", "symbol": "BTC-USD",
+                                                               "timeframe": "1h", "strategy": "ema_12_26_crossover"})
+
+        self.assertEqual(response.status_code, 413, response.text)
+        self.assertIn("limited to 2 candles", response.json()["detail"])
+
     def test_dashboard_cannot_fill_paper_orders(self):
         self.seed_candles()
         with closing(platform_app.db()) as con:

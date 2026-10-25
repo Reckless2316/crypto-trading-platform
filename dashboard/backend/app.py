@@ -31,7 +31,12 @@ from data.collectors.collector_base import Candle
 from data.history import CandleHistoryStore, ExchangeHistory
 from research.autonomous.status_cards import candidate_cards
 from data.backtesting import BacktestEngine
-from strategies.strategy_suite import STRATEGY_CATALOG, STRATEGIES, generate_signal
+from strategies.strategy_suite import (
+    STRATEGY_CATALOG,
+    STRATEGIES,
+    IncrementalBacktestSignal,
+    generate_signal,
+)
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -42,6 +47,7 @@ MAX_POSITION_PCT = 5.0
 MAX_DAILY_LOSS_PCT = 3.0
 MAX_OPEN_POSITIONS = 3
 FEE_RATE = 0.001
+MAX_BACKTEST_CANDLES = 100_000
 FRONTEND = ROOT / "dashboard" / "frontend" / "index.html"
 
 app = FastAPI(title="SURGE Crypto Trading Platform", version="1.1.0")
@@ -762,8 +768,10 @@ def run_backtest(request: BacktestRequest):
     if request.exchange not in STORED_EXCHANGES:
         raise HTTPException(status_code=422, detail="Unsupported exchange")
     try:
-        candles = CandleHistoryStore(DB_FILE).load(request.exchange, request.symbol, request.timeframe,
-                                                  request.start_ms, request.end_ms)
+        now_ms = int(time.time() * 1000)
+        candles = CandleHistoryStore(DB_FILE).load(
+            request.exchange, request.symbol, request.timeframe, request.start_ms, request.end_ms,
+            limit=MAX_BACKTEST_CANDLES + 1, closed_before_ms=now_ms)
         if not candles and request.exchange == "coinbase":
             with closing(db()) as con:
                 query = "SELECT ts_open,open,high,low,close,volume FROM candles WHERE symbol=? AND timeframe=?"
@@ -772,25 +780,26 @@ def run_backtest(request: BacktestRequest):
                     query += " AND ts_open>=?"; params.append(request.start_ms)
                 if request.end_ms is not None:
                     query += " AND ts_open<?"; params.append(request.end_ms)
-                query += " ORDER BY ts_open"
                 step_ms = {"1m":60_000,"5m":300_000,"15m":900_000,"1h":3_600_000,"4h":14_400_000,"1d":86_400_000}.get(request.timeframe, 3_600_000)
+                query += " AND ts_open<=? ORDER BY ts_open LIMIT ?"
+                params.extend((now_ms - step_ms, MAX_BACKTEST_CANDLES + 1))
                 candles = [Candle(float(r["open"]), float(r["high"]), float(r["low"]), float(r["close"]),
                                   float(r["volume"]), int(r["ts_open"]), int(r["ts_open"]) + step_ms)
                            for r in con.execute(query, params).fetchall()]
-        candles = [c for c in candles if c.ts_close <= int(time.time() * 1000)]
+        candles = [c for c in candles if c.ts_close <= now_ms]
         if not candles:
             raise HTTPException(status_code=409, detail="No stored candle history matches this backtest")
+        if len(candles) > MAX_BACKTEST_CANDLES:
+            raise HTTPException(status_code=413,
+                                detail=f"Backtests are limited to {MAX_BACKTEST_CANDLES:,} candles")
         if request.strategy not in {entry["name"] for entry in STRATEGY_CATALOG}:
             raise HTTPException(status_code=422, detail="Unknown strategy")
 
+        signal_state = IncrementalBacktestSignal(request.strategy, request.symbol)
+
         def target_long(prefix):
-            try:
-                signal = generate_signal(request.strategy, request.symbol,
-                    [float(c.close) for c in prefix], highs=[float(c.high) for c in prefix],
-                    lows=[float(c.low) for c in prefix])
-                return signal["direction"] == "long"
-            except (ValueError, TypeError):
-                return False
+            candle = prefix[-1]
+            return signal_state.update(float(candle.close), float(candle.high), float(candle.low))
 
         result = BacktestEngine(request.initial_cash, request.fee_rate).run(candles, target_long, request.symbol)
         return {"exchange": request.exchange, "symbol": request.symbol, "timeframe": request.timeframe,

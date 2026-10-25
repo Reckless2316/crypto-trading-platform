@@ -57,7 +57,8 @@ class CandleHistoryStore:
         return len(rows)
 
     def load(self, exchange: str, symbol: str, timeframe: str,
-             start_ms: Optional[int] = None, end_ms: Optional[int] = None, limit: Optional[int] = None) -> list[Candle]:
+             start_ms: Optional[int] = None, end_ms: Optional[int] = None, limit: Optional[int] = None,
+             closed_before_ms: Optional[int] = None) -> list[Candle]:
         """Candles ascending by open time; with ``limit``, only the most recent N."""
         sql = "SELECT open,high,low,close,volume,ts_open,ts_close FROM candle_history WHERE exchange=? AND symbol=? AND timeframe=?"
         params: list[object] = [exchange, symbol, timeframe]
@@ -65,6 +66,8 @@ class CandleHistoryStore:
             sql += " AND ts_open>=?"; params.append(int(start_ms))
         if end_ms is not None:
             sql += " AND ts_open<?"; params.append(int(end_ms))
+        if closed_before_ms is not None:
+            sql += " AND ts_close<=?"; params.append(int(closed_before_ms))
         if limit is None:
             sql += " ORDER BY ts_open"
         else:
