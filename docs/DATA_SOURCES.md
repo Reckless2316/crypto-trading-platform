@@ -15,7 +15,7 @@ The dashboard's **API status** panel shows the latest snapshot for each source, 
 **Probe all sources** button refreshes them. The web service also snapshots every source every
 15 minutes (`SURGE_SOURCES_INTERVAL`, in seconds; `0` turns it off).
 
-## Status on 2026-10-25, probed from a US IP (Colorado)
+## Status on 2026-10-25, probed from a US IP
 
 The list has 36 sources. "Bentley" and "Market Intel Feed" are labels on it, not sources.
 **35 of 36 work** once `COINALYZE_API_KEY` is set. Without it, 33 work.

@@ -37,7 +37,7 @@ Create the OKX key with Read + Trade permissions only (never Withdraw) and test 
 
 The platform's primary trading venue is **OKX US** (CCXT `okxus`, `SURGE_LIVE_EXCHANGE=okxus`). It is
 the cheapest US-accessible exchange on the source list for spot. It excludes New York, Texas and US
-territories; the operator is in Colorado. US-regulated perps on Kraken are far cheaper but have no documented API yet.
+territories. US-regulated perps on Kraken are far cheaper but have no documented API yet.
 The operator's account is fee tier Lv1, confirmed through the API: 0.20% maker and 0.35% taker.
 Prefer limit orders and low-turnover strategies. Reasoning, fee tables and sources:
 [docs/research/2026-10-25-venue-selection.md](docs/research/2026-10-25-venue-selection.md). Live trading
