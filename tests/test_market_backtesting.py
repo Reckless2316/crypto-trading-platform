@@ -1,5 +1,6 @@
 import tempfile
 import math
+import random
 import time
 import unittest
 from pathlib import Path
@@ -118,11 +119,21 @@ class BacktestTests(unittest.TestCase):
         self.assertEqual(seen, list(range(1, len(bars))))
 
     def test_incremental_catalog_signals_match_full_prefix_backtests(self):
-        bars = []
+        smooth = []
         for index in range(3000):
             price = 100 + index * 0.02 + 3 * math.sin(index * 0.09) + 5 * math.sin(index * 0.017)
-            bars.append(Candle(price, price + 1, price - 1, price, 1, index * 60_000, (index + 1) * 60_000))
+            smooth.append(Candle(price, price + 1, price - 1, price, 1, index * 60_000, (index + 1) * 60_000))
+        # A seeded high-volatility random walk with uneven ranges exercises the Markov and Elliott
+        # branches that a smooth series rarely reaches.
+        rng, price, walk = random.Random(7), 100.0, []
+        for index in range(1200):
+            opened, price = price, price * (1 + rng.gauss(0, 0.03))
+            high, low = max(opened, price) * (1 + abs(rng.gauss(0, 0.01))), min(opened, price) * (1 - abs(rng.gauss(0, 0.01)))
+            walk.append(Candle(opened, high, low, price, 1, index * 60_000, (index + 1) * 60_000))
+        self._assert_incremental_matches(smooth)
+        self._assert_incremental_matches(walk)
 
+    def _assert_incremental_matches(self, bars):
         for entry in STRATEGY_CATALOG:
             strategy = entry["name"]
 

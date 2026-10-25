@@ -421,6 +421,4 @@ class IncrementalBacktestSignal:
         if len(values) < 5:
             return False
         vals = values[-5:]
-        rising = vals[0] < vals[2] < vals[4] and vals[1] < vals[3]
-        falling = vals[0] > vals[2] > vals[4] and vals[1] > vals[3]
-        return rising
+        return vals[0] < vals[2] < vals[4] and vals[1] < vals[3]
