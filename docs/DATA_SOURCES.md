@@ -15,23 +15,26 @@ The dashboard's **API status** panel shows the latest snapshot for each source, 
 **Probe all sources** button refreshes them. The web service also snapshots every source every
 15 minutes (`SURGE_SOURCES_INTERVAL`, in seconds; `0` turns it off).
 
-## Status on 2026-10-25, probed from a US IP
+## Status on 2026-10-25, probed from a US IP (Colorado)
 
-**33 of 38 work with no setup.** The other five need the operator:
+The list has 36 sources. "Bentley" and "Market Intel Feed" are labels on it, not sources.
+**35 of 36 work** once `COINALYZE_API_KEY` is set. Without it, 33 work.
 
-| Source | State | What to do |
+| Source | State | Notes |
 |---|---|---|
-| Coinalyze | needs a free key | Sign up at coinalyze.net, copy the API key from the account page, and set `COINALYZE_API_KEY=` in `.env`. The key is sent in a header and is never logged. |
-| Bybit | geo-blocked (HTTP 403) | Bybit's API refuses US IPs. With `COINALYZE_API_KEY` set, the probe reads Bybit's BTC OI and funding through Coinalyze instead. |
-| BitMEX | geo-blocked (HTTP 403) | Same as Bybit: set `COINALYZE_API_KEY`. |
-| Bentley | unidentified | No public crypto data API by this name was found. Send its URL or API docs and it can be added. |
-| Market Intel Feed | unidentified | This looks like a feature of the dashboard the list came from, not a public API. If it is a news or alerts feed, name the provider. |
+| Coinalyze | needs a free key | Set `COINALYZE_API_KEY=` in `.env`. The probes read this one name (and the other data keys) from `.env`. They never read exchange trading keys. The key travels in a header and is never logged. |
+| Bybit | geo-blocked (HTTP 403) | With the Coinalyze key, BTC OI and funding come through Coinalyze (`BTCUSDT.6`). |
+| BitMEX | geo-blocked (HTTP 403) | **No legitimate US route.** Coinalyze carries no BitMEX markets, and BitMEX's public data bucket redirects to its homepage. |
+
+Coinalyze quotes funding in percent. The probes convert it to a fraction, like every other source.
 
 Sources that already work through a fallback:
 
-- **Binance Futures, Binance long/short ratio:** the live API returns HTTP 451 to US IPs. The
-  probes read Binance's public data.binance.vision archive instead (5m OI and account
-  long/short ratio, about one day behind), or Coinalyze when a key is set.
+- **Binance Futures:** the live API returns HTTP 451 to US IPs. With the Coinalyze key, the
+  probe reads live BTCUSDT OI and funding through Coinalyze. Otherwise it reads Binance's public
+  data.binance.vision archive (5m OI, about one day behind).
+- **Binance long/short ratio:** comes from the same archive (account long/short ratio, about
+  one day behind).
 - **Binance quarterly basis:** HTTP 451 from the US. The probe reports the OKX BTC quarterly
   basis instead and says so in its `via` field.
 - **Binance Spot:** falls back to Binance.US, which has the same public shape.
@@ -58,7 +61,7 @@ persons in their terms, and Coinalyze serves the same data legitimately.
 | KuCoin Futures | public REST | `api-futures.kucoin.com/api/v1/contracts/XBTUSDTM` | — |
 | Coinbase Exchange | public REST + WebSocket | `api.exchange.coinbase.com/products/BTC-USD/ticker` | — |
 | Kraken | public REST + WebSocket v2 | `api.kraken.com/0/public/Ticker` | — |
-| BitMEX | public REST + WebSocket | `bitmex.com/api/v1/instrument` (→ Coinalyze) | — |
+| BitMEX | public REST + WebSocket | `bitmex.com/api/v1/instrument` (US: blocked, no fallback) | — |
 | Bitget | public REST v2 | `api.bitget.com/api/v2/mix/market/ticker` | — |
 | MEXC | public REST | `contract.mexc.com/api/v1/contract/ticker` | — |
 | HTX | public REST | `api.hbdm.com/linear-swap-ex/market/detail/merged`, `/swap_funding_rate` | — |
@@ -68,7 +71,7 @@ persons in their terms, and Coinalyze serves the same data legitimately.
 | WEEX | REST via CCXT | `ccxt.weex().fetch_ticker` | — |
 | CoinGecko | public REST | `api.coingecko.com/api/v3/simple/price` | optional |
 | Fear & Greed | public REST | `api.alternative.me/fng/` | — |
-| Coinalyze | REST | `api.coinalyze.net/v1/open-interest`, `/funding-rate` | required |
+| Coinalyze | REST | `api.coinalyze.net/v1/exchanges`, `/future-markets`, `/open-interest`, `/funding-rate` | required |
 | Economic calendar | public JSON (unofficial mirror) | `nfs.faireconomy.media/ff_calendar_thisweek.json` | — |
 | Long/short accounts | public REST, three venues | Binance `globalLongShortAccountRatio`, Bybit `account-ratio`, OKX `rubik/stat/contracts/long-short-account-ratio` | — |
 | Deribit DVOL | public JSON-RPC | `get_volatility_index_data` | — |

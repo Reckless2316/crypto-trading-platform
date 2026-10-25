@@ -13,11 +13,12 @@ from data.call_log import DataCallLog
 from data.sources import SOURCES, Fetcher, SnapshotStore, probe, probe_all
 from data.sources import catalog
 
-# Every row of the operator's API STATUS list must have a registry entry.
+# Every row of the operator's API STATUS list must have a registry entry ("Bentley" and
+# "Market Intel Feed" are labels on that list, not data sources).
 REQUESTED = [
     "Binance Spot", "Binance Futures", "Bybit", "OKX", "Deribit", "Hyperliquid", "Gate.io", "KuCoin Futures",
     "Coinbase Exchange", "Kraken", "BitMEX", "Bitget", "MEXC", "HTX", "Phemex", "dYdX", "Bitfinex", "WEEX",
-    "CoinGecko", "Fear & Greed", "Coinalyze", "Bentley", "Market Intel Feed", "API Data Quality Log",
+    "CoinGecko", "Fear & Greed", "Coinalyze", "API Data Quality Log",
     "Economic calendar (ForexFactory)", "Long/short accounts (Binance, Bybit, OKX)", "Deribit volatility index",
     "Coinbase and Korea premiums", "Binance quarterly basis", "Macro markets (TradingView, CNBC fallback)",
     "Spot ETF flows (Farside, SoSoValue)", "CFTC positioning on CME", "Bitfinex margin longs and shorts",
@@ -55,6 +56,17 @@ class Session:
         raise AssertionError(f"unexpected request {url}")
 
 
+def setUpModule():
+    # Keep probes hermetic: never read the operator's real .env during tests.
+    global _env_patch
+    _env_patch = mock.patch.object(catalog, "ENV_FILE", Path("/nonexistent/surge/.env"))
+    _env_patch.start()
+
+
+def tearDownModule():
+    _env_patch.stop()
+
+
 def fetcher(routes, log=None):
     return Fetcher(log, Session(routes))
 
@@ -82,12 +94,11 @@ class ProbeTests(unittest.TestCase):
             self.assertEqual(r["data"]["fastest_sat_vb"], 5)
             self.assertEqual([c["source"] for c in log.recent()], ["mempool", "mempool"])
 
-    def test_states_needs_key_geo_blocked_error_unidentified(self):
+    def test_states_needs_key_geo_blocked_error(self):
         with mock.patch.dict(os.environ, {"COINALYZE_API_KEY": ""}):
             self.assertEqual(probe(catalog.BY_KEY["coinalyze"], fetcher([]))["state"], "needs_key")
         self.assertEqual(probe(catalog.BY_KEY["bitmex"], fetcher([("bitmex", Response(403, {}))]))["state"], "geo_blocked")
         self.assertEqual(probe(catalog.BY_KEY["kraken"], fetcher([("kraken", Response(500, {}))]))["state"], "error")
-        self.assertEqual(probe(catalog.BY_KEY["bentley"], fetcher([]))["state"], "unidentified")
 
     def test_binance_spot_falls_back_to_binance_us_on_451(self):
         f = fetcher([("api.binance.com", Response(451, {})),
@@ -108,15 +119,18 @@ class ProbeTests(unittest.TestCase):
         self.assertEqual((r["data"]["open_interest_btc"], r["data"]["account_long_short"]), (95000.5, 2.1))
 
     def test_coinalyze_key_goes_in_a_header_not_the_url(self):
+        markets = [{"symbol": "BTCUSD.6", "exchange": "6", "is_perpetual": True, "base_asset": "BTC", "quote_asset": "USD"},
+                   {"symbol": "BTCUSDT.6", "exchange": "6", "is_perpetual": True, "base_asset": "BTC", "quote_asset": "USDT"}]
         f = fetcher([("/exchanges", Response(payload=[{"code": "6", "name": "Bybit"}])),
-                     ("/future-markets", Response(payload=[{"symbol": "BTCUSDT.6", "exchange": "6", "is_perpetual": True,
-                                                            "base_asset": "BTC", "quote_asset": "USDT"}])),
+                     ("/future-markets", Response(payload=markets)),
                      ("/open-interest", Response(payload=[{"symbol": "BTCUSDT.6", "value": 1e9}])),
-                     ("/funding-rate", Response(payload=[{"symbol": "BTCUSDT.6", "value": 0.0001}])),
+                     ("/funding-rate", Response(payload=[{"symbol": "BTCUSDT.6", "value": 0.01}])),
                      ("bybit.com", Response(403, {}))])
         with mock.patch.dict(os.environ, {"COINALYZE_API_KEY": "secret-key"}):
             r = probe(catalog.BY_KEY["bybit"], f)
         self.assertEqual((r["state"], r["data"]["open_interest_usd"]), ("ok", 1e9))
+        self.assertEqual(r["data"]["via"], "coinalyze (BTCUSDT.6)")      # USDT perp preferred over coin-margined
+        self.assertAlmostEqual(r["data"]["funding"], 0.0001)             # Coinalyze percent -> fraction
         coinalyze_calls = [c for c in f.session.calls if "coinalyze" in c[1]]
         self.assertTrue(all("secret-key" not in c[1] and "secret-key" not in json.dumps(c[2]) for c in coinalyze_calls))
         self.assertTrue(all(c[3]["api_key"] == "secret-key" for c in coinalyze_calls))
@@ -146,6 +160,17 @@ class ProbeTests(unittest.TestCase):
             store.save([{"key": "a", "fetched_at": 2, "state": "ok", "elapsed_ms": 3, "data": {"v": 1}}])
             self.assertEqual(store.latest()["a"]["data"], {"v": 1})
             self.assertEqual([h["state"] for h in store.history("a")], ["ok", "error"])
+
+    def test_data_key_reads_only_named_keys_from_env_file(self):
+        with tempfile.TemporaryDirectory() as d:
+            env = Path(d) / ".env"
+            env.write_text("SURGE_OKX_API_SECRET=trading-secret\nCOINALYZE_API_KEY=from-file\n")
+            with mock.patch.object(catalog, "ENV_FILE", env), mock.patch.dict(os.environ, {"COINALYZE_API_KEY": ""}):
+                self.assertEqual(catalog.data_key("COINALYZE_API_KEY"), "from-file")
+                with self.assertRaises(ValueError):
+                    catalog.data_key("SURGE_OKX_API_SECRET")
+            with mock.patch.object(catalog, "ENV_FILE", env), mock.patch.dict(os.environ, {"COINALYZE_API_KEY": "from-env"}):
+                self.assertEqual(catalog.data_key("COINALYZE_API_KEY"), "from-env")
 
     def test_probe_all_never_raises(self):
         results = probe_all(fetcher([("", Response(500, {}))]), ["kraken", "okx", "mempool"])

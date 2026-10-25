@@ -17,7 +17,7 @@ from .catalog import SOURCES, Fetcher, probe_all
 from .store import SnapshotStore
 
 DEFAULT_DB = Path(__file__).resolve().parents[2] / "data" / "surge.sqlite3"
-MARK = {"ok": "OK", "needs_key": "KEY", "geo_blocked": "GEO", "unidentified": "???", "error": "ERR"}
+MARK = {"ok": "OK", "needs_key": "KEY", "geo_blocked": "GEO", "error": "ERR"}
 
 
 def _summary(result: dict) -> str:

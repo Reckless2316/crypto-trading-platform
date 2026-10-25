@@ -24,7 +24,7 @@ from bot.risk_gates import RiskGates
 from bot.onboard_ai import OnboardTradingAgent
 from data.binance_archive import ARCHIVE_EXCHANGE
 from data.call_log import DataCallLog
-from data.sources import SOURCES, Fetcher, SnapshotStore, probe_all
+from data.sources import SOURCES, Fetcher, SnapshotStore, data_key, probe_all
 from data.public_metrics import fetch_coinbase_book, fetch_global, fetch_listed_markets
 from data.collectors.coinbase_collector import CoinbaseCollector
 from data.collectors.collector_base import Candle
@@ -958,7 +958,7 @@ def refresh_swap_history():
 
 def _source_rows(latest: dict) -> list[dict]:
     return [{"key": s.key, "name": s.name, "category": s.category, "method": s.method, "docs": s.docs,
-             "auth_env": s.auth_env, "key_configured": bool(s.auth_env and os.environ.get(s.auth_env)),
+             "auth_env": s.auth_env, "key_configured": bool(s.auth_env and data_key(s.auth_env)),
              "official": s.official, "us_trading": s.us_trading, "notes": s.notes, "latest": latest.get(s.key)}
             for s in SOURCES]
 

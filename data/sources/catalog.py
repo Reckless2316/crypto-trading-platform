@@ -18,6 +18,7 @@ import zipfile
 from datetime import datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Callable
 
 import requests
@@ -29,10 +30,6 @@ USER_AGENT = "SURGE/1.0 (local research dashboard)"
 
 class NeedsKey(RuntimeError):
     """The source works only with an API key that is not configured."""
-
-
-class Unidentified(RuntimeError):
-    """The source name does not map to a known public API."""
 
 
 class Fetcher:
@@ -92,8 +89,30 @@ def _f(x) -> float | None:
         return None
 
 
+# Data-API keys a probe may use. Only these names are ever read from .env; exchange trading keys
+# are not, so the dashboard process never holds them.
+DATA_KEYS = frozenset({"COINALYZE_API_KEY", "SOSOVALUE_API_KEY", "COINGECKO_API_KEY"})
+ENV_FILE = Path(__file__).resolve().parents[2] / ".env"
+
+
+def data_key(name: str) -> str:
+    """The process environment wins; otherwise read just this one name from the repo's .env."""
+    if name not in DATA_KEYS:
+        raise ValueError(f"{name} is not a data-source key")
+    value = os.environ.get(name, "").strip()
+    if value:
+        return value
+    try:
+        for line in ENV_FILE.read_text().splitlines():
+            if line.startswith(f"{name}="):
+                return line.split("=", 1)[1].strip()
+    except OSError:
+        pass
+    return ""
+
+
 def _key(env: str) -> str:
-    value = os.environ.get(env, "").strip()
+    value = data_key(env)
     if not value:
         raise NeedsKey(f"set {env} in .env")
     return value
@@ -113,10 +132,13 @@ def _coinalyze_symbol(f: Fetcher, exchange: str, base: str = "BTC") -> str:
         names = {e["code"]: e["name"] for e in f.json("coinalyze", f"{COINALYZE}/exchanges", headers=headers)}
         f._coinalyze_markets = [dict(m, exchange_name=names.get(m["exchange"], "")) for m in
                                 f.json("coinalyze", f"{COINALYZE}/future-markets", headers=headers)]
-    for m in f._coinalyze_markets:
-        if m["exchange_name"].lower() == exchange.lower() and m.get("is_perpetual") and m.get("base_asset") == base \
-                and m.get("quote_asset") in ("USDT", "USD"):
-            return m["symbol"]
+    perps = [m for m in f._coinalyze_markets if m["exchange_name"].lower() == exchange.lower()
+             and m.get("is_perpetual") and m.get("base_asset") == base]
+    # The USDT-margined perp is the venue's main contract; coin-margined BTCUSD comes later.
+    for quote in ("USDT", "USD", "USDC"):
+        for m in perps:
+            if m.get("quote_asset") == quote:
+                return m["symbol"]
     raise RuntimeError(f"Coinalyze lists no {base} perpetual for {exchange}")
 
 
@@ -125,7 +147,8 @@ def coinalyze_perp(f: Fetcher, exchange: str) -> dict:
     headers = {"api_key": _key("COINALYZE_API_KEY")}
     oi = f.json("coinalyze", f"{COINALYZE}/open-interest", headers=headers, params={"symbols": symbol, "convert_to_usd": "true"})
     fr = f.json("coinalyze", f"{COINALYZE}/funding-rate", headers=headers, params={"symbols": symbol})
-    return {"via": f"coinalyze ({symbol})", "open_interest_usd": _f(oi[0]["value"]), "funding": _f(fr[0]["value"])}
+    # Coinalyze quotes funding in percent (0.01 = 0.01%); every other probe reports a fraction.
+    return {"via": f"coinalyze ({symbol})", "open_interest_usd": _f(oi[0]["value"]), "funding": _f(fr[0]["value"]) / 100}
 
 
 def binance_archive_metrics(f: Fetcher, symbol: str = "BTCUSDT") -> dict:
@@ -170,7 +193,7 @@ def binance_futures(f: Fetcher) -> dict:
         if not _geo(exc):
             raise
     # fapi.binance.com refuses US IPs. Prefer Coinalyze (live); otherwise the public archive (about a day behind).
-    if os.environ.get("COINALYZE_API_KEY"):
+    if data_key("COINALYZE_API_KEY"):
         return coinalyze_perp(f, "Binance")
     return {"via": "data.binance.vision archive (live API geo-blocked)", **binance_archive_metrics(f)}
 
@@ -185,7 +208,7 @@ def bybit(f: Fetcher) -> dict:
     try:
         return _bybit_live(f)
     except requests.HTTPError as exc:
-        if not _geo(exc) or not os.environ.get("COINALYZE_API_KEY"):
+        if not _geo(exc) or not data_key("COINALYZE_API_KEY"):
             raise
     return coinalyze_perp(f, "Bybit")
 
@@ -247,15 +270,7 @@ def kraken(f: Fetcher) -> dict:
 
 
 def bitmex(f: Fetcher) -> dict:
-    try:
-        return _bitmex_live(f)
-    except requests.HTTPError as exc:
-        if not _geo(exc) or not os.environ.get("COINALYZE_API_KEY"):
-            raise
-    return coinalyze_perp(f, "BitMEX")
-
-
-def _bitmex_live(f: Fetcher) -> dict:
+    # No US fallback: Coinalyze carries no BitMEX markets and public.bitmex.com redirects away.
     r = f.json("bitmex", "https://www.bitmex.com/api/v1/instrument", params={"symbol": "XBTUSD"})[0]
     return {"btc_last": _f(r["lastPrice"]), "funding": _f(r.get("fundingRate")), "open_interest_usd": _f(r.get("openInterest"))}
 
@@ -305,7 +320,7 @@ def weex(f: Fetcher) -> dict:
 # ---------------------------------------------------------------- market data and positioning
 
 def coingecko(f: Fetcher) -> dict:
-    headers = {"x-cg-demo-api-key": os.environ["COINGECKO_API_KEY"]} if os.environ.get("COINGECKO_API_KEY") else None
+    headers = {"x-cg-demo-api-key": data_key("COINGECKO_API_KEY")} if data_key("COINGECKO_API_KEY") else None
     d = f.json("coingecko", "https://api.coingecko.com/api/v3/simple/price", headers=headers,
                params={"ids": "bitcoin,ethereum", "vs_currencies": "usd", "include_market_cap": "true"})
     return {"btc_usd": _f(d["bitcoin"]["usd"]), "eth_usd": _f(d["ethereum"]["usd"]), "btc_mcap": _f(d["bitcoin"]["usd_market_cap"])}
@@ -319,7 +334,7 @@ def fear_greed(f: Fetcher) -> dict:
 def coinalyze(f: Fetcher) -> dict:
     _key("COINALYZE_API_KEY")
     out = {}
-    for venue in ("Binance", "Bybit", "OKX", "BitMEX"):
+    for venue in ("Binance", "Bybit", "OKX"):
         try:
             row = coinalyze_perp(f, venue)
             out[venue.lower()] = {"oi_usd": row["open_interest_usd"], "funding": row["funding"]}
@@ -443,9 +458,9 @@ def macro_markets(f: Fetcher) -> dict:
 
 
 def etf_flows(f: Fetcher) -> dict:
-    if os.environ.get("SOSOVALUE_API_KEY"):
+    if data_key("SOSOVALUE_API_KEY"):
         d = f.json("sosovalue", "https://openapi.sosovalue.com/openapi/v2/etf/historicalInflowChart", method="POST",
-                   headers={"x-soso-api-key": os.environ["SOSOVALUE_API_KEY"]}, body={"type": "us-btc-spot"})
+                   headers={"x-soso-api-key": data_key("SOSOVALUE_API_KEY")}, body={"type": "us-btc-spot"})
         last = d["data"][0]
         return {"via": "sosovalue", "date": last["date"], "btc_net_inflow_usd": _f(last["totalNetInflow"])}
     html = f.text("farside", "https://farside.co.uk/bitcoin-etf-flow-all-data/")
@@ -517,12 +532,6 @@ def mempool(f: Fetcher) -> dict:
             "mempool_vsize": pool["vsize"]}
 
 
-def unidentified(name: str) -> Callable[[Fetcher], dict]:
-    def probe_(f: Fetcher) -> dict:
-        raise Unidentified(f"'{name}' does not match a known public API; tell us its URL")
-    return probe_
-
-
 def data_quality_log(f: Fetcher) -> dict:
     """SURGE's own call log, summarised: the equivalent of an API data-quality log."""
     if f.log is None:
@@ -545,7 +554,8 @@ SOURCES: tuple[Source, ...] = (
            binance_futures, us_trading=US_NO, notes="Historical 5m OI/funding archive: data.binance.vision (data/binance_archive.py)",
            streams=("wss://fstream.binance.com/ws/btcusdt@markPrice",)),
     Source("bybit", "Bybit", "exchange", "public REST v5 + WebSocket", "https://bybit-exchange.github.io/docs/v5/intro", bybit,
-           us_trading=US_NO, notes="Public API refuses US IPs (HTTP 403)", streams=("wss://stream.bybit.com/v5/public/linear",)),
+           us_trading=US_NO, notes="Public API refuses US IPs (HTTP 403); served via Coinalyze when COINALYZE_API_KEY is set",
+           streams=("wss://stream.bybit.com/v5/public/linear",)),
     Source("okx", "OKX", "exchange", "public REST v5 + WebSocket", "https://www.okx.com/docs-v5/en/", okx,
            us_trading="via OKX US (us.okx.com): spot only; not NY/TX", streams=("wss://ws.okx.com:8443/ws/v5/public",)),
     Source("okx-us", "OKX US", "exchange", "public REST v5 (us.okx.com) + WebSocket", "https://www.okx.com/docs-v5/en/", okx_us,
@@ -563,7 +573,8 @@ SOURCES: tuple[Source, ...] = (
            streams=("wss://ws-feed.exchange.coinbase.com",)),
     Source("kraken", "Kraken", "exchange", "public REST + WebSocket v2", "https://docs.kraken.com/api/", kraken,
            us_trading="yes (spot; US perps via Kraken Derivatives US, no documented API)", streams=("wss://ws.kraken.com/v2",)),
-    Source("bitmex", "BitMEX", "exchange", "public REST + WebSocket", "https://www.bitmex.com/app/apiOverview", bitmex, us_trading=US_NO),
+    Source("bitmex", "BitMEX", "exchange", "public REST + WebSocket", "https://www.bitmex.com/app/apiOverview", bitmex, us_trading=US_NO,
+           notes="Refuses US IPs (HTTP 403); no legitimate US route (Coinalyze has no BitMEX markets)"),
     Source("bitget", "Bitget", "exchange", "public REST v2 + WebSocket", "https://www.bitget.com/api-doc/common/intro", bitget, us_trading=US_NO),
     Source("mexc", "MEXC", "exchange", "public REST + WebSocket", "https://mexcdevelop.github.io/apidocs/", mexc, us_trading=US_NO),
     Source("htx", "HTX", "exchange", "public REST + WebSocket", "https://www.htx.com/en-us/opend/newApiPages/", htx, us_trading=US_NO),
@@ -576,8 +587,6 @@ SOURCES: tuple[Source, ...] = (
            auth_env="COINGECKO_API_KEY", notes="Works keyless at low rate limits; the key is optional"),
     Source("fear-greed", "Fear & Greed", "sentiment", "public REST (alternative.me)", "https://alternative.me/crypto/fear-and-greed-index/", fear_greed),
     Source("coinalyze", "Coinalyze", "positioning", "REST, free API key", "https://api.coinalyze.net/v1/doc/", coinalyze, auth_env="COINALYZE_API_KEY"),
-    Source("bentley", "Bentley", "unknown", "unidentified", "", unidentified("Bentley")),
-    Source("market-intel", "Market Intel Feed", "unknown", "unidentified (a feature of the source dashboard)", "", unidentified("Market Intel Feed")),
     Source("data-quality-log", "API Data Quality Log", "internal", "SURGE DataCallLog (SQLite)", "data/call_log.py", data_quality_log),
     Source("economic-calendar", "Economic calendar (ForexFactory)", "macro", "public JSON mirror (faireconomy.media)",
            "https://nfs.faireconomy.media/ff_calendar_thisweek.json", economic_calendar, official=False),
@@ -614,8 +623,6 @@ def probe(source: Source, fetcher: Fetcher) -> dict:
         result.update(state="ok", data=source.probe(fetcher))
     except NeedsKey as exc:
         result.update(state="needs_key", error=str(exc))
-    except Unidentified as exc:
-        result.update(state="unidentified", error=str(exc))
     except requests.HTTPError as exc:
         code = getattr(exc.response, "status_code", None)
         result.update(state="geo_blocked" if code in (403, 451) else "error", error=f"HTTP {code}")

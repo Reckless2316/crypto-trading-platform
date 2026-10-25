@@ -34,16 +34,16 @@ Create the OKX key with Read + Trade permissions only (never Withdraw) and test 
 ## Primary venue: OKX US
 
 The platform's primary trading venue is **OKX US** (CCXT `okxus`, `SURGE_LIVE_EXCHANGE=okxus`). It is
-the cheapest US-accessible exchange on the source list for spot, but OKX US excludes New York, Texas
-and US territories. US-regulated perps on Kraken are far cheaper but have no documented API yet.
-Entry-tier spot fees are 0.20% maker and 0.35% taker, so prefer limit orders and low-turnover
-strategies. Reasoning, fee tables and sources:
+the cheapest US-accessible exchange on the source list for spot. It excludes New York, Texas and US
+territories; the operator is in Colorado. US-regulated perps on Kraken are far cheaper but have no documented API yet.
+The operator's account is fee tier Lv1, confirmed through the API: 0.20% maker and 0.35% taker.
+Prefer limit orders and low-turnover strategies. Reasoning, fee tables and sources:
 [docs/research/2026-10-25-venue-selection.md](docs/research/2026-10-25-venue-selection.md). Live trading
 stays disabled unless explicitly configured and armed.
 
 ## Data sources
 
-SURGE reads 38 public market-data sources: 19 exchanges plus positioning, volatility, macro, ETF
+SURGE reads 36 public market-data sources: 19 exchanges plus positioning, volatility, macro, ETF
 flow, prediction-market and on-chain feeds. The dashboard's **API status** panel shows each one,
 and the service snapshots them every 15 minutes (`SURGE_SOURCES_INTERVAL=0` turns that off).
 
@@ -51,8 +51,9 @@ and the service snapshots them every 15 minutes (`SURGE_SOURCES_INTERVAL=0` turn
 .venv/bin/python -m data.sources status    # probe all sources once
 ```
 
-33 work without setup from a US connection. A free `COINALYZE_API_KEY` unlocks Coinalyze plus
-Bybit and BitMEX, which refuse US IPs. See [docs/DATA_SOURCES.md](docs/DATA_SOURCES.md).
+From a US connection, 35 work once a free `COINALYZE_API_KEY` is in `.env`; Coinalyze also
+covers Bybit and live Binance futures. BitMEX refuses US IPs and has no fallback. See
+[docs/DATA_SOURCES.md](docs/DATA_SOURCES.md).
 
 ## Historical archive and bracket backtests
 
