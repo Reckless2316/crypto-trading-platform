@@ -30,7 +30,7 @@ Go to <http://127.0.0.1:8000>.
 
 ## 5. Click through
 The **Quick start** box walks you through it:
-1. **Get prices** downloads candles from the selected exchange.
+1. **Get prices** downloads hourly candles from the selected exchange (steps 2 and 3 use 1h).
 2. **Ask a strategy** shows the current signal. It is not advice.
 3. **Test on history** backtests the strategy on stored candles.
 4. **Arm paper trading** needs the authenticated authority setup (below). With the plain
@@ -60,9 +60,11 @@ launch the dashboard through the authority launcher, as described in
 - The web dashboard refuses to start if exchange **trading** keys are in its environment. It
   needs none to run.
 - Exchange keys should have Read + Trade permission only, never Withdraw.
-- The red **Kill switch** blocks new paper orders. It needs the authority setup above. Without it,
-  the paper runtime can still be stopped by writing a `STOP` or `KILL` file in its data directory
-  (the Operator deck buttons do this).
+- The red **Kill switch** blocks new paper orders. It needs the authority setup above.
+- Without the authority, the Operator deck's file buttons still control the paper runtime:
+  - **Write STOP** makes the runtime exit at its next check.
+  - **Write KILL** is a hard kill switch. While the file exists, *no* order is placed, not even
+    exits, but the runtime keeps running. Use STOP to actually shut it down.
 
 ## Stuck?
 - `command not found`: Python isn't installed or isn't on your PATH.
