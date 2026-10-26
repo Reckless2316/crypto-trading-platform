@@ -107,7 +107,9 @@ class RuntimeAuthority:
         self.venue = PaperVenue(fee_rate=fee_rate, slippage_bps=slippage_bps, clock_us=clock_us)
         self.authority = OrderAuthority(ledger, self.venue, book_source=self._books.get, market_source=self.market_rules,
                                         entry_verifier=entry_verifier or (lambda *a: False), clock_us=clock_us,
-                                        reconciliation_source=self._reconciliation_mark)
+                                        reconciliation_source=self._reconciliation_mark,
+                                        book_verifier=self._verify_paper_book,
+                                        market_capability_verifier=self._verify_paper_market)
 
     # ---------- observations from the runtime ----------
     def observe(self, instrument: str, bids, asks, event_us: int, rules) -> None:
@@ -120,7 +122,8 @@ class RuntimeAuthority:
                     seen[p] = seen.get(p, Decimal(0)) + q
             return tuple(sorted(seen.items(), reverse=reverse))
         payload = BookPayload(levels(bids, True), levels(asks, False))
-        self._books[instrument] = ExecutableBook("paper", instrument, event_us, payload, content_hash(payload))
+        lineage = content_hash(("paper-observation-v1", instrument, event_us, payload))
+        self._books[instrument] = ExecutableBook("paper", instrument, event_us, payload, lineage)
         tick = rules.quote_increment
         # The ledger settles quote at microdollar precision; coarsen the lot so lot x tick is a whole microdollar
         # multiple (e.g. 1e-8 BTC with a 0.01 tick becomes a 1e-4 lot). Never finer than the venue increment.
@@ -137,6 +140,15 @@ class RuntimeAuthority:
 
     def market_rules(self, instrument: str) -> MarketRules | None:
         return self._rules.get(instrument)
+
+    def _verify_paper_book(self, book: ExecutableBook) -> bool:
+        return (type(book) is ExecutableBook and self._books.get(book.instrument) is book
+            and book.lineage_hash == content_hash(("paper-observation-v1", book.instrument,
+                book.observed_at_us, book.book)))
+
+    def _verify_paper_market(self, market: MarketRules, now_us: int) -> bool:
+        return (type(market) is MarketRules and self._rules.get(market.instrument) is market
+            and market.expires_at_us > now_us)
 
     # ---------- read model ----------
     def view(self) -> dict:

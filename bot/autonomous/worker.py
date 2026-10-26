@@ -1,8 +1,9 @@
-"""Role entrypoint for the paper decision loop.
+"""Role entrypoint for collection and daily reviews; no hourly decision loop is wired.
 
-The process starts unarmed. It names which provider secrets a role may see, and
-it refuses a live venue. A candle can be considered once. Crisis or a hard kill
-stops later dispatches. The 00:15 UTC review hook may not approve trading.
+The CLI does not submit orders. The process starts unarmed, names which provider
+secrets a role may see, and refuses a live venue. The 00:15 UTC review hook may
+not approve trading. Task 16 remains incomplete until an executable hourly
+decision loop is integrated.
 """
 from __future__ import annotations
 
