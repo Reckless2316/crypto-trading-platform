@@ -1,0 +1,455 @@
+// This Pine Script(TM) source is part of SURGE Sentinel (crypto-trading-platform/sentinel).
+// It mirrors the Go engine's confluence layers, signal gate, HAR volatility
+// forecast and self-auditing track record so the same logic can be charted on
+// TradingView. Everything is evaluated on confirmed bars, and higher-timeframe
+// values come from the previous completed higher-timeframe bar, so nothing repaints.
+//
+// Not ported (Go engine only): the skill-gated direction model, perpetual-swap
+// positioning and Deribit options sentiment. See sentinel/README.md.
+//@version=6
+indicator("SURGE Sentinel", shorttitle = "Sentinel", overlay = true, max_labels_count = 500, max_lines_count = 100)
+
+// ---------------------------------------------------------------- inputs
+grpTF   = "Timeframes"
+midIn   = input.timeframe("", "Mid timeframe (empty = auto ladder)", group = grpTF)
+highIn  = input.timeframe("", "High timeframe (empty = auto ladder)", group = grpTF)
+useRef  = input.bool(true, "Use reference asset context", group = grpTF)
+refSym  = input.symbol("OKX:BTCUSDT", "Reference asset", group = grpTF)
+
+grpBar  = "Barriers and costs (match the Go engine)"
+stopATR = input.float(1.5, "Stop (1R) in ATR", minval = 0.1, step = 0.1, group = grpBar)
+targetR = input.float(2.0, "Target in R", minval = 0.1, step = 0.1, group = grpBar)
+horizon = input.int(48, "Horizon (bars)", minval = 2, maxval = 500, group = grpBar)
+feeIn   = input.float(0.20, "Entry fee %", step = 0.01, group = grpBar)
+feeOut  = input.float(0.35, "Exit fee %", step = 0.01, group = grpBar)
+slip    = input.float(0.05, "Slippage % (round trip)", step = 0.01, group = grpBar)
+
+grpGate = "Signal gate"
+minScore  = input.float(5.0, "Minimum winning score", step = 0.25, group = grpGate)
+minLayers = input.int(3, "Minimum agreeing layers", minval = 1, maxval = 5, group = grpGate)
+maxDis    = input.float(0.5, "Max disagreement ratio", step = 0.05, group = grpGate)
+coolBars  = input.int(12, "Cooldown bars", minval = 0, group = grpGate)
+coolATR   = input.float(1.0, "Cooldown price move (ATR)", step = 0.1, group = grpGate)
+
+grpShow = "Display"
+showBands = input.bool(true, "Show volatility forecast bands (projected forward)", group = grpShow)
+showTable = input.bool(true, "Show dashboard", group = grpShow)
+showST    = input.bool(true, "Show Supertrend", group = grpShow)
+
+// ---------------------------------------------------------------- timeframe ladder
+autoMid() =>
+    s = timeframe.in_seconds()
+    s <= 60 ? "5" : s <= 300 ? "15" : s <= 900 ? "60" : s <= 1800 ? "120" : s <= 3600 ? "240" : s <= 7200 ? "720" : "D"
+
+autoHigh() =>
+    s = timeframe.in_seconds()
+    s <= 60 ? "15" : s <= 300 ? "60" : s <= 900 ? "240" : s <= 1800 ? "720" : s <= 3600 ? "D" : "W"
+
+midTF  = midIn == "" ? autoMid() : midIn
+highTF = highIn == "" ? autoHigh() : highIn
+
+// ---------------------------------------------------------------- helpers
+sgn(float x) => x > 0 ? 1 : x < 0 ? -1 : 0
+
+// Candlestick patterns (subset of the 33 in the Go engine), ATR-normalised and
+// trend-filtered. Returns [bias, strength].
+patterns(float atrv, int trend) =>
+    float body  = math.abs(close - open)
+    float rng   = high - low
+    float upper = high - math.max(open, close)
+    float lower = math.min(open, close) - low
+    bool  bull  = close > open
+    bool  bear  = close < open
+    bool  pBull = close[1] > open[1]
+    bool  pBear = close[1] < open[1]
+    float pBody = math.abs(close[1] - open[1])
+    int   bias  = 0
+    float strength = 0.0
+    if atrv > 0 and rng > 0
+        // three-bar stars
+        if trend <= 0 and close[2] < open[2] and math.abs(close[2] - open[2]) >= 0.9 * atrv and pBody <= 0.35 * atrv and bull and close > (open[2] + close[2]) / 2
+            bias := 1
+            strength := math.min(1.0, (close - (open[2] + close[2]) / 2) / atrv)
+        else if trend >= 0 and close[2] > open[2] and math.abs(close[2] - open[2]) >= 0.9 * atrv and pBody <= 0.35 * atrv and bear and close < (open[2] + close[2]) / 2
+            bias := -1
+            strength := math.min(1.0, ((open[2] + close[2]) / 2 - close) / atrv)
+        // engulfing
+        else if trend <= 0 and pBear and bull and math.min(open, close) <= math.min(open[1], close[1]) and math.max(open, close) >= math.max(open[1], close[1]) and body > pBody
+            bias := 1
+            strength := math.min(1.0, body / (1.5 * atrv))
+        else if trend >= 0 and pBull and bear and math.max(open, close) >= math.max(open[1], close[1]) and math.min(open, close) <= math.min(open[1], close[1]) and body > pBody
+            bias := -1
+            strength := math.min(1.0, body / (1.5 * atrv))
+        // hammer / shooting star
+        else if trend < 0 and body > 0 and lower >= 2 * body and upper <= 0.5 * body + 0.05 * atrv and rng >= 0.8 * atrv
+            bias := 1
+            strength := math.min(1.0, lower / (2 * atrv))
+        else if trend > 0 and body > 0 and upper >= 2 * body and lower <= 0.5 * body + 0.05 * atrv and rng >= 0.8 * atrv
+            bias := -1
+            strength := math.min(1.0, upper / (2 * atrv))
+    [bias, strength]
+
+// Everything Sentinel reads from one timeframe, offset by one bar so a higher
+// timeframe contributes only its last *completed* bar.
+framePack() =>
+    float r = ta.rsi(close, 14)
+    [mLine, mSig, mHist] = ta.macd(close, 12, 26, 9)
+    [dip, dim, adxv] = ta.dmi(14, 14)
+    float e50  = ta.ema(close, 50)
+    float e200 = ta.ema(close, 200)
+    [stLine, stDirRaw] = ta.supertrend(3.0, 10)
+    int   stDir = stDirRaw < 0 ? 1 : -1
+    float a    = ta.atr(14)
+    float hm   = ta.hma(close, 55)
+    float hmSlope = a > 0 ? (hm - hm[1]) / a : 0.0
+    [bbMid, bbUp, bbLo] = ta.bb(close, 20, 2.0)
+    [kcMid, kcUp, kcLo] = ta.kc(close, 20, 1.5, true)
+    bool  sqz  = bbUp < kcUp and bbLo > kcLo
+    bool  sqzRel = sqz[1] and not sqz
+    float pctB = bbUp > bbLo ? (close - bbLo) / (bbUp - bbLo) : 0.5
+    float k    = ta.stoch(r, r, r, 14)
+    float d    = ta.sma(k, 3)
+    bool  kUp  = ta.crossover(k, d)
+    bool  kDn  = ta.crossunder(k, d)
+    float relV = ta.sma(volume, 20)[1] > 0 ? volume / ta.sma(volume, 20)[1] : 1.0
+    float mfv  = high > low ? ((close - low) - (high - close)) / (high - low) * volume : 0.0
+    float cmf  = math.sum(volume, 20) > 0 ? math.sum(mfv, 20) / math.sum(volume, 20) : 0.0
+    float donHi = ta.highest(high, 20)[1]
+    float donLo = ta.lowest(low, 20)[1]
+    int   donBreak = close > donHi ? 1 : close < donLo ? -1 : 0
+    int   cdir = close > open ? 1 : close < open ? -1 : 0
+    // swing structure and RSI divergence from 3/3 fractal pivots
+    float ph = ta.pivothigh(high, 3, 3)
+    float pl = ta.pivotlow(low, 3, 3)
+    var float h1 = na
+    var float h2 = na
+    var float l1 = na
+    var float l2 = na
+    var float hr1 = na
+    var float hr2 = na
+    var float lr1 = na
+    var float lr2 = na
+    int div = 0
+    if not na(ph)
+        h1 := h2
+        hr1 := hr2
+        h2 := ph
+        hr2 := r[3]
+        if not na(h1) and h2 > h1 and hr2 < hr1 and hr2 > 55
+            div := -1
+    if not na(pl)
+        l1 := l2
+        lr1 := lr2
+        l2 := pl
+        lr2 := r[3]
+        if not na(l1) and l2 < l1 and lr2 > lr1 and lr2 < 45
+            div := 1
+    int structure = not na(h1) and not na(l1) ? (h2 > h1 and l2 > l1 ? 1 : h2 < h1 and l2 < l1 ? -1 : 0) : 0
+    float support    = not na(l2) and l2 < close ? l2 : na
+    float resistance = not na(h2) and h2 > close ? h2 : na
+    int trend = close[3] > e50[3] and e50 > e50[3] ? 1 : close[3] < e50[3] and e50 < e50[3] ? -1 : 0
+    [pBias, pStr] = patterns(a, trend)
+    float roc = ta.roc(close, 10)
+    [close[1], e50[1], e200[1], r[1], mHist[1], mHist[1] - mHist[2], adxv[1], dip[1], dim[1], stDir[1], hmSlope[1], a[1], pctB[1], sqzRel[1], k[1], kUp[1], kDn[1], relV[1], cdir[1], cmf[1], donBreak[1], structure[1], div[1], pBias[1], pStr[1], support[1], resistance[1], roc[1]]
+
+[mClose, mE50, mE200, mRSI, mHist, mHistD, mADX, mDIp, mDIm, mST, mHMA, mATR, mPctB, mSqzRel, mK, mKUp, mKDn, mRelV, mCDir, mCMF, mDon, mStruct, mDiv, mPat, mPatS, mSup, mRes, mROC] = request.security(syminfo.tickerid, midTF, framePack(), lookahead = barmerge.lookahead_on)
+[hClose, hE50, hE200, hRSI, hHist, hHistD, hADX, hDIp, hDIm, hST, hHMA, hATR, hPctB, hSqzRel, hK, hKUp, hKDn, hRelV, hCDir, hCMF, hDon, hStruct, hDiv, hPat, hPatS, hSup, hRes, hROC] = request.security(syminfo.tickerid, highTF, framePack(), lookahead = barmerge.lookahead_on)
+
+// Reference asset: trend on the high frame (last completed bar) and the
+// return z-score of the current chart-timeframe bar (BTC shock detection).
+refTrend() =>
+    [stLine, stDirRaw] = ta.supertrend(3.0, 10)
+    float e = ta.ema(close, 50)
+    int   tr = close > e and stDirRaw < 0 ? 1 : close < e and stDirRaw > 0 ? -1 : 0
+    tr[1]
+refShockZ() =>
+    float lr = math.log(close / close[1])
+    float sd = ta.stdev(lr, 100)
+    sd > 0 ? lr / sd : 0.0
+int   refTrendH = request.security(refSym, highTF, refTrend(), lookahead = barmerge.lookahead_on)
+float refZBase  = request.security(refSym, timeframe.period, refShockZ())
+float refROCMid = request.security(refSym, midTF, ta.roc(close, 10)[1], lookahead = barmerge.lookahead_on)
+bool isRef = syminfo.tickerid == refSym
+bool ctxOn = useRef and not isRef
+
+// ---------------------------------------------------------------- base frame
+atrB   = ta.atr(14)
+rsiF   = ta.rsi(close, 7)
+streak = 0
+streak := close > close[1] ? (nz(streak[1]) > 0 ? nz(streak[1]) + 1 : 1) : close < close[1] ? (nz(streak[1]) < 0 ? nz(streak[1]) - 1 : -1) : 0
+bodyR  = high > low ? math.abs(close - open) / (high - low) : 0.0
+cdirB  = close > open ? 1 : close < open ? -1 : 0
+[stB, stBRaw] = ta.supertrend(3.0, 10)
+stBDir  = stBRaw < 0 ? 1 : -1
+stBFlip = stBDir != stBDir[1]
+vwapB   = ta.vwap(hlc3)
+vwapSD  = ta.stdev(hlc3, 20)
+vwapDev = vwapSD > 0 ? (close - vwapB) / vwapSD : 0.0
+
+// ---------------------------------------------------------------- confluence
+// Layers: 0 trend, 1 reversal, 2 momentum, 3 timing, 4 context (the Go engine adds microstructure and options).
+var float[] layerCap    = array.from(3.0, 2.5, 3.0, 2.0, 1.5)
+layL = array.new_float(5, 0.0)
+layS = array.new_float(5, 0.0)
+
+vote(float[] L, float[] S, int layer, int side, float w) =>
+    if side > 0
+        array.set(L, layer, array.get(L, layer) + w)
+    else if side < 0
+        array.set(S, layer, array.get(S, layer) + w)
+
+// trend (high frame)
+vote(layL, layS, 0, sgn(hClose - (na(hE200) ? hE50 : hE200)), na(hE200) ? 0.75 : 1.0)
+vote(layL, layS, 0, na(hE200) ? 0 : sgn(hE50 - hE200), 0.5)
+vote(layL, layS, 0, sgn(hHist), 0.75)
+vote(layL, layS, 0, hStruct, 1.0)
+vote(layL, layS, 0, hST, 0.75)
+vote(layL, layS, 0, sgn(hHMA), 0.5)
+// reversal (mid frame)
+vote(layL, layS, 1, mRSI <= 30 ? 1 : mRSI >= 70 ? -1 : 0, 1.0)
+vote(layL, layS, 1, mDiv, 1.5)
+vote(layL, layS, 1, mPctB < 0.05 and mCDir > 0 ? 1 : mPctB > 0.95 and mCDir < 0 ? -1 : 0, 0.75)
+vote(layL, layS, 1, mPat, 0.5 + 0.5 * nz(mPatS))
+vote(layL, layS, 1, not na(mSup) and mATR > 0 and (mClose - mSup) / mATR <= 0.75 ? 1 : 0, 0.75)
+vote(layL, layS, 1, not na(mRes) and mATR > 0 and (mRes - mClose) / mATR <= 0.75 ? -1 : 0, 0.75)
+vote(layL, layS, 1, mSqzRel ? mDon : 0, 1.0)
+// momentum (mid frame)
+vote(layL, layS, 2, mRelV >= 1.8 ? mCDir : 0, 1.0)
+vote(layL, layS, 2, sgn(mHist) == sgn(mHistD) ? sgn(mHist) : 0, 1.0)
+vote(layL, layS, 2, mKUp and mK < 50 ? 1 : mKDn and mK > 50 ? -1 : 0, 0.75)
+vote(layL, layS, 2, math.abs(vwapDev) >= 0.25 ? sgn(vwapDev) : 0, 0.5)
+vote(layL, layS, 2, math.abs(mCMF) >= 0.08 ? sgn(mCMF) : 0, 0.5)
+vote(layL, layS, 2, mRelV >= 1.2 ? mDon : 0, 0.75)
+vote(layL, layS, 2, mADX >= 25 ? sgn(mDIp - mDIm) : 0, 0.5)
+// timing (base frame)
+vote(layL, layS, 3, math.abs(streak) >= 3 and bodyR >= 0.5 ? sgn(streak) : 0, 0.75)
+vote(layL, layS, 3, ta.crossover(rsiF, 50) ? 1 : ta.crossunder(rsiF, 50) ? -1 : 0, 0.75)
+vote(layL, layS, 3, bodyR >= 0.7 ? cdirB : 0, 0.5)
+vote(layL, layS, 3, stBFlip ? stBDir : 0, 0.75)
+// context
+int highTrend = hClose > hE50 and hST > 0 ? 1 : hClose < hE50 and hST < 0 ? -1 : 0
+if ctxOn
+    relStr = nz(mROC) - nz(refROCMid)
+    vote(layL, layS, 4, math.abs(relStr) >= 1 ? sgn(relStr) : 0, 0.75)
+    vote(layL, layS, 4, refTrendH, 0.5)
+bool trending = mADX >= 22
+vote(layL, layS, 4, trending ? highTrend : 0, 0.5)
+
+float longScore  = 0.0
+float shortScore = 0.0
+int   layersLong = 0
+int   layersShort = 0
+for i = 0 to 4
+    float capv = array.get(layerCap, i)
+    float lv = math.min(array.get(layL, i), capv)
+    float sv = math.min(array.get(layS, i), capv)
+    array.set(layL, i, lv)
+    array.set(layS, i, sv)
+    longScore += lv
+    shortScore += sv
+    layersLong += lv >= 0.5 ? 1 : 0
+    layersShort += sv >= 0.5 ? 1 : 0
+
+int   dir     = longScore > shortScore ? 1 : shortScore > longScore ? -1 : 0
+float winS    = dir > 0 ? longScore : shortScore
+float loseS   = dir > 0 ? shortScore : longScore
+int   winL    = dir > 0 ? layersLong : layersShort
+sideOf(int layer) => dir > 0 ? array.get(layL, layer) : array.get(layS, layer)
+bool  trendRoute = sideOf(0) >= 1 and sideOf(2) >= 1
+bool  revRoute   = sideOf(1) >= 1.5 and (sideOf(3) >= 0.5 or sideOf(2) >= 0.75)
+bool  shockOK    = not ctxOn or not (math.abs(nz(refZBase)) >= 3.5 and sgn(refZBase) == -dir)
+bool  gate       = dir != 0 and winS >= minScore and winL >= minLayers and (trendRoute or revRoute) and loseS <= maxDis * winS and shockOK
+
+// ---------------------------------------------------------------- volatility forecast (HAR-RV, recursive least squares)
+float pv    = high > 0 and low > 0 ? math.pow(math.log(high / low), 2) / (4 * math.log(2)) : 0.0
+float vfloor = 1e-12
+float lv1   = math.log(math.max(pv, vfloor))
+float lv6   = math.log(math.max(ta.sma(pv, 6), vfloor))
+float lv24  = math.log(math.max(ta.sma(pv, 24), vfloor))
+float lv120 = math.log(math.max(ta.sma(pv, 120), vfloor))
+float lvH   = math.log(math.max(ta.sma(pv, horizon), vfloor)) // realised mean variance over the last `horizon` bars
+
+var float[] theta = array.new_float(5, 0.0)
+var float[] P = array.new_float(25, 0.0)
+var int nFit = 0
+var float resVar = 0.25
+if barstate.isfirst
+    for i = 0 to 4
+        array.set(P, i * 5 + i, 100.0)
+
+// The target known now is lvH; the features that predicted it are from `horizon` bars ago.
+float[] xOld = array.from(1.0, nz(lv1[horizon]), nz(lv6[horizon]), nz(lv24[horizon]), nz(lv120[horizon]))
+if bar_index > 120 + horizon and not na(lvH) and not na(lv120[horizon])
+    float[] Px = array.new_float(5, 0.0)
+    for i = 0 to 4
+        float acc = 0.0
+        for j = 0 to 4
+            acc += array.get(P, i * 5 + j) * array.get(xOld, j)
+        array.set(Px, i, acc)
+    float den = 0.9995
+    float yhat = 0.0
+    for i = 0 to 4
+        den += array.get(xOld, i) * array.get(Px, i)
+        yhat += array.get(theta, i) * array.get(xOld, i)
+    float err = lvH - yhat
+    for i = 0 to 4
+        array.set(theta, i, array.get(theta, i) + array.get(Px, i) / den * err)
+    for i = 0 to 4
+        for j = 0 to 4
+            array.set(P, i * 5 + j, (array.get(P, i * 5 + j) - array.get(Px, i) / den * array.get(Px, j)) / 0.9995)
+    nFit += 1
+    if nFit > 200
+        resVar += 0.01 * (err * err - resVar)
+
+float predNow = lvH
+if nFit > 200
+    predNow := array.get(theta, 0) + array.get(theta, 1) * lv1 + array.get(theta, 2) * lv6 + array.get(theta, 3) * lv24 + array.get(theta, 4) * lv120
+float sigBar = math.sqrt(math.exp(predNow + 0.5 * resVar))
+float sigH   = sigBar * math.sqrt(horizon)
+float expansion = math.exp(lvH) > 0 ? sigBar / math.sqrt(math.exp(lvH)) : 1.0
+
+// Empirically calibrated bands: quantiles of realised horizon returns in forecast-sigma units.
+var float[] zs = array.new_float(0)
+if bar_index > horizon and nz(sigH[horizon]) > 0
+    array.push(zs, math.log(close / close[horizon]) / sigH[horizon])
+    if array.size(zs) > 3000
+        array.shift(zs)
+bool  zReady = array.size(zs) >= 300
+float z05 = zReady ? array.percentile_nearest_rank(zs, 5) : -1.645
+float z16 = zReady ? array.percentile_nearest_rank(zs, 16) : -1.0
+float z84 = zReady ? array.percentile_nearest_rank(zs, 84) : 1.0
+float z95 = zReady ? array.percentile_nearest_rank(zs, 95) : 1.645
+string volState = expansion >= 1.15 ? "expanding" : expansion <= 0.87 ? "contracting" : "stable"
+
+// ---------------------------------------------------------------- self-audit: realised record of fired signals
+var float[] openEntry = array.new_float(0)
+var float[] openStop  = array.new_float(0)
+var int[]   openDir   = array.new_int(0)
+var int[]   openAge   = array.new_int(0)
+var float[] openCost  = array.new_float(0)
+var float[] resLong   = array.new_float(0)
+var float[] resShort  = array.new_float(0)
+
+if barstate.isconfirmed and array.size(openEntry) > 0
+    for i = array.size(openEntry) - 1 to 0
+        float e  = array.get(openEntry, i)
+        float stopD = array.get(openStop, i)
+        int   d  = array.get(openDir, i)
+        int   age = array.get(openAge, i) + 1
+        array.set(openAge, i, age)
+        float r = na
+        if d > 0
+            r := low <= e - stopD ? -1.0 : high >= e + targetR * stopD ? targetR : age >= horizon ? (close - e) / stopD : na
+        else
+            r := high >= e + stopD ? -1.0 : low <= e - targetR * stopD ? targetR : age >= horizon ? (e - close) / stopD : na
+        if not na(r)
+            float net = r - array.get(openCost, i)
+            if d > 0
+                array.push(resLong, net)
+                if array.size(resLong) > 500
+                    array.shift(resLong)
+            else
+                array.push(resShort, net)
+                if array.size(resShort) > 500
+                    array.shift(resShort)
+            array.remove(openEntry, i)
+            array.remove(openStop, i)
+            array.remove(openDir, i)
+            array.remove(openAge, i)
+            array.remove(openCost, i)
+
+trackStats(float[] rs) =>
+    int n = array.size(rs)
+    float m = n > 0 ? array.avg(rs) : 0.0
+    float sd = n > 1 ? array.stdev(rs, false) : 0.0
+    float half = n > 0 ? 1.96 * sd / math.sqrt(n) : 0.0
+    int wins = 0
+    if n > 0
+        for i = 0 to n - 1
+            wins += array.get(rs, i) > 0 ? 1 : 0
+    string status = n < 30 ? "unproven" : m - half > 0 ? "proven" : m + half < 0 ? "negative" : "unproven"
+    [n, n > 0 ? wins * 1.0 / n : 0.0, m, status]
+
+[nL, hitL, expL, statusL] = trackStats(resLong)
+[nS, hitS, expS, statusS] = trackStats(resShort)
+string edgeStatus = dir > 0 ? statusL : dir < 0 ? statusS : "n/a"
+
+// ---------------------------------------------------------------- decision
+float sl    = stopATR * atrB
+float costR = sl > 0 ? (feeIn + feeOut + slip) / 100 * close / sl : 0.0
+var int   lastLongBar  = na
+var float lastLongPx   = na
+var int   lastShortBar = na
+var float lastShortPx  = na
+bool repeatL = not na(lastLongBar) and bar_index - lastLongBar < coolBars and math.abs(close - lastLongPx) < coolATR * atrB
+bool repeatS = not na(lastShortBar) and bar_index - lastShortBar < coolBars and math.abs(close - lastShortPx) < coolATR * atrB
+bool longFire  = barstate.isconfirmed and gate and dir > 0 and not repeatL and sl > 0
+bool shortFire = barstate.isconfirmed and gate and dir < 0 and not repeatS and sl > 0
+
+float cPart = 0.5 * math.max(0, math.min(1, (winS - minScore) / 6 + 0.5)) + 0.5 * math.max(0, math.min(1, winL / 5))
+float dis   = winS > 0 ? math.min(1, loseS / winS) : 0.0
+float conf  = 100 * (0.45 * 0.5 + 0.35 * cPart + 0.20 * (1 - dis))
+conf := highTrend == -dir ? conf - 10 : conf
+conf := edgeStatus == "negative" ? math.min(conf, 40) : edgeStatus != "proven" ? math.min(conf, 59) : conf
+conf := math.max(0, math.min(100, conf))
+string tier = conf >= 75 ? "A" : conf >= 60 ? "B" : conf >= 45 ? "C" : "D"
+
+if longFire or shortFire
+    array.push(openEntry, close)
+    array.push(openStop, sl)
+    array.push(openDir, dir)
+    array.push(openAge, 0)
+    array.push(openCost, costR)
+if longFire
+    lastLongBar := bar_index
+    lastLongPx := close
+if shortFire
+    lastShortBar := bar_index
+    lastShortPx := close
+
+float score = (longScore + shortScore) > 0 ? 100 * (longScore - shortScore) / (longScore + shortScore + 3) : 0.0
+
+// ---------------------------------------------------------------- plots
+plot(showST ? stB : na, "Supertrend", color = stBDir > 0 ? color.new(color.teal, 0) : color.new(color.red, 0), linewidth = 1, style = plot.style_linebr)
+u90 = plot(showBands ? close * math.exp(z95 * sigH) : na, "Forecast 95%", color = color.new(color.gray, 60), offset = horizon)
+u68 = plot(showBands ? close * math.exp(z84 * sigH) : na, "Forecast 84%", color = color.new(color.blue, 50), offset = horizon)
+l68 = plot(showBands ? close * math.exp(z16 * sigH) : na, "Forecast 16%", color = color.new(color.blue, 50), offset = horizon)
+l90 = plot(showBands ? close * math.exp(z05 * sigH) : na, "Forecast 5%", color = color.new(color.gray, 60), offset = horizon)
+fill(u68, l68, color = color.new(color.blue, 92), title = "68% forecast range")
+fill(u90, u68, color = color.new(color.gray, 94), title = "Upper tail")
+fill(l68, l90, color = color.new(color.gray, 94), title = "Lower tail")
+
+plotshape(longFire, "LONG", shape.labelup, location.belowbar, color.new(color.teal, 0), text = "L", textcolor = color.white, size = size.small)
+plotshape(shortFire, "SHORT", shape.labeldown, location.abovebar, color.new(color.red, 0), text = "S", textcolor = color.white, size = size.small)
+
+if longFire or shortFire
+    string side = longFire ? "LONG" : "SHORT"
+    float stopPx = longFire ? close - sl : close + sl
+    float tpPx = longFire ? close + targetR * sl : close - targetR * sl
+    label.new(bar_index, longFire ? low : high, str.format("{0} {1} ({2,number,#})\nstop {3}\ntp {4}\ncost {5,number,#.##}R · edge {6}", side, tier, conf, str.tostring(stopPx, format.mintick), str.tostring(tpPx, format.mintick), costR, edgeStatus), style = longFire ? label.style_label_up : label.style_label_down, color = color.new(longFire ? color.teal : color.red, 80), textcolor = chart.fg_color, size = size.tiny)
+
+alertcondition(longFire, "Sentinel LONG", "SURGE Sentinel LONG signal on {{ticker}} {{interval}} at {{close}}")
+alertcondition(shortFire, "Sentinel SHORT", "SURGE Sentinel SHORT signal on {{ticker}} {{interval}} at {{close}}")
+if longFire or shortFire
+    alert(str.format("SURGE Sentinel {0} {1} tier {2} conf {3,number,#} edge {4} expected 1-sigma move {5,number,#.##}%", syminfo.ticker, longFire ? "LONG" : "SHORT", tier, conf, edgeStatus, sigH * 100), alert.freq_once_per_bar_close)
+
+// ---------------------------------------------------------------- dashboard
+var table dash = table.new(position.top_right, 2, 12, bgcolor = color.new(chart.bg_color, 10), border_color = color.new(color.gray, 70), border_width = 1)
+cellRow(int row, string k, string v, color c) =>
+    table.cell(dash, 0, row, k, text_color = color.gray, text_size = size.small, text_halign = text.align_left)
+    table.cell(dash, 1, row, v, text_color = c, text_size = size.small, text_halign = text.align_right)
+
+if showTable and barstate.islast
+    color dc = dir > 0 ? color.teal : dir < 0 ? color.red : color.gray
+    cellRow(0, "SURGE Sentinel", syminfo.ticker + " · " + midTF + "/" + highTF, chart.fg_color)
+    cellRow(1, "Score", str.tostring(score, "#.#"), dc)
+    cellRow(2, "Signal", gate ? (dir > 0 ? "LONG" : "SHORT") + " · " + tier : "none", gate ? dc : color.gray)
+    cellRow(3, "Long / short", str.tostring(longScore, "#.##") + " / " + str.tostring(shortScore, "#.##"), chart.fg_color)
+    cellRow(4, "Layers L / S", str.tostring(layersLong) + " / " + str.tostring(layersShort), chart.fg_color)
+    cellRow(5, "Route", trendRoute ? "trend" : revRoute ? "reversal" : "-", chart.fg_color)
+    cellRow(6, "Edge (live record)", edgeStatus, edgeStatus == "proven" ? color.teal : edgeStatus == "negative" ? color.red : color.orange)
+    cellRow(7, "Long record", str.format("{0} · hit {1,number,#%} · {2,number,#.##}R", nL, hitL, expL), chart.fg_color)
+    cellRow(8, "Short record", str.format("{0} · hit {1,number,#%} · {2,number,#.##}R", nS, hitS, expS), chart.fg_color)
+    cellRow(9, "Vol next " + str.tostring(horizon), str.tostring(sigH * 100, "#.##") + "% · " + volState, chart.fg_color)
+    cellRow(10, "Cost per trade", str.tostring(costR, "#.##") + "R", costR > 0.5 ? color.red : chart.fg_color)
+    cellRow(11, "Regime (ADX)", str.tostring(mADX, "#") + (trending ? " trending" : " ranging"), chart.fg_color)

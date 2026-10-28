@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "surge-sentinel": {
+      "command": "/absolute/path/to/sentinel",
+      "args": ["mcp", "-tf", "1h", "-symbols", "BTC-USDT,ETH-USDT,SOL-USDT,XRP-USDT"]
+    }
+  }
+}

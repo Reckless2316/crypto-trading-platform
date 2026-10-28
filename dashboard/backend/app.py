@@ -32,6 +32,7 @@ from data.collectors.collector_base import Candle
 from data.history import CandleHistoryStore, ExchangeHistory
 from research.autonomous.status_cards import candidate_cards
 from data.backtesting import BacktestEngine
+from strategies.sentinel_client import SentinelClient, SentinelUnavailable, to_signal as sentinel_to_signal
 from strategies.strategy_suite import (
     STRATEGY_CATALOG,
     STRATEGIES,
@@ -955,6 +956,19 @@ def stored_trends():
         series = [_stored_close_change(con, symbol) for symbol in ("BTC-USD", "ETH-USD")]
     body = {"series": series, "regime_valid": False, "eligible": False, "dispatched": False}
     return body
+
+
+@app.get("/api/sentinel/briefs")
+def sentinel_briefs():
+    """Advisory briefs from a locally running SURGE Sentinel engine (`sentinel serve`).
+
+    Read-only: nothing here is an order or an authority command, and the dashboard
+    still loads no exchange keys."""
+    try:
+        briefs = SentinelClient(timeout=5).briefs()
+    except (SentinelUnavailable, ValueError) as exc:
+        raise HTTPException(status_code=502, detail=f"sentinel unavailable: {exc}")
+    return {"briefs": briefs, "signals": [sentinel_to_signal(b) for b in briefs], "dispatched": False}
 
 
 @app.post("/api/market/global")

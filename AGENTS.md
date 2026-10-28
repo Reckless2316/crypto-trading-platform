@@ -72,3 +72,16 @@ network. Never route around a geo-block; use Coinalyze or the Binance archive in
 - `docs/research/2026-10-25-fade-forced-flush/`: sweep + OI-flush + funding-crowding reversal,
   pre-registered and killed (−0.2R gross per trade on 11 of 12 coins; the filters were no better
   than random). Both samples are spent. Don't re-propose it unchanged.
+- `docs/research/2026-10-28-sentinel-predictiveness/`: SURGE Sentinel walk-forward on BTC/ETH/SOL at
+  15m/1h/4h. HAR volatility forecasts are skilled out-of-sample (R² 0.11-0.44, calibrated bands).
+  Directional TA classifiers and confluence signals show no edge after OKX US fees; the direction
+  model is skill-gated for that reason. The data is spent for these hypotheses.
+
+## SURGE Sentinel (`sentinel/`, Go)
+
+Build and test with `cd sentinel && go vet ./... && go test -race ./...` (Go 1.25+, offline tests).
+Indicator changes must keep `internal/ta/talib_golden_test.go` green. Regenerate the fixture with
+`tools/talibgold/gen.sh` against a TA-Lib build. Sentinel reads public data only: never add exchange
+keys or order paths to it. The Python dashboard reaches it only through
+`strategies/sentinel_client.py`.
+

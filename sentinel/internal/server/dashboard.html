@@ -1,0 +1,161 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SURGE Sentinel</title>
+<style>
+:root{--bg:#0d1117;--panel:#161b22;--line:#30363d;--text:#e6edf3;--muted:#8b949e;--long:#3fb950;--short:#f85149;--warn:#d29922;--accent:#58a6ff}
+@media (prefers-color-scheme: light){:root{--bg:#f6f8fa;--panel:#fff;--line:#d0d7de;--text:#1f2328;--muted:#656d76;--long:#1a7f37;--short:#cf222e;--warn:#9a6700;--accent:#0969da}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:14px/1.45 system-ui,-apple-system,Segoe UI,sans-serif}
+header{display:flex;align-items:center;gap:12px;padding:12px 16px;border-bottom:1px solid var(--line);flex-wrap:wrap}
+header h1{font-size:16px;margin:0;letter-spacing:.04em}header .meta{color:var(--muted);font-size:12px}
+.dot{width:8px;height:8px;border-radius:50%;background:var(--muted);display:inline-block}.dot.on{background:var(--long)}
+main{display:grid;grid-template-columns:minmax(260px,360px) 1fr;gap:16px;padding:16px}
+@media (max-width:860px){main{grid-template-columns:1fr}}
+.list{display:flex;flex-direction:column;gap:8px}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:10px 12px;cursor:pointer}
+.card.sel{outline:2px solid var(--accent)}
+.row{display:flex;justify-content:space-between;align-items:center;gap:8px}
+.sym{font-weight:600}.px{font-variant-numeric:tabular-nums;color:var(--muted)}
+.badge{font-size:11px;padding:2px 6px;border-radius:10px;border:1px solid var(--line);white-space:nowrap}
+.LONG{color:var(--long);border-color:var(--long)}.SHORT{color:var(--short);border-color:var(--short)}
+.WATCH_LONG,.WATCH_SHORT{color:var(--warn);border-color:var(--warn)}.NEUTRAL{color:var(--muted)}
+.bar{height:6px;background:var(--line);border-radius:3px;position:relative;margin-top:8px;overflow:hidden}
+.bar i{position:absolute;top:0;bottom:0;border-radius:3px}
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:14px 16px;margin-bottom:16px}
+.panel h2{font-size:13px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);margin:0 0 10px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px}
+.kv .k{color:var(--muted);font-size:12px}.kv .v{font-size:16px;font-variant-numeric:tabular-nums}
+table{width:100%;border-collapse:collapse;font-size:13px}td,th{padding:4px 6px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}
+th{color:var(--muted);font-weight:500}.pass{color:var(--long)}.fail{color:var(--short)}
+.layer{display:grid;grid-template-columns:110px 1fr 1fr;gap:6px;align-items:center;margin:4px 0;font-size:12px}
+.half{height:10px;background:var(--line);border-radius:2px;position:relative}.half i{position:absolute;top:0;bottom:0}
+.half.l i{right:0;background:var(--long)}.half.s i{left:0;background:var(--short)}
+textarea{width:100%;min-height:60px;background:var(--bg);color:var(--text);border:1px solid var(--line);border-radius:6px;padding:8px;font:inherit}
+button{background:var(--accent);color:#fff;border:0;border-radius:6px;padding:8px 14px;font:inherit;cursor:pointer}button:disabled{opacity:.5;cursor:wait}
+pre{white-space:pre-wrap;word-break:break-word;margin:0;font:13px/1.5 ui-monospace,Consolas,monospace}
+.muted{color:var(--muted)}.note{font-size:12px;color:var(--muted);margin-top:8px}
+</style>
+</head>
+<body>
+<header>
+  <h1>SURGE SENTINEL</h1><span class="dot" id="live"></span><span class="meta" id="meta">connecting...</span>
+</header>
+<main>
+  <section class="list" id="list"></section>
+  <section id="detail"><div class="panel"><p class="muted">Waiting for the first closed bar...</p></div></section>
+</main>
+<script>
+const state = {briefs: {}, sel: null};
+const $ = (t, cls, text) => { const e = document.createElement(t); if (cls) e.className = cls; if (text !== undefined) e.textContent = text; return e; };
+const fmt = (x, d = 2) => (x === undefined || x === null || Number.isNaN(x)) ? "-" : Number(x).toLocaleString(undefined, {maximumFractionDigits: d});
+const pct = x => fmt(x * 100, 1) + "%";
+const px = x => { const a = Math.abs(x || 0); return fmt(x, a >= 1000 ? 2 : a >= 1 ? 4 : 6); };
+
+function renderList() {
+  const list = document.getElementById("list"); list.replaceChildren();
+  const rows = Object.values(state.briefs).sort((a, b) => Math.abs(b.sentinel_score) - Math.abs(a.sentinel_score));
+  for (const b of rows) {
+    const c = $("div", "card" + (state.sel === b.symbol ? " sel" : ""));
+    const r1 = $("div", "row"); r1.append($("span", "sym", b.symbol), $("span", "px", px(b.price)));
+    const r2 = $("div", "row"); const act = b.signal.action;
+    r2.append($("span", "badge " + act, act + (b.signal.tier && b.signal.tier !== "-" ? " · " + b.signal.tier : "")),
+              $("span", "muted", b.regime.kind + " · vol " + (b.volatility_forecast.state || "-")),
+              $("span", "", fmt(b.sentinel_score, 1)));
+    const bar = $("div", "bar"); const i = $("i"); const s = b.sentinel_score;
+    i.style.left = s >= 0 ? "50%" : (50 + s / 2) + "%"; i.style.width = Math.abs(s) / 2 + "%";
+    i.style.background = s >= 0 ? "var(--long)" : "var(--short)"; bar.append(i);
+    c.append(r1, r2, bar);
+    c.onclick = () => { state.sel = b.symbol; render(); };
+    list.append(c);
+  }
+}
+
+function kv(k, v) { const d = $("div", "kv"); d.append($("div", "k", k), $("div", "v", v)); return d; }
+
+function renderDetail() {
+  const b = state.briefs[state.sel]; if (!b) return;
+  const root = document.getElementById("detail"); root.replaceChildren();
+  const head = $("div", "panel");
+  head.append($("h2", "", b.symbol + " · " + b.tf + " · bar " + new Date(b.bar_time).toISOString().slice(0, 16).replace("T", " ") + " UTC"));
+  if (!b.ready) { head.append($("p", "muted", "Warming up: " + b.warmup)); root.append(head); return; }
+  const g = $("div", "grid"); const sg = b.signal;
+  g.append(kv("Signal", sg.action + (sg.actionable ? "" : sg.action.startsWith("WATCH") || sg.action === "NEUTRAL" ? "" : " (not actionable)")),
+           kv("Confidence", fmt(sg.confidence, 0) + " · tier " + sg.tier), kv("Edge status", sg.edge_status + " (" + sg.track_record.n + " fired)"),
+           kv("Sentinel score", fmt(b.sentinel_score, 1)), kv("Regime", b.regime.kind), kv("Price", px(b.price)));
+  head.append(g, $("p", "note", sg.summary)); root.append(head);
+
+  const f = b.volatility_forecast; const fp = $("div", "panel"); fp.append($("h2", "", "Volatility forecast (next " + f.horizon_bars + " bars)"));
+  const fg = $("div", "grid");
+  fg.append(kv("Expected move (1σ)", fmt(f.sigma_horizon_pct, 2) + "%"), kv("State", f.state + " ×" + fmt(f.expansion, 2)),
+            kv("68% range", px(f.range68[0]) + " – " + px(f.range68[1])), kv("90% range", px(f.range90[0]) + " – " + px(f.range90[1])),
+            kv("Out-of-sample R²", fmt(f.r2_oos, 3) + " (naive " + fmt(f.r2_naive, 3) + ")"), kv("Band coverage", pct(f.coverage68) + " / " + pct(f.coverage90)));
+  fp.append(fg, $("p", "note", f.trusted ? "The forecaster beats naive persistence out-of-sample and its bands are calibrated against realised closes." : "Forecaster still proving itself against naive persistence."));
+  root.append(fp);
+
+  const cp = $("div", "panel"); cp.append($("h2", "", "Confluence by layer (long ← → short)"));
+  for (const l of b.confluence.layers) {
+    const row = $("div", "layer"); const L = $("div", "half l"), S = $("div", "half s"); const li = $("i"), si = $("i");
+    li.style.width = (l.long / 3 * 100) + "%"; si.style.width = (l.short / 3 * 100) + "%"; L.append(li); S.append(si);
+    row.append($("span", "muted", l.layer), L, S); cp.append(row);
+  }
+  const votes = $("table"); const th = $("tr"); th.append($("th", "", "Side"), $("th", "", "Evidence"), $("th", "", "Weight")); votes.append(th);
+  for (const v of [...(b.confluence.top_long || []), ...(b.confluence.top_short || [])]) {
+    const tr = $("tr"); tr.append($("td", v.side > 0 ? "pass" : "fail", v.side > 0 ? "long" : "short"), $("td", "", v.detail), $("td", "", fmt(v.weight, 2))); votes.append(tr);
+  }
+  cp.append(votes); root.append(cp);
+
+  const gp = $("div", "panel"); gp.append($("h2", "", "Signal gate"));
+  const gt = $("table");
+  for (const c of sg.gate || []) { const tr = $("tr"); tr.append($("td", c.pass ? "pass" : "fail", c.pass ? "pass" : "fail"), $("td", "", c.name), $("td", "", c.detail)); gt.append(tr); }
+  gp.append(gt);
+  if (sg.plan) {
+    const p = sg.plan; const pg = $("div", "grid");
+    pg.append(kv("Entry", px(p.entry)), kv("Stop", px(p.stop)), kv("TP1 / TP2", px(p.tp1) + " / " + px(p.tp2)),
+              kv("Costs", fmt(p.cost_r, 2) + "R"), kv("Expected", fmt(p.expected_r, 2) + "R"), kv("Suggested risk", fmt(p.suggested_risk_pct, 2) + "% equity"));
+    gp.append($("h2", "", "Plan"), pg);
+    if (p.obstruction) gp.append($("p", "note", p.obstruction));
+    if (p.spot_note) gp.append($("p", "note", p.spot_note));
+  }
+  root.append(gp);
+
+  const m = b.direction_model; const mp = $("div", "panel"); mp.append($("h2", "", "Direction model (skill-gated)"));
+  const mg = $("div", "grid");
+  mg.append(kv("Long", (m.long_active ? "active" : "abstains") + " · AUC " + fmt(m.long_recent_auc, 3)), kv("Short", (m.short_active ? "active" : "abstains") + " · AUC " + fmt(m.short_recent_auc, 3)),
+            kv("P(long target)", pct(m.p_long)), kv("P(short target)", pct(m.p_short)), kv("Cost per trade", fmt(m.cost_r, 2) + "R"));
+  mp.append(mg, $("p", "note", "long: " + m.long_reason + " · short: " + m.short_reason)); root.append(mp);
+
+  const ap = $("div", "panel"); ap.append($("h2", "", "Ask the analyst"));
+  const ta = $("textarea"); ta.placeholder = "e.g. Is this breakout worth taking given the funding and the volatility outlook?";
+  const btn = $("button", "", "Ask"); const out = $("pre", "muted");
+  btn.onclick = async () => {
+    btn.disabled = true; out.textContent = "Thinking with Sentinel's tools...";
+    try {
+      const r = await fetch("/api/agent", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({symbol: b.symbol, timeframe: b.tf, question: ta.value})});
+      const j = await r.json();
+      if (!r.ok) { out.textContent = j.error || r.statusText; return; }
+      const a = j.assessment;
+      out.textContent = a ? `[${a.stance.toUpperCase()}] ${a.headline}\n\n${a.reasoning}\n\nRisks:\n- ${a.risks.join("\n- ")}\n\nEdge: ${a.edge_assessment}` + (j.ungrounded_numbers?.length ? `\n\nWARNING ungrounded levels: ${j.ungrounded_numbers}` : "") : (j.text || "");
+    } catch (e) { out.textContent = String(e); } finally { btn.disabled = false; }
+  };
+  ap.append(ta, $("div", "row"), btn, $("div", "note", "Uses the Claude API when ANTHROPIC_API_KEY is set on the server. The analyst can only cite engine outputs."), out);
+  root.append(ap);
+}
+
+function render() { renderList(); renderDetail(); }
+
+function connect() {
+  const es = new EventSource("/api/stream");
+  es.addEventListener("brief", ev => {
+    const b = JSON.parse(ev.data); state.briefs[b.symbol] = b; if (!state.sel) state.sel = b.symbol;
+    document.getElementById("meta").textContent = "live · " + b.tf + " closed bars · last " + new Date().toLocaleTimeString();
+    render();
+  });
+  es.onopen = () => document.getElementById("live").classList.add("on");
+  es.onerror = () => { document.getElementById("live").classList.remove("on"); document.getElementById("meta").textContent = "reconnecting..."; };
+}
+connect();
+</script>
+</body>
+</html>
