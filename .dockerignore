@@ -15,3 +15,5 @@ data/cache/
 data/autonomous/
 monitoring/
 security/
+# The Go Sentinel engine runs as its own process; the dashboard reaches it over HTTP.
+sentinel/

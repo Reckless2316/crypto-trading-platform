@@ -1,0 +1,272 @@
+{
+  "symbols": [
+    "BTC"
+  ],
+  "tf": "15m",
+  "from": "2025-12-19T14:30:00Z",
+  "to": "2026-10-28T02:15:00Z",
+  "bars": 30000,
+  "config": {
+    "symbol": "",
+    "stop_atr": 1.5,
+    "target_r": 2,
+    "horizon": 48,
+    "fee_entry_pct": 0.2,
+    "fee_exit_pct": 0.35,
+    "slippage_pct": 0.05,
+    "min_score": 5,
+    "min_layers": 3,
+    "max_disagreement": 0.5,
+    "min_edge_r": 0.05,
+    "warm_samples": 300,
+    "cooldown_bars": 12,
+    "cooldown_atr": 1,
+    "max_risk_pct": 2,
+    "require_proven_edge": false,
+    "model": {
+      "alpha": 0.05,
+      "beta": 1,
+      "l1": 0.05,
+      "l2": 2
+    }
+  },
+  "volatility": {
+    "BTC": {
+      "ready": true,
+      "trusted": true,
+      "horizon_bars": 48,
+      "sigma_per_bar": 0.0016407430357478975,
+      "sigma_horizon": 0.011367401200320629,
+      "current_sigma_per_bar": 0.0013441244116396446,
+      "expansion": 1.2206779532754855,
+      "r2_oos": 0.43757635377541715,
+      "r2_naive": 0.19969801127072506,
+      "coverage68": 0.6669258069967889,
+      "coverage90": 0.8889640020280548,
+      "samples": 29833,
+      "band_z05": -1.55841518949483,
+      "band_z16": -0.7850699958293987,
+      "band_z84": 0.7388587349421144,
+      "band_z95": 1.3266545028658236
+    }
+  },
+  "long": {
+    "model": {
+      "samples": 29039,
+      "base_rate": 0.3009056785701987,
+      "log_loss": 0.6159286243721295,
+      "brier": 0.2119067973159911,
+      "brier_skill": -0.006989927677238272,
+      "log_loss_skill": -0.006745248421110128,
+      "auc": 0.5948381173270517,
+      "reliability": [
+        {
+          "range": "0.0-0.1",
+          "count": 129,
+          "mean_pred": 0.08491820199766299,
+          "observed": 0.5116279069767442
+        },
+        {
+          "range": "0.1-0.2",
+          "count": 1692,
+          "mean_pred": 0.16677164941424077,
+          "observed": 0.21926713947990545
+        },
+        {
+          "range": "0.2-0.3",
+          "count": 11038,
+          "mean_pred": 0.2608213344472788,
+          "observed": 0.27722413480703023
+        },
+        {
+          "range": "0.3-0.4",
+          "count": 13797,
+          "mean_pred": 0.3424041951055417,
+          "observed": 0.3263752989780387
+        },
+        {
+          "range": "0.4-0.5",
+          "count": 2101,
+          "mean_pred": 0.4302492173362852,
+          "observed": 0.3050928129462161
+        },
+        {
+          "range": "0.5-0.6",
+          "count": 228,
+          "mean_pred": 0.5386709453291421,
+          "observed": 0.37719298245614036
+        },
+        {
+          "range": "0.6-0.7",
+          "count": 52,
+          "mean_pred": 0.6345398156505074,
+          "observed": 0.21153846153846154
+        },
+        {
+          "range": "0.7-0.8",
+          "count": 2,
+          "mean_pred": 0.7215347361953701,
+          "observed": 0
+        }
+      ]
+    },
+    "baseline_r": -1.8410698532344414,
+    "baseline_hit": 0.3009056785701987,
+    "signals": 766,
+    "hit_rate": 0.31723237597911225,
+    "expectancy_r": -1.6604365890583708,
+    "expectancy_ci95": [
+      -1.7756984391062234,
+      -1.5454841024651305
+    ],
+    "profit_factor": 0.09464445750709395,
+    "total_r": -1271.894427218712,
+    "max_drawdown_r": 1271.894427218712,
+    "first_half_expectancy_r": -1.4370380833780156,
+    "second_half_expectancy_r": -1.883835094738724,
+    "by_regime": {
+      "range": {
+        "n": 382,
+        "hit_rate": 0.3193717277486911,
+        "expectancy_r": -1.8909302388141744
+      },
+      "trend_down": {
+        "n": 17,
+        "hit_rate": 0.23529411764705882,
+        "expectancy_r": -2.0914280418971734
+      },
+      "trend_up": {
+        "n": 348,
+        "hit_rate": 0.31896551724137934,
+        "expectancy_r": -1.4446406262901916
+      },
+      "volatile": {
+        "n": 19,
+        "hit_rate": 0.3157894736842105,
+        "expectancy_r": -0.5931505963399432
+      }
+    },
+    "by_tier": {
+      "C": {
+        "n": 30,
+        "hit_rate": 0.3333333333333333,
+        "expectancy_r": -2.2567246583925495
+      },
+      "D": {
+        "n": 736,
+        "hit_rate": 0.31657608695652173,
+        "expectancy_r": -1.6361313688409453
+      }
+    }
+  },
+  "short": {
+    "model": {
+      "samples": 29040,
+      "base_rate": 0.30547520661157024,
+      "log_loss": 0.6234985775683971,
+      "brier": 0.21542184625383215,
+      "brier_skill": -0.015094918388170786,
+      "log_loss_skill": -0.012823640782124945,
+      "auc": 0.4837784568600157,
+      "reliability": [
+        {
+          "range": "0.0-0.1",
+          "count": 123,
+          "mean_pred": 0.08844153222883161,
+          "observed": 0.2601626016260163
+        },
+        {
+          "range": "0.1-0.2",
+          "count": 934,
+          "mean_pred": 0.1611738672652806,
+          "observed": 0.2837259100642398
+        },
+        {
+          "range": "0.2-0.3",
+          "count": 11199,
+          "mean_pred": 0.26489916573117134,
+          "observed": 0.2920796499687472
+        },
+        {
+          "range": "0.3-0.4",
+          "count": 13432,
+          "mean_pred": 0.33851724254912763,
+          "observed": 0.3113460393091126
+        },
+        {
+          "range": "0.4-0.5",
+          "count": 2927,
+          "mean_pred": 0.4375016056976832,
+          "observed": 0.341646737273659
+        },
+        {
+          "range": "0.5-0.6",
+          "count": 419,
+          "mean_pred": 0.532519476060094,
+          "observed": 0.28878281622911695
+        },
+        {
+          "range": "0.6-0.7",
+          "count": 6,
+          "mean_pred": 0.6068817623109671,
+          "observed": 0
+        }
+      ]
+    },
+    "baseline_r": -1.8378831068911856,
+    "baseline_hit": 0.30547520661157024,
+    "signals": 856,
+    "hit_rate": 0.32242990654205606,
+    "expectancy_r": -1.67380914300981,
+    "expectancy_ci95": [
+      -1.7918028806897577,
+      -1.5582099783980499
+    ],
+    "profit_factor": 0.09443697533259361,
+    "total_r": -1432.7806264163974,
+    "max_drawdown_r": 1432.7806264163974,
+    "first_half_expectancy_r": -1.3315607361640764,
+    "second_half_expectancy_r": -2.0160575498555415,
+    "by_regime": {
+      "range": {
+        "n": 432,
+        "hit_rate": 0.32407407407407407,
+        "expectancy_r": -1.9382956741370125
+      },
+      "trend_down": {
+        "n": 374,
+        "hit_rate": 0.3342245989304813,
+        "expectancy_r": -1.3882653265623626
+      },
+      "trend_up": {
+        "n": 21,
+        "hit_rate": 0.23809523809523808,
+        "expectancy_r": -1.9243725801002118
+      },
+      "volatile": {
+        "n": 29,
+        "hit_rate": 0.20689655172413793,
+        "expectancy_r": -1.234959961130293
+      }
+    },
+    "by_tier": {
+      "C": {
+        "n": 29,
+        "hit_rate": 0.27586206896551724,
+        "expectancy_r": -1.9844326493378899
+      },
+      "D": {
+        "n": 827,
+        "hit_rate": 0.32406287787182586,
+        "expectancy_r": -1.6629166621349432
+      }
+    }
+  },
+  "verdict": [
+    "BTC volatility forecast: out-of-sample R^2 0.438 vs 0.200 for naive persistence (beats it) over 29833 forecasts.",
+    "long model: AUC 0.595, Brier skill -0.007 on 29039 out-of-sample labels: no skill over the base rate.",
+    "long signals: 766 trades, hit 31.7%, expectancy -1.660R net (95% CI -1.776..-1.545) beats (95% CI excludes the baseline) the every-bar baseline -1.841R.",
+    "short model: AUC 0.484, Brier skill -0.015 on 29040 out-of-sample labels: no skill over the base rate.",
+    "short signals: 856 trades, hit 32.2%, expectancy -1.674R net (95% CI -1.792..-1.558) beats (95% CI excludes the baseline) the every-bar baseline -1.838R."
+  ]
+}

@@ -13,3 +13,7 @@ __pycache__/
 data/autonomous/runtime*/
 data/cache/
 docs/research/2026-10-25-fade-forced-flush/trades_*.jsonl
+
+# SURGE Sentinel
+sentinel/sentinel
+data/sentinel-ledger.jsonl

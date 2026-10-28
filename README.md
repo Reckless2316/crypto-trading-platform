@@ -43,6 +43,33 @@ Prefer limit orders and low-turnover strategies. Reasoning, fee tables and sourc
 [docs/research/2026-10-25-venue-selection.md](docs/research/2026-10-25-venue-selection.md). Live trading
 stays disabled unless explicitly configured and armed.
 
+## SURGE Sentinel: real-time indicators with an analyst agent
+
+[`sentinel/`](sentinel/README.md) is a Go engine that analyses OKX pairs on three timeframes in real
+time. It produces the following:
+
+- a layered long/short confluence score and signal gate;
+- a calibrated volatility forecast (out-of-sample R² 0.11-0.44, beating naive persistence on every
+  tested series);
+- a skill-gated direction model;
+- a self-auditing, hash-chained signal record.
+
+It serves the same tools to a Claude analyst agent, to MCP clients and over HTTP, with a live
+dashboard. A TradingView Pine v6 port is included. Signals are advisory only, and the engine never
+loads keys or places orders.
+
+```sh
+cd sentinel && go build -o sentinel ./cmd/sentinel
+./sentinel serve -tf 1h          # http://127.0.0.1:8090
+./sentinel agent -symbol BTC-USDT "what is the setup?"   # needs ANTHROPIC_API_KEY
+```
+
+Its walk-forward study is in
+[docs/research/2026-10-28-sentinel-predictiveness/](docs/research/2026-10-28-sentinel-predictiveness/RESULTS.md).
+Volatility is predictable; direction from technical indicators is not, after OKX US fees. The
+dashboard shows Sentinel's briefs through `GET /api/sentinel/briefs` when `sentinel serve` is
+running.
+
 ## Data sources
 
 SURGE reads 36 public market-data sources: 19 exchanges plus positioning, volatility, macro, ETF
