@@ -15,6 +15,7 @@ from .collectors.collector_base import Candle, Collector
 from .collectors.binance_collector import BinanceCollector
 from .collectors.coinbase_collector import CoinbaseCollector
 from .collectors.kraken_collector import KrakenCollector
+from .collectors.okx_collector import OkxCollector
 
 TIMEFRAME_MS = {"1m": 60_000, "5m": 300_000, "15m": 900_000,
                 "1h": 3_600_000, "4h": 14_400_000, "1d": 86_400_000}
@@ -32,7 +33,8 @@ class CandleHistoryStore:
                 open REAL NOT NULL, high REAL NOT NULL, low REAL NOT NULL,
                 close REAL NOT NULL, volume REAL NOT NULL, fetched_at_ms INTEGER NOT NULL,
                 PRIMARY KEY(exchange, symbol, timeframe, ts_open))""")
-            db.execute("CREATE INDEX IF NOT EXISTS idx_history_lookup ON candle_history(exchange,symbol,timeframe,ts_open)")
+            # The primary key already serves every lookup; a duplicate index only slows writes.
+            db.execute("DROP INDEX IF EXISTS idx_history_lookup")
             db.commit()
 
     def _connect(self):
@@ -55,16 +57,27 @@ class CandleHistoryStore:
         return len(rows)
 
     def load(self, exchange: str, symbol: str, timeframe: str,
-             start_ms: Optional[int] = None, end_ms: Optional[int] = None) -> list[Candle]:
+             start_ms: Optional[int] = None, end_ms: Optional[int] = None, limit: Optional[int] = None,
+             closed_before_ms: Optional[int] = None) -> list[Candle]:
+        """Candles ascending by open time; with ``limit``, only the most recent N."""
         sql = "SELECT open,high,low,close,volume,ts_open,ts_close FROM candle_history WHERE exchange=? AND symbol=? AND timeframe=?"
         params: list[object] = [exchange, symbol, timeframe]
         if start_ms is not None:
             sql += " AND ts_open>=?"; params.append(int(start_ms))
         if end_ms is not None:
             sql += " AND ts_open<?"; params.append(int(end_ms))
-        sql += " ORDER BY ts_open"
+        if closed_before_ms is not None:
+            sql += " AND ts_close<=?"; params.append(int(closed_before_ms))
+        if limit is None:
+            sql += " ORDER BY ts_open"
+        else:
+            sql += " ORDER BY ts_open DESC LIMIT ?"
+            params.append(max(int(limit), 0))
         with closing(self._connect()) as db:
-            return [Candle(*row) for row in db.execute(sql, params).fetchall()]
+            rows = [Candle(*row) for row in db.execute(sql, params).fetchall()]
+        if limit is not None:
+            rows.reverse()
+        return rows
 
 
 class ExchangeHistory:
@@ -72,7 +85,8 @@ class ExchangeHistory:
 
     def __init__(self, collectors: Optional[Mapping[str, Collector]] = None):
         self.collectors = dict(collectors or {
-            "coinbase": CoinbaseCollector(), "binance": BinanceCollector(), "kraken": KrakenCollector()
+            "coinbase": CoinbaseCollector(), "binance": BinanceCollector(), "kraken": KrakenCollector(),
+            "okx": OkxCollector()
         })
 
     def fetch(self, exchange: str, symbol: str, timeframe: str, start_ms: int,
@@ -89,12 +103,13 @@ class ExchangeHistory:
             "coinbase": set(CoinbaseCollector.TIMEFRAME_MAP),
             "binance": set(BinanceCollector.INTERVAL_MAP),
             "kraken": {"1m", "5m", "15m", "1h", "4h", "1d"},
+            "okx": set(OkxCollector.BAR_MAP),
         }.get(exchange, set())
         if timeframe not in supported:
             raise ValueError(f"Unsupported {exchange} timeframe: {timeframe}")
         step = TIMEFRAME_MS[timeframe]
         # Keep each call within the providers' documented candle page sizes.
-        page_size = {"coinbase": 300, "binance": 1000, "kraken": 700}.get(exchange)
+        page_size = {"coinbase": 300, "binance": 1000, "kraken": 700, "okx": 1000}.get(exchange)
         if page_size is None:
             raise ValueError(f"No pagination policy configured for exchange: {exchange}")
         result: dict[int, Candle] = {}
@@ -103,7 +118,7 @@ class ExchangeHistory:
             page_end = min(end_ms, cursor + page_size * step)
             if exchange == "binance":
                 raw = collector.fetch_candles(symbol, timeframe, cursor, page_end)
-            else:  # Coinbase and Kraken collectors take Unix seconds.
+            else:  # Coinbase, Kraken and OKX collectors take Unix seconds.
                 raw = collector.fetch_candles(symbol, timeframe, cursor // 1000, page_end // 1000)
             for c in raw:
                 if start_ms <= c.ts_open < end_ms:
@@ -126,6 +141,9 @@ class ExchangeHistory:
         elif exchange == "binance":
             if not symbol.replace("-", "").isalnum():
                 raise ValueError("Binance symbol must be alphanumeric, optionally separated by '-'")
+        elif exchange == "okx":
+            if len(symbol.split("-")) != 2 or not all(p.isalnum() for p in symbol.split("-")):
+                raise ValueError("OKX symbol must look like BTC-USDT")
         elif exchange == "kraken":
             supported = {"BTCUSDT", "ETHUSDT", "XRPUSDT", "XXBTZUSD", "XETHZUSD", "XXRPZUSD"}
             if symbol not in supported:

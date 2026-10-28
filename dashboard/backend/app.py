@@ -8,6 +8,7 @@ import os
 import sqlite3
 import stat
 import time
+from collections import deque
 from contextlib import closing
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -22,14 +23,22 @@ from dashboard.backend.authority_client import (allowed_host, check_local_post, 
 
 from bot.risk_gates import RiskGates
 from bot.onboard_ai import OnboardTradingAgent
+from data.binance_archive import ARCHIVE_EXCHANGE
 from data.call_log import DataCallLog
+from data.sources import SOURCES, Fetcher, SnapshotStore, data_key, probe_all
 from data.public_metrics import fetch_coinbase_book, fetch_global, fetch_listed_markets
 from data.collectors.coinbase_collector import CoinbaseCollector
 from data.collectors.collector_base import Candle
 from data.history import CandleHistoryStore, ExchangeHistory
 from research.autonomous.status_cards import candidate_cards
 from data.backtesting import BacktestEngine
-from strategies.strategy_suite import STRATEGY_CATALOG, STRATEGIES, generate_signal
+from strategies.sentinel_client import SentinelClient, SentinelUnavailable, to_signal as sentinel_to_signal
+from strategies.strategy_suite import (
+    STRATEGY_CATALOG,
+    STRATEGIES,
+    IncrementalBacktestSignal,
+    generate_signal,
+)
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -40,6 +49,7 @@ MAX_POSITION_PCT = 5.0
 MAX_DAILY_LOSS_PCT = 3.0
 MAX_OPEN_POSITIONS = 3
 FEE_RATE = 0.001
+MAX_BACKTEST_CANDLES = 100_000
 FRONTEND = ROOT / "dashboard" / "frontend" / "index.html"
 
 app = FastAPI(title="SURGE Crypto Trading Platform", version="1.1.0")
@@ -179,7 +189,7 @@ def init_db() -> None:
           VALUES('paper_default',10000,10000);
         INSERT OR IGNORE INTO runtime_state(id,kill_switch,armed_until) VALUES(1,1,0);
         INSERT OR IGNORE INTO automation_state(id,enabled,last_candle_ts) VALUES(1,0,0);
-        CREATE INDEX IF NOT EXISTS idx_candles_recent ON candles(symbol,timeframe,ts_open DESC);
+        DROP INDEX IF EXISTS idx_candles_recent;
         CREATE INDEX IF NOT EXISTS idx_orders_recent ON orders(created_at DESC);
         """)
         con.commit()
@@ -216,26 +226,46 @@ async def collector_loop() -> None:
         await asyncio.sleep(interval)
 
 
+async def sources_loop() -> None:
+    """Snapshot every registered data source. SURGE_SOURCES_INTERVAL=0 turns this off."""
+    interval = int(os.environ.get("SURGE_SOURCES_INTERVAL", "900"))
+    if interval <= 0:
+        return
+    await asyncio.sleep(30)   # let the service settle; short-lived clients never reach a probe
+    while True:
+        try:
+            results = await asyncio.to_thread(probe_all, Fetcher(DataCallLog(DB_FILE)))
+            await asyncio.to_thread(SnapshotStore(DB_FILE).save, results)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("Source snapshot round failed: %s", exc)
+        await asyncio.sleep(max(60, interval))
+
+
 @app.on_event("startup")
 async def start_collector() -> None:
     provider_names = {"SURGE_COINBASE_API_KEY", "SURGE_COINBASE_API_SECRET",
-        "SURGE_BINANCE_API_KEY", "SURGE_BINANCE_API_SECRET", "TYPESAFE_API_KEY", "SURGE_BRAIN_API_KEY"}
+        "SURGE_BINANCE_API_KEY", "SURGE_BINANCE_API_SECRET", "SURGE_OKX_API_KEY", "SURGE_OKX_API_SECRET",
+        "SURGE_OKX_API_PASSPHRASE", "TYPESAFE_API_KEY", "SURGE_BRAIN_API_KEY"}
     if any(os.environ.get(name) for name in provider_names):
         raise RuntimeError("Dashboard must start without provider credentials")
     init_db()
     app.state.market_data = {"last_success": None, "candles": 0, "error": None}
     app.state.collector_task = asyncio.create_task(collector_loop())
+    app.state.sources_task = asyncio.create_task(sources_loop())
 
 
 @app.on_event("shutdown")
 async def stop_collector() -> None:
-    task = getattr(app.state, "collector_task", None)
-    if task:
-        task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
+    for name in ("collector_task", "sources_task"):
+        task = getattr(app.state, name, None)
+        if task:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
 
 
 class OrderRequest(BaseModel):
@@ -331,6 +361,83 @@ def portfolio(con: sqlite3.Connection) -> dict:
     return {"account": ACCOUNT_ID, "mode": "paper", "cash": state["cash"], "market_value": market_value,
             "equity": state["cash"] + market_value, "starting_equity": state["starting_equity"],
             "realized_pnl": realized, "unrealized_pnl": unrealized, "positions": positions}
+
+
+_OBS_STARTED = time.time()
+_OBS_EVENTS: deque = deque(maxlen=50)
+_OBS_ROUTES: dict = {}
+
+
+_ROUTE_PATHS: frozenset = frozenset()
+
+
+def _route_paths() -> frozenset:
+    # Routes are all registered at import time; build the set once, on first request.
+    global _ROUTE_PATHS
+    if not _ROUTE_PATHS:
+        _ROUTE_PATHS = frozenset(getattr(route, "path", "") for route in app.routes)
+    return _ROUTE_PATHS
+
+
+@app.middleware("http")
+async def observe_requests(request: Request, call_next):
+    started = time.perf_counter()
+    status_code = 500
+    try:
+        response = await call_next(request)
+        status_code = response.status_code
+        return response
+    finally:
+        # Stats are keyed by registered route, so unknown URLs (scanners, typos) share one bucket
+        # instead of growing the table without bound.
+        path = request.url.path if request.url.path in _route_paths() else "<unmatched>"
+        if path != "/api/observability":
+            ms = (time.perf_counter() - started) * 1000
+            stat_row = _OBS_ROUTES.setdefault(path, {"count": 0, "errors": 0, "total_ms": 0.0, "max_ms": 0.0})
+            stat_row["count"] += 1
+            stat_row["errors"] += status_code >= 400
+            stat_row["total_ms"] += ms
+            stat_row["max_ms"] = max(stat_row["max_ms"], ms)
+            if status_code >= 400 or request.method != "GET":
+                _OBS_EVENTS.appendleft({"time": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                    "method": request.method, "path": path, "status": status_code, "ms": round(ms, 1)})
+
+
+def _stored_candle_count() -> tuple[bool, int]:
+    """Exchange-aware history plus legacy Coinbase rows that history does not already mirror."""
+    try:
+        with closing(db()) as con:
+            con.execute("SELECT 1").fetchone()
+            try:
+                history = con.execute("SELECT COUNT(*) FROM candle_history").fetchone()[0]
+                legacy = con.execute("""SELECT COUNT(*) FROM candles c WHERE NOT EXISTS (
+                    SELECT 1 FROM candle_history h WHERE h.exchange='coinbase' AND h.symbol=c.symbol
+                    AND h.timeframe=c.timeframe AND h.ts_open=c.ts_open)""").fetchone()[0]
+            except sqlite3.OperationalError:   # candle_history is created on first exchange fetch
+                history = 0
+                legacy = con.execute("SELECT COUNT(*) FROM candles").fetchone()[0]
+            return True, history + legacy
+    except sqlite3.Error:
+        return False, 0
+
+
+@app.get("/api/observability")
+async def observability():
+    """Plain-language health, traffic and recent-event snapshot for the dashboard."""
+    # Async on purpose: the middleware mutates _OBS_ROUTES on the event loop, so reading it here
+    # (not in a worker thread) cannot race. Only the SQLite read is moved off the loop.
+    routes = [{"path": path, "count": r["count"], "errors": r["errors"],
+               "avg_ms": round(r["total_ms"] / r["count"], 1), "max_ms": round(r["max_ms"], 1)}
+              for path, r in _OBS_ROUTES.items()]
+    events = list(_OBS_EVENTS)[:20]
+    db_ok, candles = await asyncio.to_thread(_stored_candle_count)
+    routes.sort(key=lambda r: r["count"], reverse=True)
+    total = sum(r["count"] for r in routes)
+    errors = sum(r["errors"] for r in routes)
+    collector = getattr(app.state, "market_data", {"last_success": None, "candles": 0, "error": None})
+    return {"uptime_seconds": int(time.time() - _OBS_STARTED), "database": "ok" if db_ok else "down",
+            "stored_candles": candles, "collector": collector, "requests": total, "errors": errors,
+            "routes": routes[:10], "events": events, "mode": "paper"}
 
 
 @app.get("/")
@@ -490,8 +597,13 @@ def _product_symbol(symbol: str) -> str:
     return symbol
 
 
+# Exchanges whose candles can be read from the store: the four fetchable ones plus the Binance
+# archive import (python -m data.binance_archive import), which is never fetched by this service.
+STORED_EXCHANGES = frozenset({"coinbase", "binance", "kraken", "okx", ARCHIVE_EXCHANGE})
+
+
 def _load_closed_candles(exchange: str, symbol: str, timeframe: str) -> list:
-    if exchange not in {"coinbase", "binance", "kraken"} or timeframe not in _TIMEFRAMES:
+    if exchange not in STORED_EXCHANGES or timeframe not in _TIMEFRAMES:
         raise HTTPException(status_code=422, detail="Unsupported exchange or timeframe")
     candle_rows = CandleHistoryStore(DB_FILE).load(exchange, symbol, timeframe)
     if not candle_rows and exchange == "coinbase":
@@ -639,7 +751,7 @@ def autonomous_runtime_command(command: RuntimeFileCommand):
 @app.post("/api/ai/analyze")
 def ai_analyze(symbol: str = "BTC-USD", exchange: str = "coinbase"):
     """Run the onboard explainable ensemble on stored closed candles; never submits orders."""
-    if exchange not in {"coinbase", "binance", "kraken"}:
+    if exchange not in {"coinbase", "binance", "kraken", "okx"}:
         raise HTTPException(status_code=422, detail="Unsupported exchange")
     candles = CandleHistoryStore(DB_FILE).load(exchange, symbol, "1h")
     if not candles and exchange == "coinbase":
@@ -732,11 +844,13 @@ def live_order_history(limit: int = 20):
 
 @app.post("/api/backtest")
 def run_backtest(request: BacktestRequest):
-    if request.exchange not in {"coinbase", "binance", "kraken"}:
+    if request.exchange not in STORED_EXCHANGES:
         raise HTTPException(status_code=422, detail="Unsupported exchange")
     try:
-        candles = CandleHistoryStore(DB_FILE).load(request.exchange, request.symbol, request.timeframe,
-                                                  request.start_ms, request.end_ms)
+        now_ms = int(time.time() * 1000)
+        candles = CandleHistoryStore(DB_FILE).load(
+            request.exchange, request.symbol, request.timeframe, request.start_ms, request.end_ms,
+            limit=MAX_BACKTEST_CANDLES + 1, closed_before_ms=now_ms)
         if not candles and request.exchange == "coinbase":
             with closing(db()) as con:
                 query = "SELECT ts_open,open,high,low,close,volume FROM candles WHERE symbol=? AND timeframe=?"
@@ -745,25 +859,26 @@ def run_backtest(request: BacktestRequest):
                     query += " AND ts_open>=?"; params.append(request.start_ms)
                 if request.end_ms is not None:
                     query += " AND ts_open<?"; params.append(request.end_ms)
-                query += " ORDER BY ts_open"
                 step_ms = {"1m":60_000,"5m":300_000,"15m":900_000,"1h":3_600_000,"4h":14_400_000,"1d":86_400_000}.get(request.timeframe, 3_600_000)
+                query += " AND ts_open<=? ORDER BY ts_open LIMIT ?"
+                params.extend((now_ms - step_ms, MAX_BACKTEST_CANDLES + 1))
                 candles = [Candle(float(r["open"]), float(r["high"]), float(r["low"]), float(r["close"]),
                                   float(r["volume"]), int(r["ts_open"]), int(r["ts_open"]) + step_ms)
                            for r in con.execute(query, params).fetchall()]
-        candles = [c for c in candles if c.ts_close <= int(time.time() * 1000)]
+        candles = [c for c in candles if c.ts_close <= now_ms]
         if not candles:
             raise HTTPException(status_code=409, detail="No stored candle history matches this backtest")
+        if len(candles) > MAX_BACKTEST_CANDLES:
+            raise HTTPException(status_code=413,
+                                detail=f"Backtests are limited to {MAX_BACKTEST_CANDLES:,} candles")
         if request.strategy not in {entry["name"] for entry in STRATEGY_CATALOG}:
             raise HTTPException(status_code=422, detail="Unknown strategy")
 
+        signal_state = IncrementalBacktestSignal(request.strategy, request.symbol)
+
         def target_long(prefix):
-            try:
-                signal = generate_signal(request.strategy, request.symbol,
-                    [float(c.close) for c in prefix], highs=[float(c.high) for c in prefix],
-                    lows=[float(c.low) for c in prefix])
-                return signal["direction"] == "long"
-            except (ValueError, TypeError):
-                return False
+            candle = prefix[-1]
+            return signal_state.update(float(candle.close), float(candle.high), float(candle.low))
 
         result = BacktestEngine(request.initial_cash, request.fee_rate).run(candles, target_long, request.symbol)
         return {"exchange": request.exchange, "symbol": request.symbol, "timeframe": request.timeframe,
@@ -778,7 +893,7 @@ def run_backtest(request: BacktestRequest):
 @app.post("/api/market/refresh")
 def refresh_market(symbol: str = "BTC-USD", timeframe: str = "1h", limit: int = 100,
                    exchange: str = "coinbase"):
-    if not symbol or not symbol.replace("-", "").isalnum() or exchange not in {"coinbase", "binance", "kraken"}:
+    if not symbol or not symbol.replace("-", "").isalnum() or exchange not in {"coinbase", "binance", "kraken", "okx"}:
         raise HTTPException(status_code=422, detail="Unsupported symbol or timeframe")
     if timeframe not in {"1m", "5m", "15m", "1h", "4h", "1d"}:
         raise HTTPException(status_code=422, detail="Unsupported symbol or timeframe")
@@ -841,6 +956,19 @@ def stored_trends():
         series = [_stored_close_change(con, symbol) for symbol in ("BTC-USD", "ETH-USD")]
     body = {"series": series, "regime_valid": False, "eligible": False, "dispatched": False}
     return body
+
+
+@app.get("/api/sentinel/briefs")
+def sentinel_briefs():
+    """Advisory briefs from a locally running SURGE Sentinel engine (`sentinel serve`).
+
+    Read-only: nothing here is an order or an authority command, and the dashboard
+    still loads no exchange keys."""
+    try:
+        briefs = SentinelClient(timeout=5).briefs()
+    except (SentinelUnavailable, ValueError) as exc:
+        raise HTTPException(status_code=502, detail=f"sentinel unavailable: {exc}")
+    return {"briefs": briefs, "signals": [sentinel_to_signal(b) for b in briefs], "dispatched": False}
 
 
 @app.post("/api/market/global")
@@ -927,6 +1055,32 @@ def refresh_swap_history():
         return fetch_swap_history(DataCallLog(DB_FILE))
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"public swap history request failed: {type(exc).__name__}")
+
+
+def _source_rows(latest: dict) -> list[dict]:
+    return [{"key": s.key, "name": s.name, "category": s.category, "method": s.method, "docs": s.docs,
+             "auth_env": s.auth_env, "key_configured": bool(s.auth_env and data_key(s.auth_env)),
+             "official": s.official, "us_trading": s.us_trading, "notes": s.notes, "latest": latest.get(s.key)}
+            for s in SOURCES]
+
+
+@app.get("/api/sources")
+def data_sources():
+    """Registered data sources with their latest stored snapshot. Reads SQLite only; no network."""
+    return {"sources": _source_rows(SnapshotStore(DB_FILE).latest()),
+            "interval_seconds": int(os.environ.get("SURGE_SOURCES_INTERVAL", "900"))}
+
+
+@app.post("/api/sources/refresh")
+def refresh_sources(only: str | None = None):
+    """Probe sources now (public endpoints; optional data-API keys from the environment)."""
+    keys = only.split(",") if only else None
+    known = {s.key for s in SOURCES}
+    if keys and not set(keys) <= known:
+        raise HTTPException(status_code=400, detail=f"unknown sources: {sorted(set(keys) - known)}")
+    results = probe_all(Fetcher(DataCallLog(DB_FILE)), keys)
+    SnapshotStore(DB_FILE).save(results)
+    return {"sources": _source_rows(SnapshotStore(DB_FILE).latest())}
 
 
 @app.get("/api/data-calls")
@@ -1307,14 +1461,14 @@ def research_observations():
 @app.get("/api/candles")
 def get_candles(symbol: str = "BTC-USD", timeframe: str = "1h", limit: int = 100,
                 exchange: str = "coinbase"):
-    if exchange not in {"coinbase", "binance", "kraken"}:
+    if exchange not in STORED_EXCHANGES:
         raise HTTPException(status_code=422, detail="Unsupported exchange")
-    candles = CandleHistoryStore(DB_FILE).load(exchange, symbol, timeframe)
+    limit = min(max(limit, 1), 1000)
+    candles = CandleHistoryStore(DB_FILE).load(exchange, symbol, timeframe, limit=limit)
     if not candles and exchange == "coinbase":
         with closing(db()) as con:
-            rows = con.execute("SELECT ts_open,open,high,low,close,volume FROM candles WHERE symbol=? AND timeframe=? ORDER BY ts_open DESC LIMIT ?", (symbol, timeframe, min(max(limit, 1), 1000))).fetchall()
+            rows = con.execute("SELECT ts_open,open,high,low,close,volume FROM candles WHERE symbol=? AND timeframe=? ORDER BY ts_open DESC LIMIT ?", (symbol, timeframe, limit)).fetchall()
         return list(reversed([dict(row) for row in rows]))
-    candles = candles[-min(max(limit, 1), 1000):]
     return [{"ts_open": c.ts_open, "open": c.open, "high": c.high, "low": c.low,
              "close": c.close, "volume": c.volume, "ts_close": c.ts_close} for c in candles]
 
@@ -1331,7 +1485,7 @@ def run_strategy(symbol: str = "BTC-USD", strategy: str = "ema_12_26_crossover",
                  exchange: str = "coinbase"):
     if execute:
         return unavailable("Authority strategy execution handler unavailable")
-    if exchange not in {"coinbase", "binance", "kraken"}:
+    if exchange not in {"coinbase", "binance", "kraken", "okx"}:
         raise HTTPException(status_code=422, detail="Unsupported exchange")
     candle_rows = CandleHistoryStore(DB_FILE).load(exchange, symbol, "1h")
     if not candle_rows and exchange == "coinbase":

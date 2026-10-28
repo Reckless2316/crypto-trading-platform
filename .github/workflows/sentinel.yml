@@ -1,0 +1,41 @@
+# SURGE Sentinel (Go): format, vet and race-enabled tests. Tests are offline (fake HTTP servers).
+name: sentinel
+
+on:
+  push:
+    branches: [main, "feat/**", "claude/**"]
+    paths: ["sentinel/**", ".github/workflows/sentinel.yml"]
+  pull_request:
+    paths: ["sentinel/**", ".github/workflows/sentinel.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sentinel-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: sentinel
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
+        with:
+          go-version-file: sentinel/go.mod
+          cache-dependency-path: sentinel/go.sum
+      - name: gofmt
+        run: test -z "$(gofmt -l .)" || (gofmt -l . && exit 1)
+      - name: vet
+        run: go vet ./...
+      - name: test
+        run: go test -race ./...
+      - name: build
+        run: go build -o sentinel ./cmd/sentinel

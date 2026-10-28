@@ -32,6 +32,11 @@ class LiveTradingRejected(RuntimeError):
     """Raised when an order fails validation or its risk check."""
 
 
+# okxus is the primary venue: lowest-fee US-accessible exchange with a trading API
+# (docs/research/2026-10-25-venue-selection.md).
+LIVE_EXCHANGES = frozenset({"okxus", "okx", "binance", "coinbaseadvanced"})
+
+
 @dataclass(frozen=True)
 class LiveConfig:
     exchange_id: str
@@ -40,14 +45,16 @@ class LiveConfig:
     api_key: str
     api_secret: str
     max_order_quote: float
+    api_passphrase: str = ""
 
     @classmethod
     def from_env(cls, environ: Mapping[str, str] | None = None) -> "LiveConfig":
         env = os.environ if environ is None else environ
         exchange_id = env.get("SURGE_LIVE_EXCHANGE", "").strip().lower()
-        if exchange_id not in {"binance", "coinbaseadvanced"}:
-            raise LiveTradingDisabled("SURGE_LIVE_EXCHANGE must be binance or coinbaseadvanced")
-        prefix = "SURGE_BINANCE" if exchange_id == "binance" else "SURGE_COINBASE"
+        if exchange_id not in LIVE_EXCHANGES:
+            raise LiveTradingDisabled("SURGE_LIVE_EXCHANGE must be okxus, okx, binance or coinbaseadvanced")
+        # OKX US keys are OKX keys (CCXT id okxus routes them to us.okx.com).
+        prefix = {"binance": "SURGE_BINANCE", "okx": "SURGE_OKX", "okxus": "SURGE_OKX"}.get(exchange_id, "SURGE_COINBASE")
         max_order = float(env.get("SURGE_LIVE_MAX_ORDER_QUOTE", "0"))
         return cls(
             exchange_id=exchange_id,
@@ -56,6 +63,7 @@ class LiveConfig:
             api_key=env.get(f"{prefix}_API_KEY", ""),
             api_secret=env.get(f"{prefix}_API_SECRET", ""),
             max_order_quote=max_order,
+            api_passphrase=env.get(f"{prefix}_API_PASSPHRASE", ""),
         )
 
 
@@ -144,12 +152,15 @@ def _ccxt_client(config: LiveConfig) -> Any:
     exchange_type = getattr(ccxt, config.exchange_id, None)
     if exchange_type is None:
         raise RuntimeError(f"Installed ccxt does not support {config.exchange_id}")
-    return exchange_type({
+    params: dict[str, Any] = {
         "apiKey": config.api_key,
         "secret": config.api_secret,
         "enableRateLimit": True,
         "options": {"defaultType": "spot"},
-    })
+    }
+    if config.api_passphrase:
+        params["password"] = config.api_passphrase
+    return exchange_type(params)
 
 
 class LiveCoinbaseAccount:
@@ -181,9 +192,11 @@ class LiveCoinbaseAccount:
             )
         if not self.config.api_key or not self.config.api_secret:
             raise LiveTradingDisabled("Exchange API key and secret are required")
+        if self.config.exchange_id in {"okx", "okxus"} and not self.config.api_passphrase:
+            raise LiveTradingDisabled("OKX API passphrase is required")
         if self.config.max_order_quote <= 0:
             raise LiveTradingDisabled("SURGE_LIVE_MAX_ORDER_QUOTE must be positive")
-        if self.config.exchange_id not in {"binance", "coinbaseadvanced"}:
+        if self.config.exchange_id not in LIVE_EXCHANGES:
             raise LiveTradingDisabled("Unsupported live exchange")
         self.client = client if client is not None else client_factory(self.config)
 

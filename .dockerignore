@@ -8,6 +8,12 @@ __pycache__/
 *.sqlite*
 *.log
 tests/
-research/
+# The dashboard imports research/autonomous; everything else under research/ stays out.
+research/*
+!research/autonomous/
+data/cache/
+data/autonomous/
 monitoring/
 security/
+# The Go Sentinel engine runs as its own process; the dashboard reaches it over HTTP.
+sentinel/

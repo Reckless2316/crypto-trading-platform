@@ -13,7 +13,8 @@ RUN pip install --no-cache-dir -r requirements.txt \
 COPY --chown=surge:surge dashboard ./dashboard
 COPY --chown=surge:surge bot ./bot
 COPY --chown=surge:surge data/collectors ./data/collectors
-COPY --chown=surge:surge data/history.py data/backtesting.py data/call_log.py data/public_metrics.py ./data/
+COPY --chown=surge:surge data/*.py ./data/
+COPY --chown=surge:surge data/sources ./data/sources
 COPY --chown=surge:surge research/autonomous ./research/autonomous
 COPY --chown=surge:surge prediction ./prediction
 COPY --chown=surge:surge strategies ./strategies

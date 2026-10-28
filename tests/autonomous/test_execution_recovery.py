@@ -61,7 +61,8 @@ class AuthorityTests(unittest.TestCase):
         self.market = market
         self.authority = x.OrderAuthority(self.ledger, self.venue, book_source=lambda i: self.book_source(i),
             market_source=market, entry_verifier=verifier or (lambda proposal, account, book, market, now: True),
-            clock_us=lambda: self.now)
+            clock_us=lambda: self.now, book_verifier=lambda book: True,
+            market_capability_verifier=lambda market, now: True)
         return self.proposal
 
     def submit(self, proposal=None):
@@ -78,6 +79,91 @@ class AuthorityTests(unittest.TestCase):
         params = inspect.signature(execution().OrderAuthority.submit).parameters
         self.assertNotIn("book", params)
         self.assertNotIn("market", params)
+
+    def test_missing_provenance_verifiers_refuse_before_reservation(self):
+        self.prepare()
+        self.authority.book_verifier = None
+        receipt = self.submit()
+        self.assertEqual(ReceiptStatus.REJECTED, receipt.status)
+        self.assertIn("BOOK_UNAVAILABLE", receipt.reason_codes)
+        self.assertEqual(0, self.venue.calls)
+        self.assertEqual(0, self.ledger.connection.execute("SELECT count(*) FROM order_intents").fetchone()[0])
+
+    def test_unverified_market_capability_refuses_before_reservation(self):
+        self.prepare()
+        self.authority.market_capability_verifier = lambda market, now: False
+        receipt = self.submit()
+        self.assertEqual(ReceiptStatus.REJECTED, receipt.status)
+        self.assertIn("VERIFIED_MARKET_CAPABILITY_UNAVAILABLE", receipt.reason_codes)
+        self.assertEqual(0, self.venue.calls)
+        self.assertEqual(0, self.ledger.connection.execute("SELECT count(*) FROM order_intents").fetchone()[0])
+
+    def test_market_capability_lost_at_dispatch_releases_reservation(self):
+        self.prepare()
+        checks = 0
+
+        def verify(market, now):
+            nonlocal checks
+            checks += 1
+            return checks < 3
+
+        self.authority.market_capability_verifier = verify
+        receipt = self.submit()
+        self.assertEqual(ReceiptStatus.REJECTED, receipt.status)
+        self.assertIn("MARKET_CAPABILITY_CHANGED_AT_DISPATCH", receipt.reason_codes)
+        self.assertEqual(0, self.venue.calls)
+        self.assertEqual("rejected", self.intent_state())
+        self.assertEqual(0, self.ledger.connection.execute(
+            "SELECT cash_usd_u FROM reservations").fetchone()[0])
+
+    def test_state_engine_lineage_must_be_committed_and_not_invalidated(self):
+        from pathlib import Path
+        from bot.autonomous.contracts import SourceEvent
+        from bot.autonomous.state import SourceClockPolicy, StateEngine
+
+        self.prepare()
+        source, stream = "paper-feed", "book"
+        policy = SourceClockPolicy("test-book", source, stream, 2_000_000, 0)
+        engine = StateEngine(self.ledger, Path(self.directory.name) / "archive", (policy,))
+        payload = BookPayload(((D("99.95"), D("100")),), ((D("100"), D("10")),))
+        event = SourceEvent(event_id="engine-book", source=source, stream=stream,
+            logical_key="book-key", revision=0, instrument=self.proposal.instrument,
+            event_at_us=self.now, received_at_us=self.now, known_at_us=self.now,
+            payload=payload, payload_hash=content_hash(payload), sequence=1)
+        self.assertTrue(engine.ingest(event).accepted)
+        committed = engine.executable_book(source, stream, self.proposal.instrument, "paper")
+        self.assertTrue(engine.verify_executable_book(committed))
+
+        venue = self.venue
+        authority = execution().OrderAuthority(self.ledger, venue,
+            book_source=lambda instrument: ExecutableBook("paper", instrument, self.now, payload,
+                content_hash(("executable-book-v1", "not-committed", 1))),
+            market_source=self.market, entry_verifier=lambda *args: True, clock_us=lambda: self.now,
+            book_verifier=engine.verify_executable_book,
+            market_capability_verifier=lambda market, now: True)
+        uncommitted = authority.submit(self.proposal, decision=self.proposal.decision, request_id="uncommitted-book")
+        self.assertEqual(ReceiptStatus.REJECTED, uncommitted.status)
+        self.assertEqual(0, venue.calls)
+        self.assertEqual(0, self.ledger.connection.execute("SELECT count(*) FROM order_intents").fetchone()[0])
+
+        book_reads = 0
+
+        def invalidate_before_dispatch(instrument):
+            nonlocal book_reads
+            book_reads += 1
+            if book_reads == 2:
+                engine.invalidate("invalidate-book", "engine-book", self.now, "source_reorg")
+            return committed
+
+        authority.book_source = invalidate_before_dispatch
+        invalidated = authority.submit(self.proposal, decision=self.proposal.decision, request_id="invalidated-book")
+        self.assertEqual(ReceiptStatus.REJECTED, invalidated.status)
+        self.assertIn("BOOK_STALE_AT_DISPATCH", invalidated.reason_codes)
+        self.assertFalse(engine.verify_executable_book(committed))
+        self.assertEqual(0, venue.calls)
+        self.assertEqual("rejected", self.intent_state())
+        self.assertEqual(0, self.ledger.connection.execute(
+            "SELECT cash_usd_u FROM reservations").fetchone()[0])
 
     def test_partial_ioc_fill_records_fill_and_cancels_remainder(self):
         self.prepare()
@@ -709,7 +795,8 @@ class AuthorityTests(unittest.TestCase):
         venue.ledger = self.ledger
         authority = x.OrderAuthority(self.ledger, venue, book_source=lambda instrument: ExecutableBook(
             "paper", instrument, self.now, BookPayload(((D("100"), D("1")),), ((D("101"), D("1")),)), "e" * 64),
-            market_source=lambda instrument: rules, entry_verifier=lambda *args: False, clock_us=lambda: self.now)
+            market_source=lambda instrument: rules, entry_verifier=lambda *args: False, clock_us=lambda: self.now,
+            book_verifier=lambda book: True, market_capability_verifier=lambda market, now: True)
         receipt = authority.submit(sell, decision=None, request_id="request-reduce-parent")
         self.assertEqual(ReceiptStatus.COMPLETED, receipt.status, receipt.reason_codes)
         self.assertEqual(IntentState.FILLED, receipt.state)
@@ -740,7 +827,8 @@ class AuthorityTests(unittest.TestCase):
         venue.ledger = self.ledger
         authority = x.OrderAuthority(self.ledger, venue, book_source=lambda instrument: ExecutableBook(
             "paper", instrument, self.now, BookPayload(((D("100"), D("1")),), ((D("101"), D("1")),)), "e" * 64),
-            market_source=lambda instrument: rules, entry_verifier=lambda *args: True, clock_us=lambda: self.now)
+            market_source=lambda instrument: rules, entry_verifier=lambda *args: True, clock_us=lambda: self.now,
+            book_verifier=lambda book: True, market_capability_verifier=lambda market, now: True)
         receipt = authority.submit(sell, decision=None, request_id="request-killed-reduce")
         orders = self.ledger.connection.execute("SELECT count(*) FROM order_intents").fetchone()[0]
         self.assertEqual(ReceiptStatus.REJECTED, receipt.status)
@@ -775,7 +863,8 @@ class AuthorityTests(unittest.TestCase):
         venue.ledger = self.ledger
         authority = x.OrderAuthority(self.ledger, venue, book_source=lambda instrument: ExecutableBook(
             "paper", instrument, self.now, BookPayload(((D("100"), D("1")),), ((D("101"), D("1")),)), "e" * 64),
-            market_source=lambda instrument: rules, entry_verifier=lambda *args: True, clock_us=lambda: self.now)
+            market_source=lambda instrument: rules, entry_verifier=lambda *args: True, clock_us=lambda: self.now,
+            book_verifier=lambda book: True, market_capability_verifier=lambda market, now: True)
         receipt = authority.submit(sell, decision=None, request_id="request-crisis-reduce")
         self.assertTrue(latched)
         self.assertEqual("none", control[0])

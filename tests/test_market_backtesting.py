@@ -1,10 +1,18 @@
 import tempfile
+import math
+import random
+import time
 import unittest
 from pathlib import Path
 
-from data.backtesting import BacktestEngine, markov_momentum_signal
+from data.backtesting import BacktestEngine, _ema, ema_crossover_signal, markov_momentum_signal
 from data.collectors.collector_base import Candle, Collector
 from data.history import CandleHistoryStore, ExchangeHistory
+from strategies.strategy_suite import (
+    STRATEGY_CATALOG,
+    IncrementalBacktestSignal,
+    generate_signal,
+)
 
 
 def candle(ts, price):
@@ -32,6 +40,9 @@ class HistoryTests(unittest.TestCase):
             self.assertEqual([x.close for x in store.load("binance", "BTCUSDT", "1m")], [10, 11])
             self.assertEqual([x.close for x in store.load("coinbase", "BTCUSDT", "1m")], [12])
             self.assertEqual([x.ts_open for x in store.load("binance", "BTCUSDT", "1m", 120_000, 180_000)], [120_000])
+            self.assertEqual([x.close for x in store.load("binance", "BTCUSDT", "1m", limit=1)], [11])
+            self.assertEqual(store.load("binance", "BTCUSDT", "1m", limit=5), store.load("binance", "BTCUSDT", "1m"))
+            self.assertEqual(store.load("binance", "BTCUSDT", "1m", limit=0), [])
 
     def test_fetch_paginates_and_persists(self):
         fake = FakeCollector()
@@ -72,6 +83,85 @@ class BacktestTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             BacktestEngine().run([candle(60_000, 1), candle(60_000, 2)], lambda _history: False)
         self.assertFalse(markov_momentum_signal()( [candle(0, 1)] ))
+
+    def test_signals_match_full_history_reference_and_prefix_is_a_view(self):
+        prices = [10 + ((i * 7) % 13) + (i % 5) * 0.5 for i in range(150)]
+        bars = [candle(i * 60_000, p) for i, p in enumerate(prices)]
+
+        def ref_markov(history, lookback=20, threshold=0.5):
+            changes = [history[i].close >= history[i - 1].close for i in range(1, len(history))][-lookback:]
+            if len(changes) < 2:
+                return False
+            current = changes[-1]
+            following = [changes[i + 1] for i in range(len(changes) - 1) if changes[i] == current]
+            p = sum(following) / len(following) if following else sum(changes) / len(changes)
+            return p > threshold
+
+        def ref_ema(history, fast_p=5, slow_p=12):
+            if len(history) < slow_p:
+                return False
+            closes = [c.close for c in history]
+            return _ema(closes[-max(slow_p * 3, fast_p):], fast_p) > _ema(closes[-slow_p * 3:], slow_p)
+
+        seen = []
+        markov, ema = markov_momentum_signal(20), ema_crossover_signal(5, 12)
+
+        def probe(history):
+            prefix = tuple(history)
+            seen.append(len(prefix))
+            self.assertEqual(history[-3:], prefix[-3:])
+            self.assertEqual(history[-1], prefix[-1])
+            self.assertEqual(markov(history), ref_markov(prefix))
+            self.assertEqual(ema(history), ref_ema(prefix))
+            return len(prefix) % 3 != 0
+
+        BacktestEngine().run(bars, probe)
+        self.assertEqual(seen, list(range(1, len(bars))))
+
+    def test_incremental_catalog_signals_match_full_prefix_backtests(self):
+        smooth = []
+        for index in range(3000):
+            price = 100 + index * 0.02 + 3 * math.sin(index * 0.09) + 5 * math.sin(index * 0.017)
+            smooth.append(Candle(price, price + 1, price - 1, price, 1, index * 60_000, (index + 1) * 60_000))
+        # A seeded high-volatility random walk with uneven ranges exercises the Markov and Elliott
+        # branches that a smooth series rarely reaches.
+        rng, price, walk = random.Random(7), 100.0, []
+        for index in range(1200):
+            opened, price = price, price * (1 + rng.gauss(0, 0.03))
+            high, low = max(opened, price) * (1 + abs(rng.gauss(0, 0.01))), min(opened, price) * (1 - abs(rng.gauss(0, 0.01)))
+            walk.append(Candle(opened, high, low, price, 1, index * 60_000, (index + 1) * 60_000))
+        self._assert_incremental_matches(smooth)
+        self._assert_incremental_matches(walk)
+
+    def _assert_incremental_matches(self, bars):
+        for entry in STRATEGY_CATALOG:
+            strategy = entry["name"]
+
+            def full_prefix_signal(prefix):
+                try:
+                    signal = generate_signal(strategy, "BTC-USD",
+                        [float(c.close) for c in prefix],
+                        highs=[float(c.high) for c in prefix],
+                        lows=[float(c.low) for c in prefix])
+                    return signal["direction"] == "long"
+                except (ValueError, TypeError):
+                    return False
+
+            incremental = IncrementalBacktestSignal(strategy, "BTC-USD")
+            optimized = BacktestEngine().run(
+                bars, lambda prefix: incremental.update(prefix[-1].close, prefix[-1].high, prefix[-1].low))
+            reference = BacktestEngine().run(bars, full_prefix_signal)
+            self.assertEqual(optimized, reference, strategy)
+
+    def test_twenty_thousand_candle_ema_backtest_is_bounded(self):
+        bars = [candle(index * 60_000, 100 + index * 0.001 + math.sin(index / 20))
+                for index in range(20_000)]
+        signal = IncrementalBacktestSignal("ema_12_26_crossover", "BTC-USD")
+
+        started = time.perf_counter()
+        BacktestEngine().run(
+            bars, lambda prefix: signal.update(prefix[-1].close, prefix[-1].high, prefix[-1].low))
+        self.assertLess(time.perf_counter() - started, 10)
 
 
 if __name__ == "__main__":

@@ -53,6 +53,62 @@ class PlatformApiTests(unittest.TestCase):
         with closing(platform_app.db()) as con:
             return con.execute("SELECT COUNT(*) FROM orders").fetchone()[0]
 
+    def test_observability_reports_health_and_buckets_unknown_paths(self):
+        platform_app._OBS_ROUTES.clear()
+        for n in range(30):
+            self.client.get(f"/scanner-probe-{n}")
+        self.client.get("/health")
+        body = self.client.get("/api/observability").json()
+        self.assertEqual(body["database"], "ok")
+        self.assertEqual(body["mode"], "paper")
+        paths = {r["path"]: r for r in body["routes"]}
+        self.assertEqual(paths["<unmatched>"]["count"], 30)
+        self.assertEqual(paths["<unmatched>"]["errors"], 30)
+        self.assertIn("/health", paths)
+        self.assertLessEqual(len(platform_app._OBS_ROUTES), 3)   # 30 random URLs did not add 30 keys
+
+    def test_observability_counts_history_and_legacy_candles_once(self):
+        from data.history import CandleHistoryStore
+        legacy = self.seed_candles(count=10)                       # legacy Coinbase table
+        CandleHistoryStore(self.db_path).save("coinbase", "BTC-USD", "1h", legacy[:4])   # mirrored: not double-counted
+        CandleHistoryStore(self.db_path).save("okx", "BTC-USDT", "1h", legacy[:3])       # history-only
+        self.assertEqual(self.client.get("/api/observability").json()["stored_candles"], 10 + 3)
+
+    def test_sources_registry_reads_store_without_network(self):
+        with patch.object(platform_app, "probe_all", side_effect=AssertionError("GET must not probe")):
+            body = self.client.get("/api/sources").json()
+        self.assertEqual(len(body["sources"]), len(platform_app.SOURCES))
+        self.assertTrue(all(row["latest"] is None for row in body["sources"]))
+        self.assertEqual(next(r for r in body["sources"] if r["key"] == "okx-us")["us_trading"][:3], "yes")
+
+    def test_sources_refresh_stores_snapshots_and_rejects_unknown_keys(self):
+        fake = [{"key": "mempool", "name": "Bitcoin network (mempool.space)", "category": "onchain",
+                 "fetched_at": 1.0, "state": "ok", "elapsed_ms": 5, "data": {"fastest_sat_vb": 3}}]
+        with patch.object(platform_app, "probe_all", return_value=fake) as probe:
+            body = self.client.post("/api/sources/refresh", params={"only": "mempool"}).json()
+        self.assertEqual(probe.call_args.args[1], ["mempool"])
+        latest = next(r for r in body["sources"] if r["key"] == "mempool")["latest"]
+        self.assertEqual((latest["state"], latest["data"]), ("ok", {"fastest_sat_vb": 3}))
+        self.assertEqual(self.client.post("/api/sources/refresh", params={"only": "nope"}).status_code, 400)
+
+    def test_archive_candles_are_readable_but_never_fetched(self):
+        from data.history import CandleHistoryStore
+        rows = [Candle(100 + i, 101 + i, 99 + i, 100 + i, 0, i * 3_600_000, (i + 1) * 3_600_000) for i in range(30)]
+        CandleHistoryStore(self.db_path).save(platform_app.ARCHIVE_EXCHANGE, "BTCUSDT", "1h", rows)
+        got = self.client.get("/api/candles", params={"exchange": "binance-usdm-archive", "symbol": "BTCUSDT",
+                                                     "timeframe": "1h", "limit": 5}).json()
+        self.assertEqual([c["close"] for c in got], [125, 126, 127, 128, 129])
+        refresh = self.client.post("/api/market/refresh", params={"exchange": "binance-usdm-archive", "symbol": "BTCUSDT"})
+        self.assertEqual(refresh.status_code, 422)
+
+    def test_candles_endpoint_returns_latest_window_ascending(self):
+        candles = self.seed_candles(count=10)
+
+        rows = self.client.get("/api/candles", params={"limit": 3}).json()
+
+        self.assertEqual([r["ts_open"] for r in rows], [c.ts_open for c in candles[-3:]])
+        self.assertEqual(len(self.client.get("/api/candles", params={"limit": 500}).json()), 10)
+
     def test_strategy_run_records_signal_without_opt_in_order(self):
         self.seed_candles()
 
@@ -108,6 +164,19 @@ class PlatformApiTests(unittest.TestCase):
         self.assertEqual(body["result"]["candles"], 40)
         self.assertIn("Historical simulation only", body["caveat"])
         self.assertEqual(self.order_count(), 0)
+
+    def test_backtest_rejects_histories_over_the_candle_limit(self):
+        self.seed_candles(count=3)
+        with closing(platform_app.db()) as con:
+            con.execute("DELETE FROM candle_history")
+            con.commit()
+
+        with patch.object(platform_app, "MAX_BACKTEST_CANDLES", 2):
+            response = self.client.post("/api/backtest", json={"exchange": "coinbase", "symbol": "BTC-USD",
+                                                               "timeframe": "1h", "strategy": "ema_12_26_crossover"})
+
+        self.assertEqual(response.status_code, 413, response.text)
+        self.assertIn("limited to 2 candles", response.json()["detail"])
 
     def test_dashboard_cannot_fill_paper_orders(self):
         self.seed_candles()

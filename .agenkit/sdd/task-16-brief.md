@@ -4,6 +4,8 @@
 
 **Consumes:** Tasks 1–15 interfaces. **Produces:** `run_worker(config,dependencies) -> None`, authority/reflex entrypoints, independent deadlines, continuous marking and durable hourly scheduling; `role_secret_names(role: str) -> frozenset[str]`.
 
+**Current milestone:** collection and daily reviews only. `--serve` and `--serve-seconds` do not run hourly decisions or submit orders. Keep Task 16 incomplete until an entrypoint integration test proves the approved hourly workflow and durable candle deduplication across restart.
+
 - [ ] RED: roles cannot inherit venue/model credentials indiscriminately.
 
 ```python
