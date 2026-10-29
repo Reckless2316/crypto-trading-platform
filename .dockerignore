@@ -17,3 +17,7 @@ monitoring/
 security/
 # The Go Sentinel engine runs as its own process; the dashboard reaches it over HTTP.
 sentinel/
+# Agent tooling (skills, MCP config) is for development machines, not the image.
+.claude/
+.mcp.json
+skills-lock.json

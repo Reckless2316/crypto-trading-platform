@@ -59,6 +59,27 @@ permissions, no withdraw, and fee tier Lv1 (0.20% maker / 0.35% taker). Build an
 - **Hard rules are unchanged.** The web dashboard never loads keys. No live orders or arming
   without explicit operator approval for that specific step (`LIVE_ARM_REQUIRES_TASK22`).
 
+## OKX agent kit (skills + MCP)
+
+The official OKX agent kit is installed for agents working in this repo:
+
+- **Skills** in `.claude/skills/` (okx-cex-market, -trade, -portfolio, -bot, -earn, -auth,
+  -smartmoney, -skill-mp, okx-sentiment-tracker, earn-hunter), from `okx/agent-skills` and pinned
+  by `skills-lock.json`. Update them with `npx skills add okx/agent-skills -a claude-code -s '*' -y`.
+  They drive the `okx` CLI (`npm i -g @okx_ai/okx-trade-cli`), which reads `~/.okx/config.toml`.
+  Use `--site us` / `site = "us"` there, since the operator's key exists only on `us.okx.com`.
+- **MCP server** `okx-us` in `.mcp.json`, launched by `deploy/okx-mcp.sh`. It is
+  `@okx_ai/okx-trade-mcp@1.4.9 --site us --read-only`. The wrapper maps `SURGE_OKX_*` from `.env`
+  to `OKX_*` without printing them, and runs public-only when there is no `.env`. It also disables
+  the `okx-pilot` native proxy binary, because this repo never routes around a geo-block.
+  Read-only mode registers no order, transfer or bot write tools.
+- The hosted OAuth server (`https://www.okx.com/api/v1/mcp/trading-oauth`) is global OKX. It is a
+  user-scope install (`claude mcp add --transport http --scope user okx-agent-trade-kit ...`, then
+  `/mcp` to log in), not part of this repo, and may not accept an OKX US account.
+- Write access is never enabled here. Placing orders through the skills or a non-read-only server
+  counts as a live order and needs explicit operator approval for that specific step. Try
+  `--profile demo` first.
+
 ## Data sources
 
 `data/sources/` registers all 36 sources from the operator's API-status list ("Bentley" and
