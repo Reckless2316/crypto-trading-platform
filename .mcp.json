@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "okx-us": {
+      "type": "stdio",
+      "command": "bash",
+      "args": ["deploy/okx-mcp.sh"],
+      "env": {}
+    }
+  }
+}

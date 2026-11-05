@@ -1,0 +1,65 @@
+{
+  "version": 1,
+  "skills": {
+    "earn-hunter": {
+      "source": "okx/agent-skills",
+      "sourceType": "github",
+      "skillPath": "skills/earn-hunter/SKILL.md",
+      "computedHash": "c7f28c924ed16cd8a97d0a44fd29269e45845dd1cf3b4e916b2213a427c9b4c9"
+    },
+    "okx-cex-auth": {
+      "source": "okx/agent-skills",
+      "sourceType": "github",
+      "skillPath": "skills/okx-cex-auth/SKILL.md",
+      "computedHash": "f054cf667814dd1d7d497a5dd212730128c09d0f1e2a945bae0e5ac8f2d91222"
+    },
+    "okx-cex-bot": {
+      "source": "okx/agent-skills",
+      "sourceType": "github",
+      "skillPath": "skills/okx-cex-bot/SKILL.md",
+      "computedHash": "73123c946b342fdf136d94ce0f0fde7ddfde95f0427cd7d841a10bd8bd4485e7"
+    },
+    "okx-cex-earn": {
+      "source": "okx/agent-skills",
+      "sourceType": "github",
+      "skillPath": "skills/okx-cex-earn/SKILL.md",
+      "computedHash": "f021dd5388cf6ad3eba69ee3d3334ca1a1e4ef3d722bac4cf25723f89d713123"
+    },
+    "okx-cex-market": {
+      "source": "okx/agent-skills",
+      "sourceType": "github",
+      "skillPath": "skills/okx-cex-market/SKILL.md",
+      "computedHash": "21b3bd3942cbb4fd510367e4906fb06ea33584dd5026ec573b9775f96e1baf4a"
+    },
+    "okx-cex-portfolio": {
+      "source": "okx/agent-skills",
+      "sourceType": "github",
+      "skillPath": "skills/okx-cex-portfolio/SKILL.md",
+      "computedHash": "d317e0c662b8cbe6a148eb13269c9fef412e13be9d4035346d7b876e47ab0392"
+    },
+    "okx-cex-skill-mp": {
+      "source": "okx/agent-skills",
+      "sourceType": "github",
+      "skillPath": "skills/okx-cex-skill-mp/SKILL.md",
+      "computedHash": "aaf3bbd0bc7db75130197043d65b01dd9150e67e5022553294074fb6d30a4e17"
+    },
+    "okx-cex-smartmoney": {
+      "source": "okx/agent-skills",
+      "sourceType": "github",
+      "skillPath": "skills/okx-cex-smartmoney/SKILL.md",
+      "computedHash": "09d7bcc8b3b62a89e367930de376db963a54fc70f7d51765c7ab7e39ef94224a"
+    },
+    "okx-cex-trade": {
+      "source": "okx/agent-skills",
+      "sourceType": "github",
+      "skillPath": "skills/okx-cex-trade/SKILL.md",
+      "computedHash": "21ba91593752b624ed31440421ae073b4b416f8f41e8bc27194da2aa2d882771"
+    },
+    "okx-sentiment-tracker": {
+      "source": "okx/agent-skills",
+      "sourceType": "github",
+      "skillPath": "skills/okx-sentiment-tracker/SKILL.md",
+      "computedHash": "27f008e6892b675bd42e0de83c3915bda4159771f0c33ee878f93f98f7419850"
+    }
+  }
+}
