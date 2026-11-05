@@ -17,7 +17,8 @@ env_file="${SURGE_ENV_FILE:-$repo/.env}"
 # Parse KEY=value lines instead of sourcing, so .env is never executed.
 read_env() {
 	[[ -f "$env_file" ]] || return 0
-	grep -E "^[[:space:]]*$1=" "$env_file" | tail -n 1 | cut -d= -f2- |
+	# A missing entry is an empty value, not an error (grep exits 1 on no match).
+	{ grep -E "^[[:space:]]*$1=" "$env_file" || true; } | tail -n 1 | cut -d= -f2- |
 		sed -E 's/^[[:space:]]+|[[:space:]]+$//g; s/^"(.*)"$/\1/; s/^'"'"'(.*)'"'"'$/\1/'
 }
 

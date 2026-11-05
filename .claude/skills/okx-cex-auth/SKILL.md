@@ -91,7 +91,7 @@ If Step 0.2 detected an `api_key` profile and the subsequent API call returns an
 
 Present the user with exactly these two options, neutrally (do NOT label OAuth as "recommended"):
 
-1. **Replace the API key** — the user generates a new key on the OKX web console (`https://<site>/account/my-api`) and either provides `AK/SK/PP` to you or re-runs `okx config init` themselves.
+1. **Replace the API key** — the user generates a new key on the OKX web console (`https://<site>/account/my-api`) and re-runs `okx config init` themselves in their own terminal (or, in this repo, updates `SURGE_OKX_*` in the local `.env`). Never ask for, accept or echo `AK/SK/PP` in the conversation; if the user pastes them, tell them to revoke that key.
 2. **Switch entirely to OAuth** — first remove the broken API-key profile (`okx config use <other-profile>` or delete the profile block in `~/.okx/config.toml`), THEN run the OAuth login flow from Step 0.3.
 
 Option 2 requires removing the profile first. If you attempt `okx auth login` while the API key profile still exists, the CLI guard will skip OAuth with `{"status":"skipped","reason":"api_key_configured",...}` and nothing will change.

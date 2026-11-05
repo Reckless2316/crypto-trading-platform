@@ -65,7 +65,7 @@ The official OKX agent kit is installed for agents working in this repo:
 
 - **Skills** in `.claude/skills/` (okx-cex-market, -trade, -portfolio, -bot, -earn, -auth,
   -smartmoney, -skill-mp, okx-sentiment-tracker, earn-hunter), from `okx/agent-skills` and pinned
-  by `skills-lock.json`. Update them with `npx skills add okx/agent-skills -a claude-code -s '*' -y`.
+  by `skills-lock.json`. One local edit: `okx-cex-auth` Step 0.2.a no longer offers to take keys in chat. Re-apply it after an update. Update them with `npx skills add okx/agent-skills -a claude-code -s '*' -y`.
   They drive the `okx` CLI (`npm i -g @okx_ai/okx-trade-cli`), which reads `~/.okx/config.toml`.
   Use `--site us` / `site = "us"` there, since the operator's key exists only on `us.okx.com`.
 - **MCP server** `okx-us` in `.mcp.json`, launched by `deploy/okx-mcp.sh`. It is
